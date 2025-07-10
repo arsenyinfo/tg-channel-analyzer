@@ -113,9 +113,9 @@ impl TelegramBot {
             .replace("!", "\\!")
     }
 
-    pub fn new(bot_token: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn new(bot_token: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let bot = Bot::new(bot_token);
-        let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new()?));
+        let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new().await?));
 
         Ok(Self {
             bot,

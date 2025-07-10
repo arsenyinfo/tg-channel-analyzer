@@ -23,7 +23,7 @@ pub struct AnalysisEngine {
 }
 
 impl AnalysisEngine {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let api_id = env::var("TG_API_ID")
             .map_err(|_| "TG_API_ID environment variable is required")?
             .parse::<i32>()
@@ -32,11 +32,13 @@ impl AnalysisEngine {
         let api_hash = env::var("TG_API_HASH")
             .map_err(|_| "TG_API_HASH environment variable is required")?;
 
+        let cache = CacheManager::new().await?;
+
         Ok(Self {
             client: None,
             api_id,
             api_hash,
-            cache: CacheManager::new(),
+            cache,
         })
     }
 
@@ -112,7 +114,7 @@ impl AnalysisEngine {
     ) -> Result<AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting analysis for channel: {}", channel_username);
 
-        let messages = match self.cache.load_channel_messages(channel_username) {
+        let messages = match self.cache.load_channel_messages(channel_username).await {
             Some(cached_messages) => cached_messages,
             None => {
                 info!("Fetching fresh messages from channel");
@@ -122,7 +124,7 @@ impl AnalysisEngine {
                     self.get_all_messages(client, channel_username).await?
                 };
                 self.cache
-                    .save_channel_messages(channel_username, &messages)?;
+                    .save_channel_messages(channel_username, &messages).await?;
                 messages
             }
         };
@@ -131,7 +133,7 @@ impl AnalysisEngine {
 
         // check LLM cache first
         let cache_key = self.cache.get_llm_cache_key(&messages, "analysis");
-        if let Some(cached_result) = self.cache.load_llm_result(&cache_key) {
+        if let Some(cached_result) = self.cache.load_llm_result(&cache_key).await {
             return Ok(cached_result);
         }
 
@@ -163,7 +165,7 @@ Messages:
         };
 
         // cache the LLM result
-        if let Err(e) = self.cache.save_llm_result(&cache_key, &result) {
+        if let Err(e) = self.cache.save_llm_result(&cache_key, &result).await {
             info!("Failed to cache LLM result: {}", e);
         }
 
