@@ -1,11 +1,17 @@
 mod analysis;
 mod bot;
 mod cache;
+mod migrations;
+mod user_manager;
 
+use bot::TelegramBot;
+use cache::CacheManager;
 use clap::Parser;
 use log::info;
+use migrations::MigrationManager;
 use std::env;
-use bot::TelegramBot;
+use std::sync::Arc;
+use user_manager::UserManager;
 
 #[derive(Parser)]
 #[command(name = "tg-analyzer")]
@@ -36,12 +42,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let _args = Args::parse();
 
-    let bot_token = env::var("BOT_TOKEN")
-        .map_err(|_| "BOT_TOKEN environment variable is required")?;
+    let bot_token =
+        env::var("BOT_TOKEN").map_err(|_| "BOT_TOKEN environment variable is required")?;
 
     info!("Starting bot...");
-    
-    let bot = TelegramBot::new(&bot_token).await?;
+
+    // initialize database pool and run migrations
+    info!("Initializing database...");
+    let pool = CacheManager::create_pool().await?;
+    MigrationManager::run_migrations(&pool).await?;
+
+    // initialize user manager with shared pool
+    let user_manager = Arc::new(UserManager::new(pool.clone()));
+
+    let bot = TelegramBot::new(&bot_token, user_manager, pool).await?;
     bot.run().await;
 
     Ok(())

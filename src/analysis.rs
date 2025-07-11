@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::cache::{AnalysisResult, CacheManager};
+use deadpool_postgres::Pool;
 
 #[derive(Serialize, Deserialize, Debug, Hash)]
 pub struct MessageDict {
@@ -23,16 +24,16 @@ pub struct AnalysisEngine {
 }
 
 impl AnalysisEngine {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(pool: Pool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let api_id = env::var("TG_API_ID")
             .map_err(|_| "TG_API_ID environment variable is required")?
             .parse::<i32>()
             .map_err(|_| "TG_API_ID must be a valid integer")?;
-        
-        let api_hash = env::var("TG_API_HASH")
-            .map_err(|_| "TG_API_HASH environment variable is required")?;
 
-        let cache = CacheManager::new().await?;
+        let api_hash =
+            env::var("TG_API_HASH").map_err(|_| "TG_API_HASH environment variable is required")?;
+
+        let cache = CacheManager::new(pool);
 
         Ok(Self {
             client: None,
@@ -124,7 +125,8 @@ impl AnalysisEngine {
                     self.get_all_messages(client, channel_username).await?
                 };
                 self.cache
-                    .save_channel_messages(channel_username, &messages).await?;
+                    .save_channel_messages(channel_username, &messages)
+                    .await?;
                 messages
             }
         };
@@ -246,12 +248,22 @@ async fn query_llm(
             Ok(resp) => resp,
             Err(e) => {
                 if attempt == MAX_RETRIES {
-                    error!("Failed to get response from Gemini API after {} attempts: {:?}", MAX_RETRIES + 1, e);
+                    error!(
+                        "Failed to get response from Gemini API after {} attempts: {:?}",
+                        MAX_RETRIES + 1,
+                        e
+                    );
                     return Err(e.into());
                 }
-                
+
                 let delay = calculate_delay(attempt);
-                warn!("Gemini API call failed (attempt {}/{}): {:?}. Retrying in {}ms", attempt + 1, MAX_RETRIES + 1, e, delay.as_millis());
+                warn!(
+                    "Gemini API call failed (attempt {}/{}): {:?}. Retrying in {}ms",
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                    e,
+                    delay.as_millis()
+                );
                 sleep(delay).await;
                 continue;
             }
@@ -261,17 +273,29 @@ async fn query_llm(
 
         if content.is_empty() {
             if attempt == MAX_RETRIES {
-                error!("Received empty response from Gemini API after {} attempts", MAX_RETRIES + 1);
+                error!(
+                    "Received empty response from Gemini API after {} attempts",
+                    MAX_RETRIES + 1
+                );
                 return Err("Empty response from Gemini API".into());
             }
-            
+
             let delay = calculate_delay(attempt);
-            warn!("Received empty response from Gemini API (attempt {}/{}). Retrying in {}ms", attempt + 1, MAX_RETRIES + 1, delay.as_millis());
+            warn!(
+                "Received empty response from Gemini API (attempt {}/{}). Retrying in {}ms",
+                attempt + 1,
+                MAX_RETRIES + 1,
+                delay.as_millis()
+            );
             sleep(delay).await;
             continue;
         }
 
-        info!("Received response of length: {} (attempt {})", content.len(), attempt + 1);
+        info!(
+            "Received response of length: {} (attempt {})",
+            content.len(),
+            attempt + 1
+        );
         return Ok(LLMResponse { content });
     }
 

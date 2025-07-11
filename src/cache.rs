@@ -13,7 +13,11 @@ pub struct CacheManager {
 }
 
 impl CacheManager {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(pool: Pool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn create_pool() -> Result<Pool, Box<dyn std::error::Error + Send + Sync>> {
         let database_url =
             env::var("DATABASE_URL").map_err(|_| "DATABASE_URL environment variable not set")?;
 
@@ -21,69 +25,12 @@ impl CacheManager {
         config.url = Some(database_url);
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls = MakeRustlsConnect::new(rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth());
-        let pool = config.create_pool(Some(Runtime::Tokio1), tls)?;
-
-        let cache_manager = Self { pool };
-        
-        // run database migrations
-        cache_manager.run_migrations().await?;
-        
-        Ok(cache_manager)
-    }
-
-    async fn run_migrations(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Running database migrations...");
-        let client = self.pool.get().await?;
-
-        // create channel_messages table
-        client.execute(
-            "CREATE TABLE IF NOT EXISTS channel_messages (
-                id SERIAL PRIMARY KEY,
-                channel_name VARCHAR(255) NOT NULL UNIQUE,
-                messages_data JSONB NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            )",
-            &[]
-        ).await?;
-
-        // create llm_results table
-        client.execute(
-            "CREATE TABLE IF NOT EXISTS llm_results (
-                id SERIAL PRIMARY KEY,
-                cache_key VARCHAR(64) NOT NULL UNIQUE,
-                analysis_result JSONB NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            )",
-            &[]
-        ).await?;
-
-        // create indexes for better performance
-        client.execute(
-            "CREATE INDEX IF NOT EXISTS idx_channel_messages_name ON channel_messages(channel_name)",
-            &[]
-        ).await?;
-
-        client.execute(
-            "CREATE INDEX IF NOT EXISTS idx_llm_results_key ON llm_results(cache_key)",
-            &[]
-        ).await?;
-
-        client.execute(
-            "CREATE INDEX IF NOT EXISTS idx_channel_messages_updated ON channel_messages(updated_at)",
-            &[]
-        ).await?;
-
-        client.execute(
-            "CREATE INDEX IF NOT EXISTS idx_llm_results_created ON llm_results(created_at)",
-            &[]
-        ).await?;
-
-        info!("Database migrations completed successfully");
-        Ok(())
+        let tls = MakeRustlsConnect::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+        Ok(config.create_pool(Some(Runtime::Tokio1), tls)?)
     }
 
     // channel message cache
