@@ -357,6 +357,41 @@ impl TelegramBot {
 
                             let telegram_user_id = query.from.id.0 as i64;
 
+                            // check if user has credits before starting analysis
+                            let user = match user_manager
+                                .get_or_create_user(
+                                    telegram_user_id,
+                                    query.from.username.as_deref(),
+                                    Some(query.from.first_name.as_str()),
+                                    query.from.last_name.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok(user) => user,
+                                Err(e) => {
+                                    error!("Failed to get user: {}", e);
+                                    bot.send_message(
+                                        message.chat().id,
+                                        "❌ Failed to check credits. Please try again.",
+                                    )
+                                    .await?;
+                                    return Ok(());
+                                }
+                            };
+
+                            if user.analysis_credits <= 0 {
+                                // no credits available, send payment options
+                                let message_text = "❌ No analysis credits available.\n\n\
+                                    You need credits to analyze channels. Choose a package below:";
+                                
+                                bot.send_message(message.chat().id, message_text)
+                                    .reply_markup(Self::create_payment_keyboard())
+                                    .await?;
+                                
+                                bot.answer_callback_query(&query.id).await?;
+                                return Ok(());
+                            }
+
                             // start analysis in background
                             let bot_clone = bot.clone();
                             let user_chat_id = message.chat().id;
@@ -669,10 +704,18 @@ impl TelegramBot {
         {
             Ok(credits) => credits,
             Err(e) => {
-                error!(
-                    "Failed to consume credit for user {}: {}",
-                    telegram_user_id, e
-                );
+                let error_msg = e.to_string();
+                if error_msg.contains("Insufficient credits") {
+                    info!(
+                        "User {} has insufficient credits for channel {}",
+                        telegram_user_id, channel_name
+                    );
+                } else {
+                    error!(
+                        "Failed to consume credit for user {}: {}",
+                        telegram_user_id, e
+                    );
+                }
                 bot.send_message(
                     user_chat_id,
                     "⚠️ Analysis completed but failed to update credits. Please contact support.",
