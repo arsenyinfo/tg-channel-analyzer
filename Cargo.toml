@@ -16,7 +16,7 @@ grammers-session = "0.7"
 gemini-rs = "2.0.0"
 regex = "1.0"
 clap = { version = "4.0", features = ["derive"] }
-teloxide = { version = "0.13", features = ["macros"] }
+teloxide = { version = "0.14", features = ["macros"] }
 tokio-stream = "0.1"
 fastrand = "2.0"
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
@@ -25,3 +25,5 @@ dotenvy = "0.15"
 tokio-postgres-rustls = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 webpki-roots = "0.26"
+html-escape = "0.2.13"
+comrak = "0.39.1"

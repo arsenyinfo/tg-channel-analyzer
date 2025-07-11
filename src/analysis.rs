@@ -47,33 +47,86 @@ impl AnalysisEngine {
         if self.client.is_none() {
             info!("Initializing Telegram client...");
 
-            let session = match Session::load_file("session_name.session") {
-                Ok(session) => {
-                    info!("Loaded existing session");
-                    session
+            for attempt in 0..=MAX_RETRIES {
+                let session = match Session::load_file("session_name.session") {
+                    Ok(session) => {
+                        info!("Loaded existing session");
+                        session
+                    }
+                    Err(_) => {
+                        info!("No existing session found, creating new one");
+                        Session::new()
+                    }
+                };
+
+                let config = Config {
+                    session,
+                    api_id: self.api_id,
+                    api_hash: self.api_hash.clone(),
+                    params: InitParams {
+                        ..Default::default()
+                    },
+                };
+
+                let client = match Client::connect(config).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        if attempt == MAX_RETRIES {
+                            error!(
+                                "Failed to connect Telegram client after {} attempts: {}",
+                                MAX_RETRIES + 1,
+                                e
+                            );
+                            return Err(e.into());
+                        }
+
+                        let delay = calculate_delay(attempt);
+                        warn!(
+                            "Failed to connect Telegram client (attempt {}/{}): {}. Retrying in {}ms",
+                            attempt + 1,
+                            MAX_RETRIES + 1,
+                            e,
+                            delay.as_millis()
+                        );
+                        sleep(delay).await;
+                        continue;
+                    }
+                };
+
+                match client.is_authorized().await {
+                    Ok(true) => {
+                        info!(
+                            "Client connected and authorized successfully (attempt {})",
+                            attempt + 1
+                        );
+                        self.client = Some(client);
+                        break;
+                    }
+                    Ok(false) => {
+                        return Err("Client is not authorized. Please run the standalone analyzer first to authorize.".into());
+                    }
+                    Err(e) => {
+                        if attempt == MAX_RETRIES {
+                            error!(
+                                "Failed to check client authorization after {} attempts: {}",
+                                MAX_RETRIES + 1,
+                                e
+                            );
+                            return Err(e.into());
+                        }
+
+                        let delay = calculate_delay(attempt);
+                        warn!(
+                            "Failed to check client authorization (attempt {}/{}): {}. Retrying in {}ms",
+                            attempt + 1,
+                            MAX_RETRIES + 1,
+                            e,
+                            delay.as_millis()
+                        );
+                        sleep(delay).await;
+                    }
                 }
-                Err(_) => {
-                    info!("No existing session found, creating new one");
-                    Session::new()
-                }
-            };
-
-            let config = Config {
-                session,
-                api_id: self.api_id,
-                api_hash: self.api_hash.clone(),
-                params: InitParams {
-                    ..Default::default()
-                },
-            };
-
-            let client = Client::connect(config).await?;
-
-            if !client.is_authorized().await? {
-                return Err("Client is not authorized. Please run the standalone analyzer first to authorize.".into());
             }
-
-            self.client = Some(client);
         }
 
         Ok(self.client.as_ref().unwrap())
@@ -83,8 +136,6 @@ impl AnalysisEngine {
         &mut self,
         channel_username: &str,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let client = self.ensure_client().await?;
-
         let clean_username = if channel_username.starts_with('@') {
             &channel_username[1..]
         } else {
@@ -93,25 +144,79 @@ impl AnalysisEngine {
 
         info!("Validating channel: {}", clean_username);
 
-        match client.resolve_username(clean_username).await {
-            Ok(Some(_)) => {
-                info!("Channel {} is valid and accessible", clean_username);
-                Ok(true)
-            }
-            Ok(None) => {
-                info!("Channel {} not found", clean_username);
-                Ok(false)
-            }
-            Err(e) => {
-                error!("Error validating channel {}: {}", clean_username, e);
-                Err(e.into())
+        for attempt in 0..=MAX_RETRIES {
+            let client = match self.ensure_client().await {
+                Ok(client) => client,
+                Err(e) => {
+                    if attempt == MAX_RETRIES {
+                        error!(
+                            "Failed to get client for channel validation after {} attempts: {}",
+                            MAX_RETRIES + 1,
+                            e
+                        );
+                        return Err(e);
+                    }
+
+                    let delay = calculate_delay(attempt);
+                    warn!(
+                        "Failed to get client for channel validation (attempt {}/{}): {}. Retrying in {}ms",
+                        attempt + 1,
+                        MAX_RETRIES + 1,
+                        e,
+                        delay.as_millis()
+                    );
+                    sleep(delay).await;
+                    continue;
+                }
+            };
+
+            match client.resolve_username(clean_username).await {
+                Ok(Some(_)) => {
+                    info!(
+                        "Channel {} is valid and accessible (attempt {})",
+                        clean_username,
+                        attempt + 1
+                    );
+                    return Ok(true);
+                }
+                Ok(None) => {
+                    info!("Channel {} not found", clean_username);
+                    return Ok(false);
+                }
+                Err(e) => {
+                    if attempt == MAX_RETRIES {
+                        error!(
+                            "Error validating channel {} after {} attempts: {}",
+                            clean_username,
+                            MAX_RETRIES + 1,
+                            e
+                        );
+                        return Err(e.into());
+                    }
+
+                    let delay = calculate_delay(attempt);
+                    warn!(
+                        "Channel validation failed for {} (attempt {}/{}): {}. Retrying in {}ms",
+                        clean_username,
+                        attempt + 1,
+                        MAX_RETRIES + 1,
+                        e,
+                        delay.as_millis()
+                    );
+                    sleep(delay).await;
+                    // reset client on connection errors
+                    self.client = None;
+                }
             }
         }
+
+        unreachable!()
     }
 
-    pub async fn analyze_channel(
+    pub async fn analyze_channel_with_type(
         &mut self,
         channel_username: &str,
+        _analysis_type: &str,
     ) -> Result<AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting analysis for channel: {}", channel_username);
 
@@ -131,42 +236,18 @@ impl AnalysisEngine {
             }
         };
 
-        let messages_json = serde_json::to_string_pretty(&messages)?;
-
-        // check LLM cache first
         let cache_key = self.cache.get_llm_cache_key(&messages, "analysis");
         if let Some(cached_result) = self.cache.load_llm_result(&cache_key).await {
             return Ok(cached_result);
         }
 
-        let prompt = format!(
-            "Given the following messages from a Telegram channel, analyze the author profile and write three blocks of text in the following format:
-
-            <professional>This part should contain a professional analysis of the author, including their expertise, background, and any relevant professional details, as an advice to the hiring manager</professional>
-            <personal>This part should contain a personal analysis of the author, as written by a professional psychologist for non-professional reader</personal>
-            <roast>This part should contain a roast of the author, as written by a friend of theirs, that is somewhat harsh</roast>
-            Each part should be around 2048 characters long, in the language of the messages.
-
-Messages:
-{}",
-            messages_json
-        );
+        let prompt = Self::generate_analysis_prompt(&messages)?;
 
         info!("Querying LLM for analysis...");
-        let llm_response = query_llm(&prompt, "gemini-2.5-flash").await?;
+        let mut result = Self::query_and_parse_analysis(&prompt).await?;
+        result.messages_count = messages.len();
 
-        let professional = extract_tag(&llm_response.content, "professional");
-        let personal = extract_tag(&llm_response.content, "personal");
-        let roast = extract_tag(&llm_response.content, "roast");
-
-        let result = AnalysisResult {
-            professional: professional,
-            personal: personal,
-            roast: roast,
-            messages_count: messages.len(),
-        };
-
-        // cache the LLM result
+        // cache the full analysis result
         if let Err(e) = self.cache.save_llm_result(&cache_key, &result).await {
             info!("Failed to cache LLM result: {}", e);
         }
@@ -181,43 +262,152 @@ Messages:
     ) -> Result<Vec<MessageDict>, Box<dyn std::error::Error + Send + Sync>> {
         info!("Getting messages from {}", channel_username);
 
-        let mut messages = Vec::new();
-
         let clean_username = if channel_username.starts_with('@') {
             &channel_username[1..]
         } else {
             channel_username
         };
 
-        let channel = client.resolve_username(clean_username).await?;
+        // retry channel resolution
+        let channel = {
+            let mut attempt = 0;
+            loop {
+                match client.resolve_username(clean_username).await {
+                    Ok(channel) => break channel,
+                    Err(e) => {
+                        if attempt == MAX_RETRIES {
+                            error!(
+                                "Failed to resolve channel {} after {} attempts: {}",
+                                clean_username,
+                                MAX_RETRIES + 1,
+                                e
+                            );
+                            return Err(e.into());
+                        }
 
+                        let delay = calculate_delay(attempt);
+                        warn!(
+                            "Failed to resolve channel {} for message fetching (attempt {}/{}): {}. Retrying in {}ms",
+                            clean_username,
+                            attempt + 1,
+                            MAX_RETRIES + 1,
+                            e,
+                            delay.as_millis()
+                        );
+                        sleep(delay).await;
+                        attempt += 1;
+                    }
+                }
+            }
+        };
+
+        let mut messages = Vec::new();
         let mut skipped = 0;
+
         if let Some(chat) = channel {
-            let mut message_iter = client.iter_messages(&chat);
+            for attempt in 0..=MAX_RETRIES {
+                let mut message_iter = client.iter_messages(&chat);
+                let mut current_messages = Vec::new();
+                let mut current_skipped = 0;
 
-            while let Some(message) = message_iter.next().await? {
-                if message.forward_header().is_some() {
-                    skipped += 1;
-                    continue;
+                match async {
+                    while let Some(message) = message_iter.next().await? {
+                        if message.forward_header().is_some() {
+                            current_skipped += 1;
+                            continue;
+                        }
+                        if message.text().len() < 32 {
+                            current_skipped += 1;
+                            continue;
+                        }
+
+                        current_messages.push(MessageDict {
+                            date: Some(message.date().to_rfc2822()),
+                            message: Some(message.text().to_string()),
+                        });
+
+                        if current_messages.len() >= 200 {
+                            break;
+                        }
+                    }
+                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
                 }
-                if message.text().len() < 32 {
-                    skipped += 1;
-                    continue;
-                }
+                .await
+                {
+                    Ok(_) => {
+                        messages = current_messages;
+                        skipped = current_skipped;
+                        info!(
+                            "Retrieved {} messages, skipped {} (attempt {})",
+                            messages.len(),
+                            skipped,
+                            attempt + 1
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        if attempt == MAX_RETRIES {
+                            error!(
+                                "Failed to fetch messages from {} after {} attempts: {}",
+                                clean_username,
+                                MAX_RETRIES + 1,
+                                e
+                            );
+                            return Err(e);
+                        }
 
-                messages.push(MessageDict {
-                    date: Some(message.date().to_rfc2822()),
-                    message: Some(message.text().to_string()),
-                });
-
-                if messages.len() >= 200 {
-                    break;
+                        let delay = calculate_delay(attempt);
+                        warn!(
+                            "Failed to fetch messages from {} (attempt {}/{}): {}. Retrying in {}ms",
+                            clean_username,
+                            attempt + 1,
+                            MAX_RETRIES + 1,
+                            e,
+                            delay.as_millis()
+                        );
+                        sleep(delay).await;
+                    }
                 }
             }
         }
 
         info!("Retrieved {} messages, skipped {}", messages.len(), skipped);
         Ok(messages)
+    }
+
+    fn generate_analysis_prompt(
+        messages: &[MessageDict],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let messages_json = serde_json::to_string_pretty(messages)?;
+
+        Ok(format!(
+            "Given the following messages from a Telegram channel, analyze the author profile and write three blocks of text in the following format:
+
+                    <professional>This part should contain a professional analysis of the author, including their expertise, background, and any relevant professional details, as an advice to the hiring manager</professional>
+                    <personal>This part should contain a personal analysis of the author, as written by a professional psychologist for non-professional reader</personal>
+                    <roast>This part should contain a roast of the author, as written by a friend of theirs, that is somewhat harsh</roast>
+                    Each part should be around 2048 characters long, in the language of the messages.
+Messages:
+{}",
+            messages_json
+        ))
+    }
+
+    async fn query_and_parse_analysis(
+        prompt: &str,
+    ) -> Result<AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
+        let llm_response = query_llm(prompt, "gemini-2.5-pro").await?;
+
+        let professional = extract_tag(&llm_response.content, "professional");
+        let personal = extract_tag(&llm_response.content, "personal");
+        let roast = extract_tag(&llm_response.content, "roast");
+
+        Ok(AnalysisResult {
+            professional,
+            personal,
+            roast,
+            messages_count: 0, // will be set by caller
+        })
     }
 }
 

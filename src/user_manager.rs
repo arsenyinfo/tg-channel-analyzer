@@ -1,5 +1,5 @@
 use deadpool_postgres::Pool;
-use log::{error, info, warn};
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 
@@ -82,29 +82,6 @@ impl UserManager {
         Ok(user)
     }
 
-    /// checks if user has available credits
-    pub async fn check_credits(
-        &self,
-        telegram_user_id: i64,
-    ) -> Result<i32, Box<dyn Error + Send + Sync>> {
-        let client = self.pool.get().await?;
-
-        let row = client
-            .query_opt(
-                "SELECT analysis_credits FROM users WHERE telegram_user_id = $1",
-                &[&telegram_user_id],
-            )
-            .await?;
-
-        match row {
-            Some(row) => Ok(row.get(0)),
-            None => {
-                warn!("User {} not found when checking credits", telegram_user_id);
-                Ok(0)
-            }
-        }
-    }
-
     /// consumes one credit and records the analysis
     pub async fn consume_credit(
         &self,
@@ -180,38 +157,5 @@ impl UserManager {
                 Err("User not found".into())
             }
         }
-    }
-
-    /// gets user analysis history (for future admin features)
-    pub async fn get_user_analyses(
-        &self,
-        telegram_user_id: i64,
-        limit: Option<i64>,
-    ) -> Result<Vec<(String, std::time::SystemTime)>, Box<dyn Error + Send + Sync>> {
-        let client = self.pool.get().await?;
-        let limit = limit.unwrap_or(10);
-
-        let rows = client
-            .query(
-                "SELECT ua.channel_name, ua.analysis_timestamp 
-                 FROM user_analyses ua 
-                 JOIN users u ON ua.user_id = u.id 
-                 WHERE u.telegram_user_id = $1 
-                 ORDER BY ua.analysis_timestamp DESC 
-                 LIMIT $2",
-                &[&telegram_user_id, &limit],
-            )
-            .await?;
-
-        let analyses = rows
-            .iter()
-            .map(|row| {
-                let channel_name: String = row.get(0);
-                let timestamp: std::time::SystemTime = row.get(1);
-                (channel_name, timestamp)
-            })
-            .collect();
-
-        Ok(analyses)
     }
 }

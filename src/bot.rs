@@ -1,8 +1,12 @@
+use comrak::{markdown_to_html, ComrakOptions};
+use html_escape;
 use log::{error, info};
-use regex::Regex;
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, ParseMode};
+use teloxide::types::{
+    CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, ParseMode,
+    PreCheckoutQuery, SuccessfulPayment,
+};
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
 
@@ -11,13 +15,21 @@ use crate::cache::AnalysisResult;
 use crate::user_manager::UserManager;
 use deadpool_postgres::Pool;
 
+// payment configuration constants
+const CREDITS_1_PRICE: u32 = 10;
+const CREDITS_10_PRICE: u32 = 50;
+const CREDITS_1_AMOUNT: i32 = 1;
+const CREDITS_10_AMOUNT: i32 = 10;
+
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Supported commands:")]
 pub enum Command {
     #[command(description = "start the bot")]
     Start,
-    #[command(description = "add credits to your account")]
-    AddCredits { amount: i32 },
+    #[command(description = "buy 1 analysis for 10 star")]
+    Buy1,
+    #[command(description = "buy 10 analyses for 50 stars")]
+    Buy10,
 }
 
 pub struct TelegramBot {
@@ -27,101 +39,123 @@ pub struct TelegramBot {
 }
 
 impl TelegramBot {
-    fn escape_markdown_v2(text: &str) -> String {
-        // use safe placeholders that won't get escaped
-        let mut result = text.to_string();
+    fn create_payment_keyboard() -> InlineKeyboardMarkup {
+        let buy1_button = InlineKeyboardButton::callback(
+            format!(
+                "💎 Buy {} Credit ({} ⭐)",
+                CREDITS_1_AMOUNT, CREDITS_1_PRICE
+            ),
+            "buy_1",
+        );
+        let buy10_button = InlineKeyboardButton::callback(
+            format!(
+                "💎 Buy {} Credits ({} ⭐)",
+                CREDITS_10_AMOUNT, CREDITS_10_PRICE
+            ),
+            "buy_10",
+        );
 
-        // first escape backslashes
-        result = result.replace("\\", "\\\\");
-
-        let bold_re = Regex::new(r"\*\*([^*]+)\*\*").unwrap();
-        let underline_re = Regex::new(r"__([^_]+)__").unwrap();
-        let italic_re = Regex::new(r"\*([^*]+)\*").unwrap();
-
-        // use safe placeholder format with no special chars
-        let mut replacements = Vec::new();
-        let mut counter = 0;
-
-        // process bold first (**text** -> *text* for MarkdownV2)
-        result = bold_re
-            .replace_all(&result, |caps: &regex::Captures| {
-                let content = &caps[1];
-                let escaped_content = Self::escape_content_only(content);
-                let placeholder = format!("SAFEPLACEHOLDERBOLD{}", counter);
-                replacements.push((placeholder.clone(), format!("*{}*", escaped_content)));
-                counter += 1;
-                placeholder
-            })
-            .to_string();
-
-        // process underline (__text__ -> __text__ for MarkdownV2)
-        result = underline_re
-            .replace_all(&result, |caps: &regex::Captures| {
-                let content = &caps[1];
-                let escaped_content = Self::escape_content_only(content);
-                let placeholder = format!("SAFEPLACEHOLDERUNDERLINE{}", counter);
-                replacements.push((placeholder.clone(), format!("__{}__", escaped_content)));
-                counter += 1;
-                placeholder
-            })
-            .to_string();
-
-        // process italic (*text* -> _text_ for MarkdownV2)
-        result = italic_re
-            .replace_all(&result, |caps: &regex::Captures| {
-                let content = &caps[1];
-                let escaped_content = Self::escape_content_only(content);
-                let placeholder = format!("SAFEPLACEHOLDERITALIC{}", counter);
-                replacements.push((placeholder.clone(), format!("_{}_", escaped_content)));
-                counter += 1;
-                placeholder
-            })
-            .to_string();
-
-        // escape all remaining special characters
-        result = result
-            .replace("_", "\\_")
-            .replace("[", "\\[")
-            .replace("]", "\\]")
-            .replace("(", "\\(")
-            .replace(")", "\\)")
-            .replace("~", "\\~")
-            .replace(">", "\\>")
-            .replace("#", "\\#")
-            .replace("+", "\\+")
-            .replace("-", "\\-")
-            .replace("=", "\\=")
-            .replace("|", "\\|")
-            .replace("{", "\\{")
-            .replace("}", "\\}")
-            .replace(".", "\\.")
-            .replace("!", "\\!")
-            .replace("*", "\\*");
-
-        // restore formatted content
-        for (placeholder, replacement) in replacements {
-            result = result.replace(&placeholder, &replacement);
-        }
-
-        result
+        InlineKeyboardMarkup::new(vec![vec![buy1_button], vec![buy10_button]])
     }
 
-    fn escape_content_only(text: &str) -> String {
-        text.replace("[", "\\[")
-            .replace("]", "\\]")
-            .replace("(", "\\(")
-            .replace(")", "\\)")
-            .replace("~", "\\~")
-            .replace(">", "\\>")
-            .replace("#", "\\#")
-            .replace("+", "\\+")
-            .replace("-", "\\-")
-            .replace("=", "\\=")
-            .replace("|", "\\|")
-            .replace("{", "\\{")
-            .replace("}", "\\}")
-            .replace(".", "\\.")
-            .replace("!", "\\!")
+    fn create_analysis_selection_keyboard(channel_name: &str) -> InlineKeyboardMarkup {
+        let professional_button = InlineKeyboardButton::callback(
+            "💼 Professional Analysis",
+            format!("analysis_professional_{}", channel_name),
+        );
+        let personal_button = InlineKeyboardButton::callback(
+            "🧠 Personal Analysis",
+            format!("analysis_personal_{}", channel_name),
+        );
+        let roast_button = InlineKeyboardButton::callback(
+            "🔥 Roast Analysis",
+            format!("analysis_roast_{}", channel_name),
+        );
+
+        InlineKeyboardMarkup::new(vec![
+            vec![professional_button],
+            vec![personal_button],
+            vec![roast_button],
+        ])
+    }
+
+    fn escape_html(text: &str) -> String {
+        // use proper HTML escaping library
+        html_escape::encode_text(text).to_string()
+    }
+
+    fn markdown_to_html_safe(text: &str) -> String {
+        // convert markdown to HTML with Telegram-compatible options
+        let mut options = ComrakOptions::default();
+        options.extension.strikethrough = true;
+        options.extension.autolink = true;
+        options.render.hardbreaks = true;
+        options.render.unsafe_ = false;
+
+        let html = markdown_to_html(text, &options);
+
+        // telegram HTML mode only supports: b, i, u, s, code, pre, a
+        // replace unsupported tags with supported ones or remove them
+        let html = html
+            .replace("<p>", "")
+            .replace("</p>", "\n\n")
+            .replace("<h1>", "<b>")
+            .replace("</h1>", "</b>\n\n")
+            .replace("<h2>", "<b>")
+            .replace("</h2>", "</b>\n\n")
+            .replace("<h3>", "<b>")
+            .replace("</h3>", "</b>\n")
+            .replace("<h4>", "<b>")
+            .replace("</h4>", "</b>\n")
+            .replace("<h5>", "<b>")
+            .replace("</h5>", "</b>\n")
+            .replace("<h6>", "<b>")
+            .replace("</h6>", "</b>\n")
+            .replace("<strong>", "<b>")
+            .replace("</strong>", "</b>")
+            .replace("<em>", "<i>")
+            .replace("</em>", "</i>")
+            .replace("<del>", "<s>")
+            .replace("</del>", "</s>")
+            // remove list tags and convert to plain text with bullets
+            .replace("<ul>", "")
+            .replace("</ul>", "\n")
+            .replace("<ol>", "")
+            .replace("</ol>", "\n")
+            .replace("<li>", "• ")
+            .replace("</li>", "\n")
+            // remove other unsupported tags
+            .replace("<div>", "")
+            .replace("</div>", "\n")
+            .replace("<span>", "")
+            .replace("</span>", "")
+            .replace("<br>", "\n")
+            .replace("<br/>", "\n")
+            .replace("<br />", "\n")
+            .replace("<hr>", "\n───────────\n")
+            .replace("<hr/>", "\n───────────\n")
+            .replace("<hr />", "\n───────────\n");
+
+        // clean up excessive whitespace
+        let lines: Vec<&str> = html.lines().collect();
+        let mut result = Vec::new();
+        let mut empty_line_count = 0;
+
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                empty_line_count += 1;
+                // allow max 1 consecutive empty line (single blank line between paragraphs)
+                if empty_line_count <= 1 {
+                    result.push("");
+                }
+            } else {
+                empty_line_count = 0;
+                result.push(trimmed);
+            }
+        }
+
+        result.join("\n").trim().to_string()
     }
 
     pub async fn new(
@@ -139,26 +173,230 @@ impl TelegramBot {
         })
     }
 
+    async fn send_payment_invoice(
+        bot: Bot,
+        chat_id: ChatId,
+        credits: i32,
+        stars: u32,
+        title: &str,
+        description: &str,
+    ) -> ResponseResult<()> {
+        let prices = vec![LabeledPrice {
+            label: format!("{} credits", credits),
+            amount: stars,
+        }];
+
+        bot.send_invoice(
+            chat_id,
+            title,
+            description,
+            format!("credits_{}", credits),
+            "XTR",
+            prices,
+        )
+        .provider_token("")
+        .await?;
+
+        Ok(())
+    }
+
+    async fn handle_pre_checkout_query(bot: Bot, query: PreCheckoutQuery) -> ResponseResult<()> {
+        // approve all pre-checkout queries for digital goods
+        // in a real implementation, you might want to add additional validation
+        bot.answer_pre_checkout_query(query.id, true).await?;
+        info!(
+            "Approved pre-checkout query for {} stars",
+            query.total_amount
+        );
+        Ok(())
+    }
+
+    async fn handle_successful_payment(
+        bot: Bot,
+        msg: Message,
+        payment: SuccessfulPayment,
+        user_manager: Arc<UserManager>,
+    ) -> ResponseResult<()> {
+        let telegram_user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+
+        // parse credits from payload
+        let credits = if payment.invoice_payload == "credits_1" {
+            1
+        } else if payment.invoice_payload == "credits_10" {
+            10
+        } else {
+            error!("Unknown payment payload: {}", payment.invoice_payload);
+            return Ok(());
+        };
+
+        // add credits to user account
+        match user_manager.add_credits(telegram_user_id, credits).await {
+            Ok(new_balance) => {
+                let success_msg = format!(
+                    "🎉 <b>Payment Successful!</b> - @ScratchAuthorEgoBot\n\n\
+                    ✅ Added {} credits to your account\n\
+                    💳 New balance: {} credits\n\n\
+                    You can now analyze channels by sending me a channel username like <code>@channelname</code>",
+                    credits, new_balance
+                );
+
+                bot.send_message(msg.chat.id, success_msg)
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+
+                info!(
+                    "Successfully processed payment: {} credits for user {}",
+                    credits, telegram_user_id
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Failed to add credits after payment for user {}: {}",
+                    telegram_user_id, e
+                );
+                bot.send_message(
+                    msg.chat.id,
+                    "⚠️ Payment received but failed to add credits. Please contact support with your payment ID."
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn run(&self) {
         info!("Starting Telegram bot...");
 
-        let handler = Update::filter_message()
+        let handler = dptree::entry()
+            .branch(Update::filter_pre_checkout_query().endpoint(Self::handle_pre_checkout_query))
+            .branch(Update::filter_callback_query().endpoint(Self::handle_callback_query))
             .branch(
-                dptree::entry()
-                    .filter_command::<Command>()
-                    .endpoint(Self::handle_command),
-            )
-            .branch(dptree::endpoint(Self::handle_message));
+                Update::filter_message()
+                    .branch(
+                        dptree::entry()
+                            .filter_command::<Command>()
+                            .endpoint(Self::handle_command),
+                    )
+                    .branch(
+                        dptree::entry()
+                            .filter_map(|msg: Message| {
+                                msg.successful_payment()
+                                    .cloned()
+                                    .map(|payment| (msg, payment))
+                            })
+                            .endpoint(
+                                |(msg, payment): (Message, SuccessfulPayment),
+                                 bot: Bot,
+                                 user_manager: Arc<UserManager>| {
+                                    Self::handle_successful_payment(bot, msg, payment, user_manager)
+                                },
+                            ),
+                    )
+                    .branch(dptree::endpoint(Self::handle_message)),
+            );
 
         Dispatcher::builder(self.bot.clone(), handler)
             .dependencies(dptree::deps![
                 self.analysis_engine.clone(),
                 self.user_manager.clone()
             ])
+            .error_handler(
+                teloxide::error_handlers::LoggingErrorHandler::with_custom_text(
+                    "An error from the update listener",
+                ),
+            )
             .enable_ctrlc_handler()
             .build()
             .dispatch()
             .await;
+    }
+
+    async fn handle_callback_query(
+        bot: Bot,
+        query: CallbackQuery,
+        analysis_engine: Arc<Mutex<AnalysisEngine>>,
+        user_manager: Arc<UserManager>,
+    ) -> ResponseResult<()> {
+        if let Some(data) = &query.data {
+            if let Some(message) = &query.message {
+                match data.as_str() {
+                    "buy_1" => {
+                        Self::send_payment_invoice(
+                            bot.clone(),
+                            message.chat().id,
+                            CREDITS_1_AMOUNT,
+                            CREDITS_1_PRICE,
+                            "1 Channel Analysis",
+                            "Get 1 analysis credit to analyze any Telegram channel",
+                        )
+                        .await?;
+
+                        bot.answer_callback_query(&query.id).await?;
+                    }
+                    "buy_10" => {
+                        Self::send_payment_invoice(
+                            bot.clone(),
+                            message.chat().id,
+                            CREDITS_10_AMOUNT,
+                            CREDITS_10_PRICE,
+                            "10 Channel Analyses",
+                            &format!("Get 10 analysis credits to analyze any Telegram channels ({} stars discount!)",
+                                (CREDITS_1_PRICE * CREDITS_10_AMOUNT as u32) - CREDITS_10_PRICE),
+                        )
+                        .await?;
+
+                        bot.answer_callback_query(&query.id).await?;
+                    }
+                    callback_data if callback_data.starts_with("analysis_") => {
+                        // parse analysis type and channel from callback data
+                        let parts: Vec<&str> = callback_data.splitn(3, '_').collect();
+                        if parts.len() >= 3 {
+                            let analysis_type = parts[1]; // professional, personal, or roast
+                            let channel_name = parts[2];
+
+                            let telegram_user_id = query.from.id.0 as i64;
+
+                            // start analysis in background
+                            let bot_clone = bot.clone();
+                            let user_chat_id = message.chat().id;
+                            let channel_name_clone = channel_name.to_string();
+                            let analysis_type_clone = analysis_type.to_string();
+                            let analysis_engine_clone = analysis_engine.clone();
+                            let user_manager_clone = user_manager.clone();
+
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::perform_single_analysis(
+                                    bot_clone.clone(),
+                                    user_chat_id,
+                                    channel_name_clone,
+                                    analysis_type_clone,
+                                    analysis_engine_clone,
+                                    user_manager_clone,
+                                    telegram_user_id,
+                                )
+                                .await
+                                {
+                                    error!("Analysis failed: {}", e);
+                                    let _ = bot_clone
+                                        .send_message(
+                                            user_chat_id,
+                                            "❌ Analysis failed. Please try again later.",
+                                        )
+                                        .await;
+                                }
+                            });
+                        }
+
+                        bot.answer_callback_query(&query.id).await?;
+                    }
+                    _ => {
+                        bot.answer_callback_query(&query.id).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn handle_command(
@@ -169,50 +407,101 @@ impl TelegramBot {
     ) -> ResponseResult<()> {
         match cmd {
             Command::Start => {
-                let intro_text = "🤖 <b>Channel Analyzer Bot</b>\n\n\
-                    Welcome! I can analyze Telegram channels and provide insights.\n\n\
-                    📋 <b>How to use:</b>\n\
-                    • Send me a channel username (e.g., <code>@channelname</code>)\n\
-                    • I'll validate the channel and start analysis\n\
-                    • Results will be sent directly to you here\n\n\
-                    ⚡ <b>Features:</b>\n\
-                    • Deep content analysis using AI\n\
-                    • Author profile insights\n\
-                    • Channel activity patterns\n\n\
-                    Just send me a channel name to get started!";
+                // get user info from telegram message
+                let telegram_user_id = msg.from.as_ref().map(|user| user.id.0 as i64).unwrap_or(0);
+                let username = msg.from.as_ref().and_then(|user| user.username.as_deref());
+                let first_name = msg.from.as_ref().map(|user| user.first_name.as_str());
+                let last_name = msg.from.as_ref().and_then(|user| user.last_name.as_deref());
 
-                bot.send_message(msg.chat.id, intro_text)
-                    .parse_mode(ParseMode::Html)
-                    .await?;
-            }
-            Command::AddCredits { amount } => {
-                if amount <= 0 || amount > 100 {
-                    bot.send_message(msg.chat.id, "❌ Invalid amount. Please specify between 1 and 100 credits.")
-                        .await?;
-                    return Ok(());
-                }
-                
-                let telegram_user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-                if telegram_user_id == 0 {
-                    bot.send_message(msg.chat.id, "❌ Could not identify user.")
-                        .await?;
-                    return Ok(());
-                }
-                
-                match user_manager.add_credits(telegram_user_id, amount).await {
-                    Ok(new_balance) => {
-                        bot.send_message(
-                            msg.chat.id,
-                            format!("✅ Successfully added {} credits! Your new balance is: {} credits", amount, new_balance)
-                        )
-                        .await?;
-                    }
+                // get or create user to check credit balance
+                let user = match user_manager
+                    .get_or_create_user(telegram_user_id, username, first_name, last_name)
+                    .await
+                {
+                    Ok(user) => user,
                     Err(e) => {
-                        error!("Failed to add credits: {}", e);
-                        bot.send_message(msg.chat.id, "❌ Failed to add credits. Please try again later.")
+                        log::error!("Failed to get/create user: {}", e);
+                        bot.send_message(msg.chat.id, "❌ Sorry, there was an error accessing your account. Please try again later.")
                             .await?;
+                        return Ok(());
                     }
+                };
+
+                if user.analysis_credits <= 0 {
+                    // user has no credits - show pricing and payment options
+                    let intro_text = format!(
+                        "🤖 <b>@ScratchAuthorEgoBot - Channel Analyzer</b>\n\n\
+                        Welcome! I can analyze Telegram channels and provide insights.\n\n\
+                        📋 <b>How to use:</b>\n\
+                        • Send me a channel username (e.g., <code>@channelname</code>)\n\
+                        • I'll validate the channel and show analysis options\n\
+                        • Choose your preferred analysis type\n\
+                        • Get detailed results in seconds!\n\n\
+                        ⚡ <b>Analysis Types:</b>\n\
+                        • 💼 Professional: Expert assessment for hiring\n\
+                        • 🧠 Personal: Psychological profile insights\n\
+                        • 🔥 Roast: Fun, brutally honest critique\n\n\
+                        💰 <b>Pricing:</b>\n\
+                        • 1 analysis: {} ⭐ stars\n\
+                        • 10 analyses: {} ⭐ stars (save {} stars!)\n\n\
+                        Choose a package below or just send me a channel name to get started!",
+                        CREDITS_1_PRICE,
+                        CREDITS_10_PRICE,
+                        (CREDITS_1_PRICE * CREDITS_10_AMOUNT as u32) - CREDITS_10_PRICE
+                    );
+
+                    bot.send_message(msg.chat.id, intro_text)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(Self::create_payment_keyboard())
+                        .await?;
+                } else {
+                    // user has credits - show welcome without pricing
+                    let intro_text = format!(
+                        "🤖 <b>@ScratchAuthorEgoBot - Channel Analyzer</b>\n\n\
+                        Welcome back! I can analyze Telegram channels and provide insights.\n\n\
+                        📋 <b>How to use:</b>\n\
+                        • Send me a channel username (e.g., <code>@channelname</code>)\n\
+                        • I'll validate the channel and show analysis options\n\
+                        • Choose your preferred analysis type\n\
+                        • Get detailed results in seconds!\n\n\
+                        ⚡ <b>Analysis Types:</b>\n\
+                        • 💼 Professional: Expert assessment for hiring\n\
+                        • 🧠 Personal: Psychological profile insights\n\
+                        • 🔥 Roast: Fun, brutally honest critique\n\n\
+                        💳 <b>Your Status:</b>\n\
+                        • Credits remaining: <b>{}</b>\n\
+                        • Total analyses performed: <b>{}</b>\n\n\
+                        Just send me a channel name to get started!",
+                        user.analysis_credits, user.total_analyses_performed
+                    );
+
+                    bot.send_message(msg.chat.id, intro_text)
+                        .parse_mode(ParseMode::Html)
+                        .await?;
                 }
+            }
+            Command::Buy1 => {
+                Self::send_payment_invoice(
+                    bot,
+                    msg.chat.id,
+                    CREDITS_1_AMOUNT,
+                    CREDITS_1_PRICE,
+                    "1 Channel Analysis",
+                    "Get 1 analysis credit to analyze any Telegram channel",
+                )
+                .await?;
+            }
+            Command::Buy10 => {
+                Self::send_payment_invoice(
+                    bot,
+                    msg.chat.id,
+                    CREDITS_10_AMOUNT,
+                    CREDITS_10_PRICE,
+                    "10 Channel Analyses",
+                    &format!("Get 10 analysis credits to analyze any Telegram channels ({} stars discount!)",
+                        (CREDITS_1_PRICE * CREDITS_10_AMOUNT as u32) - CREDITS_10_PRICE),
+                )
+                .await?;
             }
         }
         Ok(())
@@ -257,66 +546,57 @@ impl TelegramBot {
                 // check if user has credits
                 if user.analysis_credits <= 0 {
                     let no_credits_msg = format!(
-                        "❌ *No Analysis Credits Available*\n\n\
-                        You have used all your free analysis credits\\.\n\n\
-                        💰 *Add More Credits:*\n\
-                        Use `/addcredits <amount>` to add more credits\\.\n\
-                        Example: `/addcredits 5`\n\n\
-                        📊 *Your Stats:*\n\
-                        • Credits remaining: `{}`\n\
-                        • Total analyses performed: `{}`",
-                        user.analysis_credits, user.total_analyses_performed
+                        "❌ <b>No Analysis Credits Available</b>\n\n\
+                        You have used all your free analysis credits.\n\n\
+                        💰 <b>Purchase More Credits:</b>\n\
+                        • 1 analysis for {} ⭐ stars\n\
+                        • 10 analyses for {} ⭐ stars (save {} stars!)\n\n\
+                        📊 <b>Your Stats:</b>\n\
+                        • Credits remaining: <code>{}</code>\n\
+                        • Total analyses performed: <code>{}</code>\n\n\
+                        Choose a package below to continue analyzing channels!",
+                        CREDITS_1_PRICE,
+                        CREDITS_10_PRICE,
+                        (CREDITS_1_PRICE * CREDITS_10_AMOUNT as u32) - CREDITS_10_PRICE,
+                        user.analysis_credits,
+                        user.total_analyses_performed
                     );
 
                     bot.send_message(msg.chat.id, no_credits_msg)
-                        .parse_mode(ParseMode::MarkdownV2)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(Self::create_payment_keyboard())
                         .await?;
                     return Ok(());
                 }
 
                 // send immediate response with credit info
                 let credits_msg = format!(
-                    "🔍 Validating channel and starting analysis\\.\\.\\.\n\n\
-                    💳 Credits remaining after this analysis: `{}`",
+                    "🔍 Validating channel...\n\n\
+                    💳 Credits remaining after analysis: <code>{}</code>",
                     user.analysis_credits - 1
                 );
                 bot.send_message(msg.chat.id, credits_msg)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .await?;
 
-                // validate and analyze channel
+                // validate channel first
                 let mut engine = analysis_engine.lock().await;
                 match engine.validate_channel(text).await {
                     Ok(true) => {
-                        drop(engine); // release lock before long operation
+                        drop(engine); // release lock
 
-                        // start analysis in background
-                        let bot_clone = bot.clone();
-                        let user_chat_id = msg.chat.id;
-                        let channel_name = text.to_string();
-                        let analysis_engine_clone = analysis_engine.clone();
-                        let user_manager_clone = user_manager.clone();
+                        // show analysis type selection
+                        let selection_msg = format!(
+                            "✅ <b>Channel Validated!</b> by @ScratchAuthorEgoBot\n\n\
+                            🎯 <b>Channel:</b> <code>{}</code>\n\n\
+                            Please choose the type of analysis you'd like to perform:",
+                            Self::escape_html(text)
+                        );
 
-                        tokio::spawn(async move {
-                            if let Err(e) = Self::perform_analysis(
-                                bot_clone.clone(),
-                                user_chat_id,
-                                channel_name,
-                                analysis_engine_clone,
-                                user_manager_clone,
-                                telegram_user_id,
-                            )
-                            .await
-                            {
-                                error!("Analysis failed: {}", e);
-                                let _ = bot_clone
-                                    .send_message(
-                                        user_chat_id,
-                                        "❌ Analysis failed. Please try again later.",
-                                    )
-                                    .await;
-                            }
-                        });
+                        bot.send_message(msg.chat.id, selection_msg)
+                            .parse_mode(ParseMode::Html)
+                            .reply_markup(Self::create_analysis_selection_keyboard(text))
+                            .await?;
                     }
                     Ok(false) => {
                         bot.send_message(
@@ -344,26 +624,42 @@ impl TelegramBot {
         Ok(())
     }
 
-    async fn perform_analysis(
+    async fn perform_single_analysis(
         bot: Bot,
         user_chat_id: ChatId,
         channel_name: String,
+        analysis_type: String,
         analysis_engine: Arc<Mutex<AnalysisEngine>>,
         user_manager: Arc<UserManager>,
         telegram_user_id: i64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Starting analysis for channel: {}", channel_name);
+        info!(
+            "Starting {} analysis for channel: {}",
+            analysis_type, channel_name
+        );
 
         // notify user that analysis is starting
+        let analysis_emoji = match analysis_type.as_str() {
+            "professional" => "💼",
+            "personal" => "🧠",
+            "roast" => "🔥",
+            _ => "🔍",
+        };
+
         bot.send_message(
             user_chat_id,
-            "✅ Channel validated! Starting analysis... This may take a few minutes.",
+            format!(
+                "Starting {} {} analysis... This may take a few minutes.",
+                analysis_emoji, analysis_type
+            ),
         )
         .await?;
 
         // perform analysis
         let mut engine = analysis_engine.lock().await;
-        let result = engine.analyze_channel(&channel_name).await?;
+        let result = engine
+            .analyze_channel_with_type(&channel_name, &analysis_type)
+            .await?;
         drop(engine);
 
         // consume credit after successful analysis
@@ -388,63 +684,93 @@ impl TelegramBot {
 
         // notify user that analysis is complete and send results with credit info
         let completion_msg = format!(
-            "✅ *Analysis Complete\\!*\n\n\
-            📊 Your results are ready\\.\n\
-            💳 Credits remaining: `{}`",
+            "✅ <b>{} Analysis Complete!</b> by @ScratchAuthorEgoBot\n\n\
+            📊 Your results are ready.\n\
+            💳 Credits remaining: <code>{}</code>",
+            analysis_type
+                .chars()
+                .next()
+                .unwrap()
+                .to_uppercase()
+                .collect::<String>()
+                + &analysis_type[1..],
             remaining_credits
         );
         bot.send_message(user_chat_id, completion_msg)
-            .parse_mode(ParseMode::MarkdownV2)
+            .parse_mode(ParseMode::Html)
             .await?;
 
-        // send results directly to user
-        Self::send_results_to_user(bot, user_chat_id, &channel_name, result).await?;
+        // send single analysis result to user
+        Self::send_single_analysis_to_user(
+            bot,
+            user_chat_id,
+            &channel_name,
+            &analysis_type,
+            result,
+        )
+        .await?;
 
         Ok(())
     }
 
-    async fn send_results_to_user(
+    async fn send_single_analysis_to_user(
         bot: Bot,
         user_chat_id: ChatId,
         channel_name: &str,
+        analysis_type: &str,
         result: AnalysisResult,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let header = format!(
-            "📊 *Channel Analysis Results*\n\n\
-            🎯 *Channel:* `{}`\n\n",
-            Self::escape_markdown_v2(channel_name)
+            "📊 <b>Channel Analysis Results</b> by @ScratchAuthorEgoBot\n\n\
+            🎯 <b>Channel:</b> <code>{}</code>\n\n",
+            Self::escape_html(channel_name)
         );
 
-        let mut parts_sent = 0;
-        for (analysis_type, analysis_content) in [
-            ("Professional", &result.professional),
-            ("Personal", &result.personal),
-            ("Roast", &result.roast),
-        ] {
-            match analysis_content {
-                Some(content) if !content.is_empty() => {
-                    let analysis_header = format!("🔍 *{} Analysis:*\n\n", analysis_type);
-                    let escaped_content = Self::escape_markdown_v2(content);
-                    let full_message = format!("{}{}{}", header, analysis_header, escaped_content);
+        let (analysis_emoji, analysis_content) = match analysis_type {
+            "professional" => ("💼", &result.professional),
+            "personal" => ("🧠", &result.personal),
+            "roast" => ("🔥", &result.roast),
+            _ => ("🔍", &None),
+        };
 
-                    bot.send_message(user_chat_id, full_message)
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await?;
-                    parts_sent += 1;
-                }
-                _ => {
-                    info!(
-                        "No {} analysis content available for channel: {}",
-                        analysis_type, channel_name
-                    );
-                }
+        match analysis_content {
+            Some(content) if !content.is_empty() => {
+                let analysis_header = format!(
+                    "{} <b>{} Analysis:</b>\n\n",
+                    analysis_emoji,
+                    analysis_type
+                        .chars()
+                        .next()
+                        .unwrap()
+                        .to_uppercase()
+                        .collect::<String>()
+                        + &analysis_type[1..]
+                );
+                // convert LLM markdown content to HTML
+                let html_content = Self::markdown_to_html_safe(content);
+                let full_message = format!("{}{}{}", header, analysis_header, html_content);
+
+                bot.send_message(user_chat_id, full_message)
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+
+                info!(
+                    "Sent {} analysis results to user for channel: {}",
+                    analysis_type, channel_name
+                );
+            }
+            _ => {
+                bot.send_message(
+                    user_chat_id,
+                    format!(
+                        "❌ No {} analysis content was generated. Please try again.",
+                        analysis_type
+                    ),
+                )
+                .await?;
             }
         }
 
-        info!(
-            "Results sent to user for {} (split into {} parts)",
-            channel_name, parts_sent
-        );
         Ok(())
     }
 }

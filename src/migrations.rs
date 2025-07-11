@@ -5,10 +5,12 @@ use tokio_postgres::Transaction;
 pub struct MigrationManager;
 
 impl MigrationManager {
-    pub async fn run_migrations(pool: &Pool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn run_migrations(
+        pool: &Pool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Running database migrations...");
         let mut client = pool.get().await?;
-        
+
         // check if migrations table exists and create if not
         let needs_init = client
             .query_opt(
@@ -40,7 +42,9 @@ impl MigrationManager {
         Ok(())
     }
 
-    async fn initial_setup(transaction: &Transaction<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn initial_setup(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // create all tables and indexes in a single transaction
         let migration_sql = r#"
             -- Migration tracking table
@@ -105,7 +109,9 @@ impl MigrationManager {
         Ok(())
     }
 
-    async fn get_current_version(client: &deadpool_postgres::Object) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_current_version(
+        client: &deadpool_postgres::Object,
+    ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
         let row = client
             .query_one("SELECT MAX(version) FROM schema_migrations", &[])
             .await?;
@@ -113,21 +119,42 @@ impl MigrationManager {
     }
 
     fn latest_version() -> i32 {
-        1 // increment this when adding new migrations
+        2 // increment this when adding new migrations
     }
 
     async fn run_pending_migrations(
-        _transaction: &Transaction<'_>,
-        _current_version: i32,
+        transaction: &Transaction<'_>,
+        current_version: i32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // add future migrations here
-        // for version in (current_version + 1)..=Self::latest_version() {
-        //     match version {
-        //         2 => { /* migration 2 */ }
-        //         _ => {}
-        //     }
-        //     transaction.execute("INSERT INTO schema_migrations (version) VALUES ($1)", &[&version]).await?;
-        // }
+        for version in (current_version + 1)..=Self::latest_version() {
+            match version {
+                2 => {
+                    // add user_analysis_choices table for tracking pending analysis requests
+                    let migration_sql = r#"
+                        CREATE TABLE user_analysis_choices (
+                            id SERIAL PRIMARY KEY,
+                            user_id INTEGER NOT NULL REFERENCES users(id),
+                            telegram_user_id BIGINT NOT NULL,
+                            channel_name VARCHAR(255) NOT NULL,
+                            analysis_type VARCHAR(50) NOT NULL CHECK (analysis_type IN ('professional', 'personal', 'roast')),
+                            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                        );
+
+                        CREATE INDEX idx_user_analysis_choices_user_id ON user_analysis_choices(user_id);
+                        CREATE INDEX idx_user_analysis_choices_telegram_id ON user_analysis_choices(telegram_user_id);
+                        CREATE INDEX idx_user_analysis_choices_created ON user_analysis_choices(created_at);
+                    "#;
+                    transaction.batch_execute(migration_sql).await?;
+                }
+                _ => {}
+            }
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations (version) VALUES ($1)",
+                    &[&version],
+                )
+                .await?;
+        }
         Ok(())
     }
 }
