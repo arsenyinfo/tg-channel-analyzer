@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::analysis::AnalysisEngine;
 use crate::cache::AnalysisResult;
-use crate::user_manager::UserManager;
+use crate::user_manager::{UserManager, UserManagerError};
 use deadpool_postgres::Pool;
 
 // payment configuration constants
@@ -704,24 +704,29 @@ impl TelegramBot {
         {
             Ok(credits) => credits,
             Err(e) => {
-                let error_msg = e.to_string();
-                if error_msg.contains("Insufficient credits") {
-                    info!(
-                        "User {} has insufficient credits for channel {}",
-                        telegram_user_id, channel_name
-                    );
-                } else {
-                    error!(
-                        "Failed to consume credit for user {}: {}",
-                        telegram_user_id, e
-                    );
+                match &e {
+                    UserManagerError::InsufficientCredits(user_id) => {
+                        info!(
+                            "User {} has insufficient credits for channel {}",
+                            user_id, channel_name
+                        );
+                    }
+                    UserManagerError::UserNotFound(user_id) => {
+                        error!("User {} not found during credit consumption", user_id);
+                    }
+                    UserManagerError::DatabaseError(db_err) => {
+                        error!(
+                            "Database error while consuming credit for user {}: {}",
+                            telegram_user_id, db_err
+                        );
+                    }
                 }
                 bot.send_message(
                     user_chat_id,
                     "⚠️ Analysis completed but failed to update credits. Please contact support.",
                 )
                 .await?;
-                return Err(e);
+                return Err(Box::new(e));
             }
         };
 

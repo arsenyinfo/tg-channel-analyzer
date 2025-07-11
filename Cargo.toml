@@ -2,6 +2,11 @@
 name = "tg-main"
 version = "0.1.0"
 edition = "2021"
+default-run = "tg-main"
+
+[[bin]]
+name = "authorize"
+path = "src/bin/authorize.rs"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
@@ -27,3 +32,4 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 webpki-roots = "0.26"
 html-escape = "0.2.13"
 comrak = "0.39.1"
+bincode = "1.3"

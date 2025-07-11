@@ -2,6 +2,42 @@ use deadpool_postgres::Pool;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::fmt;
+
+#[derive(Debug)]
+pub enum UserManagerError {
+    InsufficientCredits(i64), // telegram_user_id
+    UserNotFound(i64),        // telegram_user_id
+    DatabaseError(Box<dyn Error + Send + Sync>),
+}
+
+impl fmt::Display for UserManagerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UserManagerError::InsufficientCredits(user_id) => {
+                write!(f, "User {} has insufficient credits", user_id)
+            }
+            UserManagerError::UserNotFound(user_id) => {
+                write!(f, "User {} not found", user_id)
+            }
+            UserManagerError::DatabaseError(e) => write!(f, "Database error: {}", e),
+        }
+    }
+}
+
+impl Error for UserManagerError {}
+
+impl From<tokio_postgres::Error> for UserManagerError {
+    fn from(err: tokio_postgres::Error) -> Self {
+        UserManagerError::DatabaseError(Box::new(err))
+    }
+}
+
+impl From<deadpool_postgres::PoolError> for UserManagerError {
+    fn from(err: deadpool_postgres::PoolError) -> Self {
+        UserManagerError::DatabaseError(Box::new(err))
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct User {
@@ -87,7 +123,7 @@ impl UserManager {
         &self,
         telegram_user_id: i64,
         channel_name: &str,
-    ) -> Result<i32, Box<dyn Error + Send + Sync>> {
+    ) -> Result<i32, UserManagerError> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
 
@@ -104,8 +140,22 @@ impl UserManager {
         let (user_id, remaining_credits) = match row {
             Some(row) => (row.get::<_, i32>(0), row.get::<_, i32>(1)),
             None => {
+                // check if user exists to provide more specific error before rolling back
+                let user_exists = transaction
+                    .query_opt(
+                        "SELECT 1 FROM users WHERE telegram_user_id = $1",
+                        &[&telegram_user_id],
+                    )
+                    .await?
+                    .is_some();
+                
                 transaction.rollback().await?;
-                return Err("Insufficient credits or user not found".into());
+                
+                return if user_exists {
+                    Err(UserManagerError::InsufficientCredits(telegram_user_id))
+                } else {
+                    Err(UserManagerError::UserNotFound(telegram_user_id))
+                };
             }
         };
 
