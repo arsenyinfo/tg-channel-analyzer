@@ -2,13 +2,15 @@ mod analysis;
 mod bot;
 mod cache;
 mod migrations;
+mod session_manager;
 mod user_manager;
 
 use bot::TelegramBot;
 use cache::CacheManager;
 use clap::Parser;
-use log::info;
+use log::{error, info};
 use migrations::MigrationManager;
+use session_manager::SessionManager;
 use std::env;
 use std::sync::Arc;
 use user_manager::UserManager;
@@ -46,6 +48,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         env::var("BOT_TOKEN").map_err(|_| "BOT_TOKEN environment variable is required")?;
 
     info!("Starting bot...");
+
+    // validate sessions before initialization
+    info!("Validating Telegram sessions...");
+    let validation_result = SessionManager::validate_sessions().await?;
+    
+    if !validation_result.is_success() {
+        if let Some(error_msg) = validation_result.error_message() {
+            error!("Session validation failed:\n{}", error_msg);
+            return Err("Session validation failed - see above for details".into());
+        }
+    }
+    
+    if let Some(success_msg) = validation_result.success_message() {
+        info!("{}", success_msg);
+    }
 
     // initialize database pool and run migrations
     info!("Initializing database...");

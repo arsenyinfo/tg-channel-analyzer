@@ -1,8 +1,13 @@
 use grammers_client::{Client, Config, InitParams};
 use grammers_session::Session;
 use std::env;
+use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+
+/// extracts phone number digits only, removing all formatting
+fn sanitize_phone_number(phone: &str) -> String {
+    phone.chars().filter(|c| c.is_ascii_digit()).collect()
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,10 +24,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Connecting to Telegram...");
 
+    print!("Enter your phone number (international format, e.g., +1234567890): ");
+    io::stdout().flush()?;
+    let mut phone = String::new();
+    io::stdin().read_line(&mut phone)?;
+    let phone = phone.trim();
+    
+    // sanitize phone number for filename
+    let phone_digits = sanitize_phone_number(phone);
+    
+    // get current directory and create absolute paths
+    let current_dir = env::current_dir()?;
+    let sessions_dir = current_dir.join("sessions");
+    let session_path = sessions_dir.join(format!("{}.session", phone_digits));
+    
+    // ensure sessions directory exists
+    if !sessions_dir.exists() {
+        println!("Creating sessions directory...");
+        fs::create_dir_all(&sessions_dir)?;
+    }
+
     // try to load existing session first
-    let session = match Session::load_file("session_name.session") {
+    let session = match Session::load_file(session_path.to_str().unwrap()) {
         Ok(session) => {
-            println!("Loaded existing session");
+            println!("Loaded existing session from {}", session_path.display());
             session
         }
         Err(_) => {
@@ -40,16 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    let mut client = Client::connect(config).await?;
+    let client = Client::connect(config).await?;
 
     if !client.is_authorized().await? {
         println!("You are not authorized. Let's do that now.");
-        
-        print!("Enter your phone number (international format, e.g., +1234567890): ");
-        io::stdout().flush()?;
-        let mut phone = String::new();
-        io::stdin().read_line(&mut phone)?;
-        let phone = phone.trim();
 
         let token = client.request_login_code(phone).await?;
         
@@ -78,11 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // save the session
-    let session_path = "session_name.session";
-    println!("Saving session to: {}", std::env::current_dir()?.join(session_path).display());
-    
-    match client.session().save_to_file(session_path) {
-        Ok(_) => println!("Session saved successfully to {}", session_path),
+    match client.session().save_to_file(session_path.to_str().unwrap()) {
+        Ok(_) => println!("Session saved successfully to {} for phone number {}", session_path.display(), phone),
         Err(e) => {
             eprintln!("Failed to save session: {}", e);
             eprintln!("This might be a permissions issue or the grammers library version issue.");

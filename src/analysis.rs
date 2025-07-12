@@ -1,14 +1,61 @@
-use grammers_client::{Client, Config, InitParams};
+use grammers_client::{types::Chat, Client, Config, InitParams};
 use grammers_session::Session;
 use log::{error, info, warn};
+use rand::Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 use crate::cache::{AnalysisResult, CacheManager};
+use crate::session_manager::SessionManager;
 use deadpool_postgres::Pool;
+
+/// rate limiter for telegram api operations
+struct TelegramRateLimiter {
+    username_resolution_last_call: Arc<Mutex<Option<Instant>>>,
+    message_iteration_last_call: Arc<Mutex<Option<Instant>>>,
+}
+
+impl TelegramRateLimiter {
+    fn new() -> Self {
+        Self {
+            username_resolution_last_call: Arc::new(Mutex::new(None)),
+            message_iteration_last_call: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// wait for username resolution rate limit (1 request per 15 seconds)
+    async fn wait_for_username_resolution(&self) {
+        let mut last_call = self.username_resolution_last_call.lock().await;
+
+        if let Some(last_time) = *last_call {
+            let elapsed = last_time.elapsed();
+            let min_interval = Duration::from_secs(600);
+
+            if elapsed < min_interval {
+                let wait_time = min_interval - elapsed;
+                info!(
+                    "Rate limiting username resolution: waiting {}ms",
+                    wait_time.as_millis()
+                );
+                sleep(wait_time).await;
+            }
+        }
+
+        *last_call = Some(Instant::now());
+    }
+
+    /// wait for message iteration rate limit (no artificial limit, just tracking)
+    async fn wait_for_message_iteration(&self) {
+        let mut last_call = self.message_iteration_last_call.lock().await;
+        *last_call = Some(Instant::now());
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Hash)]
 pub struct MessageDict {
@@ -21,6 +68,9 @@ pub struct AnalysisEngine {
     api_id: i32,
     api_hash: String,
     cache: CacheManager,
+    resolved_channels: HashMap<String, Chat>,
+    rate_limiter: TelegramRateLimiter,
+    session_files: Vec<String>,
 }
 
 impl AnalysisEngine {
@@ -35,12 +85,27 @@ impl AnalysisEngine {
 
         let cache = CacheManager::new(pool);
 
+        let session_files = SessionManager::discover_sessions()?;
+        if session_files.is_empty() {
+            return Err("No session files found in sessions/ directory".into());
+        }
+        info!("Found {} session files", session_files.len());
+
         Ok(Self {
             client: None,
             api_id,
             api_hash,
             cache,
+            resolved_channels: HashMap::new(),
+            rate_limiter: TelegramRateLimiter::new(),
+            session_files,
         })
+    }
+
+    fn get_random_session(&self) -> &String {
+        let mut rng = rand::thread_rng();
+        let index = rng.gen_range(0..self.session_files.len());
+        &self.session_files[index]
     }
 
     async fn ensure_client(&mut self) -> Result<&Client, Box<dyn std::error::Error + Send + Sync>> {
@@ -48,13 +113,14 @@ impl AnalysisEngine {
             info!("Initializing Telegram client...");
 
             for attempt in 0..=MAX_RETRIES {
-                let session = match Session::load_file("session_name.session") {
+                let session_file = self.get_random_session();
+                let session = match Session::load_file(session_file) {
                     Ok(session) => {
-                        info!("Loaded existing session");
+                        info!("Loaded existing session: {}", session_file);
                         session
                     }
                     Err(_) => {
-                        info!("No existing session found, creating new one");
+                        info!("Failed to load session {}, creating new one", session_file);
                         Session::new()
                     }
                 };
@@ -145,6 +211,9 @@ impl AnalysisEngine {
         info!("Validating channel: {}", clean_username);
 
         for attempt in 0..=MAX_RETRIES {
+            // rate limit username resolution on every attempt
+            self.rate_limiter.wait_for_username_resolution().await;
+
             let client = match self.ensure_client().await {
                 Ok(client) => client,
                 Err(e) => {
@@ -171,12 +240,15 @@ impl AnalysisEngine {
             };
 
             match client.resolve_username(clean_username).await {
-                Ok(Some(_)) => {
+                Ok(Some(chat)) => {
                     info!(
                         "Channel {} is valid and accessible (attempt {})",
                         clean_username,
                         attempt + 1
                     );
+                    // cache the resolved channel
+                    self.resolved_channels
+                        .insert(clean_username.to_string(), chat);
                     return Ok(true);
                 }
                 Ok(None) => {
@@ -204,8 +276,9 @@ impl AnalysisEngine {
                         delay.as_millis()
                     );
                     sleep(delay).await;
-                    // reset client on connection errors
+                    // reset client and clear channel cache on connection errors
                     self.client = None;
+                    self.resolved_channels.remove(clean_username);
                 }
             }
         }
@@ -225,10 +298,7 @@ impl AnalysisEngine {
             None => {
                 info!("Fetching fresh messages from channel");
                 self.ensure_client().await?;
-                let messages = {
-                    let client = self.client.as_ref().unwrap();
-                    self.get_all_messages(client, channel_username).await?
-                };
+                let messages = self.get_all_messages(channel_username).await?;
                 self.cache
                     .save_channel_messages(channel_username, &messages)
                     .await?;
@@ -256,8 +326,7 @@ impl AnalysisEngine {
     }
 
     async fn get_all_messages(
-        &self,
-        client: &Client,
+        &mut self,
         channel_username: &str,
     ) -> Result<Vec<MessageDict>, Box<dyn std::error::Error + Send + Sync>> {
         info!("Getting messages from {}", channel_username);
@@ -268,12 +337,27 @@ impl AnalysisEngine {
             channel_username
         };
 
-        // retry channel resolution
-        let channel = {
+        // check for cached channel first, fallback to resolution if needed
+        let channel = if let Some(cached_channel) = self.resolved_channels.get(clean_username) {
+            info!("Using cached channel for {}", clean_username);
+            Some(cached_channel.clone())
+        } else {
+            info!("No cached channel found, resolving {}", clean_username);
+            // get client reference
+            let client = self.client.as_ref().ok_or("Client not initialized")?;
+            // retry channel resolution
             let mut attempt = 0;
             loop {
+                self.rate_limiter.wait_for_username_resolution().await;
                 match client.resolve_username(clean_username).await {
-                    Ok(channel) => break channel,
+                    Ok(channel) => {
+                        if let Some(ref ch) = channel {
+                            // cache the newly resolved channel
+                            self.resolved_channels
+                                .insert(clean_username.to_string(), ch.clone());
+                        }
+                        break channel;
+                    }
                     Err(e) => {
                         if attempt == MAX_RETRIES {
                             error!(
@@ -305,7 +389,9 @@ impl AnalysisEngine {
         let mut skipped = 0;
 
         if let Some(chat) = channel {
+            let client = self.client.as_ref().ok_or("Client not initialized")?;
             for attempt in 0..=MAX_RETRIES {
+                self.rate_limiter.wait_for_message_iteration().await;
                 let mut message_iter = client.iter_messages(&chat);
                 let mut current_messages = Vec::new();
                 let mut current_skipped = 0;
@@ -366,6 +452,8 @@ impl AnalysisEngine {
                             delay.as_millis()
                         );
                         sleep(delay).await;
+                        // clear channel cache on message fetching errors
+                        self.resolved_channels.remove(clean_username);
                     }
                 }
             }

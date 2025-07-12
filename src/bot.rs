@@ -16,10 +16,10 @@ use crate::user_manager::{UserManager, UserManagerError};
 use deadpool_postgres::Pool;
 
 // payment configuration constants
-const CREDITS_1_PRICE: u32 = 10;
-const CREDITS_10_PRICE: u32 = 50;
-const CREDITS_1_AMOUNT: i32 = 1;
-const CREDITS_10_AMOUNT: i32 = 10;
+const SINGLE_PACKAGE_PRICE: u32 = 30;
+const BULK_PACKAGE_PRICE: u32 = 200;
+const SINGLE_PACKAGE_AMOUNT: i32 = 1;
+const BULK_PACKAGE_AMOUNT: i32 = 10;
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Supported commands:")]
@@ -40,22 +40,22 @@ pub struct TelegramBot {
 
 impl TelegramBot {
     fn create_payment_keyboard() -> InlineKeyboardMarkup {
-        let buy1_button = InlineKeyboardButton::callback(
+        let single_button = InlineKeyboardButton::callback(
             format!(
                 "💎 Buy {} Credit ({} ⭐)",
-                CREDITS_1_AMOUNT, CREDITS_1_PRICE
+                SINGLE_PACKAGE_AMOUNT, SINGLE_PACKAGE_PRICE
             ),
-            "buy_1",
+            "buy_single",
         );
-        let buy10_button = InlineKeyboardButton::callback(
+        let bulk_button = InlineKeyboardButton::callback(
             format!(
                 "💎 Buy {} Credits ({} ⭐)",
-                CREDITS_10_AMOUNT, CREDITS_10_PRICE
+                BULK_PACKAGE_AMOUNT, BULK_PACKAGE_PRICE
             ),
-            "buy_10",
+            "buy_bulk",
         );
 
-        InlineKeyboardMarkup::new(vec![vec![buy1_button], vec![buy10_button]])
+        InlineKeyboardMarkup::new(vec![vec![single_button], vec![bulk_button]])
     }
 
     fn create_analysis_selection_keyboard(channel_name: &str) -> InlineKeyboardMarkup {
@@ -321,12 +321,12 @@ impl TelegramBot {
         if let Some(data) = &query.data {
             if let Some(message) = &query.message {
                 match data.as_str() {
-                    "buy_1" => {
+                    "buy_single" => {
                         Self::send_payment_invoice(
                             bot.clone(),
                             message.chat().id,
-                            CREDITS_1_AMOUNT,
-                            CREDITS_1_PRICE,
+                            SINGLE_PACKAGE_AMOUNT,
+                            SINGLE_PACKAGE_PRICE,
                             "1 Channel Analysis",
                             "Get 1 analysis credit to analyze any Telegram channel",
                         )
@@ -334,15 +334,15 @@ impl TelegramBot {
 
                         bot.answer_callback_query(&query.id).await?;
                     }
-                    "buy_10" => {
+                    "buy_bulk" => {
                         Self::send_payment_invoice(
                             bot.clone(),
                             message.chat().id,
-                            CREDITS_10_AMOUNT,
-                            CREDITS_10_PRICE,
+                            BULK_PACKAGE_AMOUNT,
+                            BULK_PACKAGE_PRICE,
                             "10 Channel Analyses",
                             &format!("Get 10 analysis credits to analyze any Telegram channels ({} stars discount!)",
-                                (CREDITS_1_PRICE * CREDITS_10_AMOUNT as u32) - CREDITS_10_PRICE),
+                                (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE),
                         )
                         .await?;
 
@@ -383,11 +383,11 @@ impl TelegramBot {
                                 // no credits available, send payment options
                                 let message_text = "❌ No analysis credits available.\n\n\
                                     You need credits to analyze channels. Choose a package below:";
-                                
+
                                 bot.send_message(message.chat().id, message_text)
                                     .reply_markup(Self::create_payment_keyboard())
                                     .await?;
-                                
+
                                 bot.answer_callback_query(&query.id).await?;
                                 return Ok(());
                             }
@@ -412,7 +412,18 @@ impl TelegramBot {
                                 )
                                 .await
                                 {
-                                    error!("Analysis failed: {}", e);
+                                    if let Some(user_error) = e.downcast_ref::<crate::user_manager::UserManagerError>() {
+                                        match user_error {
+                                            crate::user_manager::UserManagerError::InsufficientCredits(user_id) => {
+                                                info!("Analysis failed: User {} has insufficient credits", user_id);
+                                            }
+                                            _ => {
+                                                error!("Analysis failed: {}", e);
+                                            }
+                                        }
+                                    } else {
+                                        error!("Analysis failed: {}", e);
+                                    }
                                     let _ = bot_clone
                                         .send_message(
                                             user_chat_id,
@@ -480,9 +491,9 @@ impl TelegramBot {
                         • 1 analysis: {} ⭐ stars\n\
                         • 10 analyses: {} ⭐ stars (save {} stars!)\n\n\
                         Choose a package below or just send me a channel name to get started!",
-                        CREDITS_1_PRICE,
-                        CREDITS_10_PRICE,
-                        (CREDITS_1_PRICE * CREDITS_10_AMOUNT as u32) - CREDITS_10_PRICE
+                        SINGLE_PACKAGE_PRICE,
+                        BULK_PACKAGE_PRICE,
+                        (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE
                     );
 
                     bot.send_message(msg.chat.id, intro_text)
@@ -519,8 +530,8 @@ impl TelegramBot {
                 Self::send_payment_invoice(
                     bot,
                     msg.chat.id,
-                    CREDITS_1_AMOUNT,
-                    CREDITS_1_PRICE,
+                    SINGLE_PACKAGE_AMOUNT,
+                    SINGLE_PACKAGE_PRICE,
                     "1 Channel Analysis",
                     "Get 1 analysis credit to analyze any Telegram channel",
                 )
@@ -530,11 +541,11 @@ impl TelegramBot {
                 Self::send_payment_invoice(
                     bot,
                     msg.chat.id,
-                    CREDITS_10_AMOUNT,
-                    CREDITS_10_PRICE,
+                    BULK_PACKAGE_AMOUNT,
+                    BULK_PACKAGE_PRICE,
                     "10 Channel Analyses",
                     &format!("Get 10 analysis credits to analyze any Telegram channels ({} stars discount!)",
-                        (CREDITS_1_PRICE * CREDITS_10_AMOUNT as u32) - CREDITS_10_PRICE),
+                        (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE),
                 )
                 .await?;
             }
@@ -590,9 +601,9 @@ impl TelegramBot {
                         • Credits remaining: <code>{}</code>\n\
                         • Total analyses performed: <code>{}</code>\n\n\
                         Choose a package below to continue analyzing channels!",
-                        CREDITS_1_PRICE,
-                        CREDITS_10_PRICE,
-                        (CREDITS_1_PRICE * CREDITS_10_AMOUNT as u32) - CREDITS_10_PRICE,
+                        SINGLE_PACKAGE_PRICE,
+                        BULK_PACKAGE_PRICE,
+                        (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE,
                         user.analysis_credits,
                         user.total_analyses_performed
                     );
