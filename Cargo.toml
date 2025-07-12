@@ -15,7 +15,12 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
 env_logger = "0.10"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", features = [
+    "json",
+    "cookies",
+    "gzip",
+    "deflate",
+] }
 grammers-client = "0.7"
 grammers-session = "0.7"
 gemini-rs = "2.0.0"
@@ -28,9 +33,16 @@ tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 deadpool-postgres = "0.14"
 dotenvy = "0.15"
 tokio-postgres-rustls = "0.12"
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "tls12",
+    "aws_lc_rs",
+] }
 webpki-roots = "0.26"
 html-escape = "0.2.13"
 comrak = "0.39.1"
 bincode = "1.3"
 rand = "0.8"
+scraper = "0.18"
+cookie_store = "0.21"
+url = "2.4"

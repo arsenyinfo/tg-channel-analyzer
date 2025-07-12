@@ -29,7 +29,7 @@ impl TelegramRateLimiter {
         }
     }
 
-    /// wait for username resolution rate limit (1 request per 15 seconds)
+    /// wait for username resolution rate limit (1 request per 10 minutes)
     async fn wait_for_username_resolution(&self) {
         let mut last_call = self.username_resolution_last_call.lock().await;
 

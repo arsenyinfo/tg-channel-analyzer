@@ -1,9 +1,11 @@
 mod analysis;
+mod backend_config;
 mod bot;
 mod cache;
 mod migrations;
 mod session_manager;
 mod user_manager;
+mod web_scraper;
 
 use bot::TelegramBot;
 use cache::CacheManager;

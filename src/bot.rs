@@ -4,8 +4,8 @@ use log::{error, info};
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{
-    CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, ParseMode,
-    PreCheckoutQuery, SuccessfulPayment,
+    CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
+    LinkPreviewOptions, ParseMode, PreCheckoutQuery, SuccessfulPayment,
 };
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
@@ -412,7 +412,9 @@ impl TelegramBot {
                                 )
                                 .await
                                 {
-                                    if let Some(user_error) = e.downcast_ref::<crate::user_manager::UserManagerError>() {
+                                    if let Some(user_error) =
+                                        e.downcast_ref::<crate::user_manager::UserManagerError>()
+                                    {
                                         match user_error {
                                             crate::user_manager::UserManagerError::InsufficientCredits(user_id) => {
                                                 info!("Analysis failed: User {} has insufficient credits", user_id);
@@ -421,15 +423,21 @@ impl TelegramBot {
                                                 error!("Analysis failed: {}", e);
                                             }
                                         }
+                                        let _ = bot_clone
+                                            .send_message(
+                                                user_chat_id,
+                                                "❌ Analysis failed. Please try again later.",
+                                            )
+                                            .await;
                                     } else {
                                         error!("Analysis failed: {}", e);
+                                        let _ = bot_clone
+                                            .send_message(
+                                                user_chat_id,
+                                                "❌ Analysis failed. Please try again later.",
+                                            )
+                                            .await;
                                     }
-                                    let _ = bot_clone
-                                        .send_message(
-                                            user_chat_id,
-                                            "❌ Analysis failed. Please try again later.",
-                                        )
-                                        .await;
                                 }
                             });
                         }
@@ -703,10 +711,31 @@ impl TelegramBot {
 
         // perform analysis
         let mut engine = analysis_engine.lock().await;
-        let result = engine
+        let (result, was_cached) = engine
             .analyze_channel_with_type(&channel_name, &analysis_type)
-            .await?;
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
         drop(engine);
+
+        // notify user if messages weren't cached (high load situation)
+        if !was_cached {
+            let high_load_msg = "⚠️ <b>High Load Notice</b>\n\n\
+                This channel wasn't cached, so we had to fetch messages with rate limiting. \
+                This may cause delays for other users.\n\n\
+                🔧 <b>For better performance:</b>\n\
+                Consider running your own instance with your API keys from the 🔗 <a href=\"https://github.com/arsenyinfo/tg-channel-analyzer/\">GitHub Repository</a>\n\n\
+                This allows unlimited analysis without affecting other users!";
+            bot.send_message(user_chat_id, high_load_msg)
+                .parse_mode(ParseMode::Html)
+                .link_preview_options(LinkPreviewOptions {
+                    is_disabled: true,
+                    url: None,
+                    prefer_large_media: false,
+                    prefer_small_media: false,
+                    show_above_text: false,
+                })
+                .await?;
+        }
 
         // consume credit after successful analysis
         let remaining_credits = match user_manager
