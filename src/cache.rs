@@ -184,7 +184,7 @@ impl CacheManager {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AnalysisResult {
     pub professional: Option<String>,
     pub personal: Option<String>,

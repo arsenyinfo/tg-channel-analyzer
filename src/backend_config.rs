@@ -30,24 +30,6 @@ impl Default for BackendConfig {
     }
 }
 
-impl BackendConfig {
-    pub fn new() -> Self {
-        let config = Self::default();
-        info!(
-            "Backend configuration: enabled backends: {:?}",
-            config.enabled_backends
-        );
-        config
-    }
-
-    pub fn is_backend_enabled(&self, backend: BackendType) -> bool {
-        self.enabled_backends.contains(&backend)
-    }
-
-    pub fn get_enabled_backends(&self) -> &[BackendType] {
-        &self.enabled_backends
-    }
-}
 
 #[derive(Debug)]
 pub struct BackendRateLimiter {

@@ -13,6 +13,8 @@ use tokio::time::sleep;
 
 use crate::cache::{AnalysisResult, CacheManager};
 use crate::session_manager::SessionManager;
+use crate::web_scraper::TelegramWebScraper;
+use crate::backend_config::{BackendConfig, BackendRateLimiter, BackendType};
 use deadpool_postgres::Pool;
 
 /// rate limiter for telegram api operations
@@ -63,14 +65,23 @@ pub struct MessageDict {
     pub message: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct AnalysisData {
+    pub messages: Vec<MessageDict>,
+    pub cache_key: String,
+}
+
 pub struct AnalysisEngine {
     client: Option<Client>,
     api_id: i32,
     api_hash: String,
-    cache: CacheManager,
+    pub cache: CacheManager,
     resolved_channels: HashMap<String, Chat>,
     rate_limiter: TelegramRateLimiter,
     session_files: Vec<String>,
+    web_scraper: TelegramWebScraper,
+    backend_config: BackendConfig,
+    backend_rate_limiter: BackendRateLimiter,
 }
 
 impl AnalysisEngine {
@@ -91,6 +102,9 @@ impl AnalysisEngine {
         }
         info!("Found {} session files", session_files.len());
 
+        let web_scraper = TelegramWebScraper::new()
+            .map_err(|e| format!("Failed to initialize web scraper: {}", e))?;
+
         Ok(Self {
             client: None,
             api_id,
@@ -99,6 +113,9 @@ impl AnalysisEngine {
             resolved_channels: HashMap::new(),
             rate_limiter: TelegramRateLimiter::new(),
             session_files,
+            web_scraper,
+            backend_config: BackendConfig::default(),
+            backend_rate_limiter: BackendRateLimiter::new(),
         })
     }
 
@@ -286,19 +303,25 @@ impl AnalysisEngine {
         unreachable!()
     }
 
-    pub async fn analyze_channel_with_type(
+    pub async fn check_rate_limits(&self) -> bool {
+        let web_time = self.backend_rate_limiter.time_until_available(BackendType::WebScraping);
+        let api_time = self.backend_rate_limiter.time_until_available(BackendType::Api);
+        web_time.is_some() && api_time.is_some()
+    }
+
+    pub async fn prepare_analysis_data(
         &mut self,
         channel_username: &str,
-        _analysis_type: &str,
-    ) -> Result<AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<AnalysisData, Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting analysis for channel: {}", channel_username);
 
-        let messages = match self.cache.load_channel_messages(channel_username).await {
+        let messages = match self.cache.load_channel_messages(channel_username).await
+        {
             Some(cached_messages) => cached_messages,
             None => {
                 info!("Fetching fresh messages from channel");
                 self.ensure_client().await?;
-                let messages = self.get_all_messages(channel_username).await?;
+                let (messages, _hit_rate_limits) = self.get_all_messages_with_rate_limit_info(channel_username).await?;
                 self.cache
                     .save_channel_messages(channel_username, &messages)
                     .await?;
@@ -307,30 +330,85 @@ impl AnalysisEngine {
         };
 
         let cache_key = self.cache.get_llm_cache_key(&messages, "analysis");
-        if let Some(cached_result) = self.cache.load_llm_result(&cache_key).await {
-            return Ok(cached_result);
-        }
-
-        let prompt = Self::generate_analysis_prompt(&messages)?;
-
-        info!("Querying LLM for analysis...");
-        let mut result = Self::query_and_parse_analysis(&prompt).await?;
-        result.messages_count = messages.len();
-
-        // cache the full analysis result
-        if let Err(e) = self.cache.save_llm_result(&cache_key, &result).await {
-            info!("Failed to cache LLM result: {}", e);
-        }
-
-        Ok(result)
+        Ok(AnalysisData {
+            messages,
+            cache_key,
+        })
     }
 
-    async fn get_all_messages(
+    pub async fn finish_analysis(
+        &mut self,
+        cache_key: &str,
+        result: AnalysisResult,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // cache the full analysis result
+        if let Err(e) = self.cache.save_llm_result(cache_key, &result).await {
+            info!("Failed to cache LLM result: {}", e);
+        }
+        Ok(())
+    }
+
+
+    async fn get_all_messages_with_rate_limit_info(
+        &mut self,
+        channel_username: &str,
+    ) -> Result<(Vec<MessageDict>, bool), Box<dyn std::error::Error + Send + Sync>> {
+        info!("Getting messages from {}", channel_username);
+
+        // select backend based on rate limits (web scraping preferred)
+        let backend = self.backend_rate_limiter.select_available_backend(&self.backend_config.enabled_backends)
+            .unwrap_or(BackendType::WebScraping);
+
+        // check if both backends are rate limited
+        let web_time = self.backend_rate_limiter.time_until_available(BackendType::WebScraping);
+        let api_time = self.backend_rate_limiter.time_until_available(BackendType::Api);
+        let hit_rate_limits = web_time.is_some() && api_time.is_some();
+
+        // if chosen backend is not available, wait for the closest one
+        if !self.backend_rate_limiter.is_available(backend) {
+            let closest_backend = match (web_time, api_time) {
+                (None, _) => BackendType::WebScraping,
+                (_, None) => BackendType::Api,
+                (Some(web), Some(api)) => if web <= api { BackendType::WebScraping } else { BackendType::Api },
+            };
+            
+            if let Some(wait_time) = self.backend_rate_limiter.time_until_available(closest_backend) {
+                info!("Waiting {}s for {} backend", wait_time.as_secs(), closest_backend.name());
+                self.backend_rate_limiter.wait_for_backend(closest_backend).await;
+            }
+        }
+
+        let messages = match backend {
+            BackendType::WebScraping => {
+                info!("Using web scraping backend for {}", channel_username);
+                let channel_url = format!("https://t.me/{}", channel_username.trim_start_matches('@'));
+                let messages = self.web_scraper.scrape_channel_messages(&channel_url, 10).await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                self.backend_rate_limiter.record_backend_call(BackendType::WebScraping);
+                messages
+            }
+            BackendType::Api => {
+                info!("Using API backend for {}", channel_username);
+                
+                // validate channel when using API backend
+                if !self.validate_channel(channel_username).await? {
+                    return Err("Channel not found or not accessible".into());
+                }
+                
+                self.ensure_client().await?;
+                let messages = self.get_all_messages_api(channel_username).await?;
+                self.backend_rate_limiter.record_backend_call(BackendType::Api);
+                messages
+            }
+        };
+
+        Ok((messages, hit_rate_limits))
+    }
+
+    async fn get_all_messages_api(
         &mut self,
         channel_username: &str,
     ) -> Result<Vec<MessageDict>, Box<dyn std::error::Error + Send + Sync>> {
-        info!("Getting messages from {}", channel_username);
-
         let clean_username = if channel_username.starts_with('@') {
             &channel_username[1..]
         } else {
@@ -463,7 +541,7 @@ impl AnalysisEngine {
         Ok(messages)
     }
 
-    fn generate_analysis_prompt(
+    pub fn generate_analysis_prompt(
         messages: &[MessageDict],
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let messages_json = serde_json::to_string_pretty(messages)?;
@@ -471,7 +549,7 @@ impl AnalysisEngine {
         Ok(format!(
             "Given the following messages from a Telegram channel, analyze the author profile and write three blocks of text in the following format:
 
-                    <professional>This part should contain a professional analysis of the author, including their expertise, background, and any relevant professional details, as an advice to the hiring manager</professional>
+                    <professional>This part should contain a professional analysis of the author, including their expertise, background, and any relevant professional details, as an advice to the hiring manager, including potential issues</professional>
                     <personal>This part should contain a personal analysis of the author, as written by a professional psychologist for non-professional reader</personal>
                     <roast>This part should contain a roast of the author, as written by a friend of theirs, that is somewhat harsh</roast>
                     Each part should be around 2048 characters long, in the language of the messages.
@@ -481,7 +559,7 @@ Messages:
         ))
     }
 
-    async fn query_and_parse_analysis(
+    pub async fn query_and_parse_analysis(
         prompt: &str,
     ) -> Result<AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
         let llm_response = query_llm(prompt, "gemini-2.5-pro").await?;

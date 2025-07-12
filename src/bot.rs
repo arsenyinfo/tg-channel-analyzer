@@ -564,7 +564,6 @@ impl TelegramBot {
     async fn handle_message(
         bot: Bot,
         msg: Message,
-        analysis_engine: Arc<Mutex<AnalysisEngine>>,
         user_manager: Arc<UserManager>,
     ) -> ResponseResult<()> {
         if let Some(text) = msg.text() {
@@ -625,7 +624,7 @@ impl TelegramBot {
 
                 // send immediate response with credit info
                 let credits_msg = format!(
-                    "🔍 Validating channel...\n\n\
+                    "🔍 Starting analysis...\n\n\
                     💳 Credits remaining after analysis: <code>{}</code>",
                     user.analysis_credits - 1
                 );
@@ -633,40 +632,17 @@ impl TelegramBot {
                     .parse_mode(ParseMode::Html)
                     .await?;
 
-                // validate channel first
-                let mut engine = analysis_engine.lock().await;
-                match engine.validate_channel(text).await {
-                    Ok(true) => {
-                        drop(engine); // release lock
+                // show analysis type selection directly (validation will happen during analysis)
+                let selection_msg = format!(
+                    "🎯 <b>Channel:</b> <code>{}</code>\n\n\
+                    Please choose the type of analysis you'd like to perform:",
+                    Self::escape_html(text)
+                );
 
-                        // show analysis type selection
-                        let selection_msg = format!(
-                            "✅ <b>Channel Validated!</b> by @ScratchAuthorEgoBot\n\n\
-                            🎯 <b>Channel:</b> <code>{}</code>\n\n\
-                            Please choose the type of analysis you'd like to perform:",
-                            Self::escape_html(text)
-                        );
-
-                        bot.send_message(msg.chat.id, selection_msg)
-                            .parse_mode(ParseMode::Html)
-                            .reply_markup(Self::create_analysis_selection_keyboard(text))
-                            .await?;
-                    }
-                    Ok(false) => {
-                        bot.send_message(
-                            msg.chat.id,
-                            "❌ Channel not found or not accessible. Please check the channel name and try again.",
-                        ).await?;
-                    }
-                    Err(e) => {
-                        error!("Channel validation error: {}", e);
-                        bot.send_message(
-                            msg.chat.id,
-                            "❌ Error validating channel. Please try again later.",
-                        )
-                        .await?;
-                    }
-                }
+                bot.send_message(msg.chat.id, selection_msg)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(Self::create_analysis_selection_keyboard(text))
+                    .await?;
             } else {
                 // send help message for invalid input
                 bot.send_message(
@@ -709,33 +685,74 @@ impl TelegramBot {
         )
         .await?;
 
-        // perform analysis
-        let mut engine = analysis_engine.lock().await;
-        let (result, was_cached) = engine
-            .analyze_channel_with_type(&channel_name, &analysis_type)
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-        drop(engine);
+        // check if we'll hit rate limits before starting (with lock)
+        let will_hit_rate_limits = {
+            let engine = analysis_engine.lock().await;
+            let cached = engine
+                .cache
+                .load_channel_messages(&channel_name)
+                .await
+                .is_some();
+            if !cached {
+                engine.check_rate_limits().await
+            } else {
+                false
+            }
+        };
 
-        // notify user if messages weren't cached (high load situation)
-        if !was_cached {
+        // notify user about high load BEFORE starting analysis
+        if will_hit_rate_limits {
             let high_load_msg = "⚠️ <b>High Load Notice</b>\n\n\
-                This channel wasn't cached, so we had to fetch messages with rate limiting. \
-                This may cause delays for other users.\n\n\
+                This may take longer than usual.\n\n\
                 🔧 <b>For better performance:</b>\n\
-                Consider running your own instance with your API keys from the 🔗 <a href=\"https://github.com/arsenyinfo/tg-channel-analyzer/\">GitHub Repository</a>\n\n\
-                This allows unlimited analysis without affecting other users!";
+                Consider running your own instance with your API keys from the 🔗 <a href=\"https://github.com/arsenyinfo/tg-channel-analyzer/\">GitHub Repository</a>";
             bot.send_message(user_chat_id, high_load_msg)
                 .parse_mode(ParseMode::Html)
                 .link_preview_options(LinkPreviewOptions {
                     is_disabled: true,
                     url: None,
-                    prefer_large_media: false,
                     prefer_small_media: false,
+                    prefer_large_media: false,
                     show_above_text: false,
                 })
                 .await?;
         }
+
+        // prepare analysis data (with lock)
+        let analysis_data = {
+            let mut engine = analysis_engine.lock().await;
+            engine.prepare_analysis_data(&channel_name).await?
+        };
+
+        // check for cached result (with lock)
+        let cached_result = {
+            let engine = analysis_engine.lock().await;
+            engine.cache.load_llm_result(&analysis_data.cache_key).await
+        };
+
+        let result = if let Some(cached_result) = cached_result {
+            cached_result
+        } else {
+            // generate prompt without lock
+            let prompt =
+                crate::analysis::AnalysisEngine::generate_analysis_prompt(&analysis_data.messages)?;
+
+            info!("Querying LLM for analysis...");
+            // perform LLM call WITHOUT holding the lock
+            let mut result =
+                crate::analysis::AnalysisEngine::query_and_parse_analysis(&prompt).await?;
+            result.messages_count = analysis_data.messages.len();
+
+            // finish analysis (cache result) with lock
+            {
+                let mut engine = analysis_engine.lock().await;
+                engine
+                    .finish_analysis(&analysis_data.cache_key, result.clone())
+                    .await?;
+            }
+
+            result
+        };
 
         // consume credit after successful analysis
         let remaining_credits = match user_manager
