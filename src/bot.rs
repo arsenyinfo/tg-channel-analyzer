@@ -240,6 +240,19 @@ impl TelegramBot {
     ) -> ResponseResult<()> {
         let telegram_user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
 
+        // get user info for referral link
+        let user_db_id = match user_manager
+            .get_or_create_user(telegram_user_id, None, None, None, None)
+            .await
+        {
+            Ok((user_info, _)) => user_info.id,
+            Err(e) => {
+                error!("Failed to get user info during payment: {}", e);
+                // continue with payment processing even if we can't get the referral link
+                0
+            }
+        };
+
         // parse credits from payload
         let credits = if payment.invoice_payload == "credits_1" {
             1
@@ -254,10 +267,11 @@ impl TelegramBot {
         match user_manager.add_credits(telegram_user_id, credits).await {
             Ok(new_balance) => {
                 let success_msg = format!(
-                    "🎉 <b>Payment Successful!</b> - @ScratchAuthorEgoBot\n\n\
+                    "🎉 <b>Payment Successful!</b> - <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a>\n\n\
                     ✅ Added {} credits to your account\n\
                     💳 New balance: {} credits\n\n\
                     You can now analyze channels by sending me a channel username like <code>@channelname</code>",
+                    user_db_id,
                     credits, new_balance
                 );
 
@@ -278,27 +292,33 @@ impl TelegramBot {
                             let reward_msg = if reward_info.paid_rewards > 0 && reward_info.milestone_rewards > 0 {
                                 format!(
                                     "🎉 <b>Referral Rewards!</b>\n\n\
-                                    You've earned <b>{}</b> credits:\n\
+                                    You've earned <b>{}</b> credits (Total referrals: <b>{}</b>):\n\
                                     • {} credit(s) for paid referral\n\
                                     • {} credit(s) for milestone bonus\n\n\
-                                    Keep sharing your referral link to earn more!",
+                                    Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
                                     reward_info.total_credits_awarded,
+                                    reward_info.referral_count,
                                     reward_info.paid_rewards,
-                                    reward_info.milestone_rewards
+                                    reward_info.milestone_rewards,
+                                    reward_info.referrer_user_id.unwrap_or(0)
                                 )
                             } else if reward_info.paid_rewards > 0 {
                                 format!(
                                     "🎉 <b>Referral Reward!</b>\n\n\
-                                    You've earned <b>{}</b> credit(s) for a paid referral!\n\n\
-                                    Keep sharing your referral link to earn more!",
-                                    reward_info.paid_rewards
+                                    You've earned <b>{}</b> credit(s) for a paid referral! (Total referrals: <b>{}</b>)\n\n\
+                                    Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
+                                    reward_info.paid_rewards,
+                                    reward_info.referral_count,
+                                    reward_info.referrer_user_id.unwrap_or(0)
                                 )
                             } else if reward_info.milestone_rewards > 0 {
                                 format!(
                                     "🎉 <b>Milestone Reward!</b>\n\n\
-                                    You've earned <b>{}</b> credit(s) for reaching a referral milestone!\n\n\
-                                    Keep sharing your referral link to earn more!",
-                                    reward_info.milestone_rewards
+                                    You've earned <b>{}</b> credit(s) for reaching <b>{}</b> referrals!\n\n\
+                                    Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
+                                    reward_info.milestone_rewards,
+                                    reward_info.referral_count,
+                                    reward_info.referrer_user_id.unwrap_or(0)
                                 )
                             } else {
                                 String::new()
@@ -478,8 +498,8 @@ impl TelegramBot {
                                 if let Err(e) = Self::perform_single_analysis(
                                     bot_clone.clone(),
                                     user_chat_id,
-                                    channel_name_clone,
-                                    analysis_type_clone,
+                                    channel_name_clone.clone(),
+                                    analysis_type_clone.clone(),
                                     analysis_engine_clone,
                                     user_manager_clone,
                                     telegram_user_id,
@@ -492,25 +512,29 @@ impl TelegramBot {
                                         match user_error {
                                             crate::user_manager::UserManagerError::InsufficientCredits(user_id) => {
                                                 info!("Analysis failed: User {} has insufficient credits", user_id);
+                                                let _ = bot_clone
+                                                    .send_message(
+                                                        user_chat_id,
+                                                        "❌ Insufficient credits. Please purchase more credits to continue.",
+                                                    )
+                                                    .await;
                                             }
                                             _ => {
-                                                error!("Analysis failed: {}", e);
+                                                error!("Analysis failed for channel {} (type: {}): {}", channel_name_clone, analysis_type_clone, e);
+                                                error!("User manager error during analysis: {}", user_error);
+                                                let _ = bot_clone
+                                                    .send_message(
+                                                        user_chat_id,
+                                                        "❌ Analysis failed due to a system error. Please try again later.",
+                                                    )
+                                                    .await;
                                             }
                                         }
-                                        let _ = bot_clone
-                                            .send_message(
-                                                user_chat_id,
-                                                "❌ Analysis failed. Please try again later.",
-                                            )
-                                            .await;
                                     } else {
-                                        error!("Analysis failed: {}", e);
-                                        let _ = bot_clone
-                                            .send_message(
-                                                user_chat_id,
-                                                "❌ Analysis failed. Please try again later.",
-                                            )
-                                            .await;
+                                        // Log the full error details
+                                        error!("Analysis failed for channel {} (type: {}): {}", channel_name_clone, analysis_type_clone, e);
+                                        error!("Non-user error during analysis: {}", e);
+                                        // Don't send generic error - it's already handled in perform_single_analysis
                                     }
                                 }
                             });
@@ -537,20 +561,36 @@ impl TelegramBot {
             Command::Start => {
                 // parse referral code from message text
                 let referrer_user_id = if let Some(text) = msg.text() {
+                    info!("Processing /start command with text: {}", text);
                     if let Some(args) = text.strip_prefix("/start ") {
+                        info!("Found referral code in /start command: {}", args);
                         if let Ok(user_id) = args.trim().parse::<i32>() {
+                            info!("Parsed referrer user ID: {}", user_id);
                             // validate that referrer exists
                             match user_manager.validate_referrer(user_id).await {
-                                Ok(true) => Some(user_id),
-                                _ => None,
+                                Ok(true) => {
+                                    info!("Referrer user ID {} validated successfully", user_id);
+                                    Some(user_id)
+                                }
+                                Ok(false) => {
+                                    info!("Referrer user ID {} does not exist", user_id);
+                                    None
+                                }
+                                Err(e) => {
+                                    error!("Failed to validate referrer user ID {}: {}", user_id, e);
+                                    None
+                                }
                             }
                         } else {
+                            info!("Failed to parse referrer ID from args: {}", args);
                             None
                         }
                     } else {
+                        info!("No referral code found in /start command");
                         None
                     }
                 } else {
+                    info!("No text found in /start message");
                     None
                 };
 
@@ -576,21 +616,59 @@ impl TelegramBot {
 
                 // send referral milestone notification if applicable
                 if let Some(reward_info) = maybe_reward_info {
+                    info!("Received reward info for referral: referral_count={}, milestone_rewards={}, paid_rewards={}, is_celebration={}, referrer_telegram_id={:?}", 
+                          reward_info.referral_count, reward_info.milestone_rewards, reward_info.paid_rewards, 
+                          reward_info.is_celebration_milestone, reward_info.referrer_telegram_id);
                     if let Some(referrer_telegram_id) = reward_info.referrer_telegram_id {
-                        let reward_msg = format!(
-                            "🎉 <b>Milestone Reward!</b>\n\n\
-                            You've earned <b>{}</b> credit(s) for reaching a referral milestone!\n\n\
-                            Keep sharing your referral link to earn more!",
-                            reward_info.total_credits_awarded
-                        );
+                        let reward_msg = if reward_info.is_celebration_milestone && reward_info.total_credits_awarded > 0 {
+                            format!(
+                                "🎉 <b>Referral Milestone!</b>\n\n\
+                                Congratulations! You've reached <b>{}</b> referrals and earned <b>{}</b> credit(s)!\n\n\
+                                Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
+                                reward_info.referral_count,
+                                reward_info.total_credits_awarded,
+                                reward_info.referrer_user_id.unwrap_or(0)
+                            )
+                        } else if reward_info.is_celebration_milestone {
+                            format!(
+                                "🎊 <b>Referral Milestone!</b>\n\n\
+                                Congratulations! You've reached <b>{}</b> referrals!\n\n\
+                                Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
+                                reward_info.referral_count,
+                                reward_info.referrer_user_id.unwrap_or(0)
+                            )
+                        } else if reward_info.total_credits_awarded > 0 {
+                            format!(
+                                "🎉 <b>Referral Reward!</b>\n\n\
+                                You've earned <b>{}</b> credit(s) for reaching <b>{}</b> referrals!\n\n\
+                                Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
+                                reward_info.total_credits_awarded,
+                                reward_info.referral_count,
+                                reward_info.referrer_user_id.unwrap_or(0)
+                            )
+                        } else {
+                            String::new()
+                        };
 
-                        let _ = bot.send_message(
-                            ChatId(referrer_telegram_id), 
-                            reward_msg
-                        )
-                        .parse_mode(ParseMode::Html)
-                        .await;
+                        if !reward_msg.is_empty() {
+                            info!("Sending referral notification to telegram user {}: {}", referrer_telegram_id, reward_msg.replace("\n", " "));
+                            match bot.send_message(
+                                ChatId(referrer_telegram_id), 
+                                reward_msg
+                            )
+                            .parse_mode(ParseMode::Html)
+                            .await {
+                                Ok(_) => info!("Successfully sent referral notification to telegram user {}", referrer_telegram_id),
+                                Err(e) => error!("Failed to send referral notification to telegram user {}: {}", referrer_telegram_id, e)
+                            }
+                        } else {
+                            info!("No reward message to send (empty message generated)");
+                        }
+                    } else {
+                        error!("Reward info received but no referrer_telegram_id found");
                     }
+                } else {
+                    info!("No reward info received for user creation");
                 }
 
                 if user.analysis_credits <= 0 {
@@ -602,7 +680,7 @@ impl TelegramBot {
                     };
 
                     let intro_text = format!(
-                        "🤖 <b>@ScratchAuthorEgoBot - Channel Analyzer</b>\n\n\
+                        "🤖 <b><a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a> - Channel Analyzer</b>\n\n\
                         Welcome! I can analyze Telegram channels and provide insights.\n\n\
                         📋 <b>How to use:</b>\n\
                         • Send me a channel username (e.g., <code>@channelname</code>)\n\
@@ -617,15 +695,16 @@ impl TelegramBot {
                         • 1 analysis: {} ⭐ stars\n\
                         • 10 analyses: {} ⭐ stars (save {} stars!)\n\n\
                         🎁 <b>Referral Program:</b> {}\n\
-                        Share your link: <code>https://t.me/YourBot?start={}</code>\n\
+                        Share your link: <code>https://t.me/ScratchAuthorEgoBot?start={}</code>\n\
                         • Get credits at milestones: 1, 5, 10, 20, 30...\n\
                         • Get 1 credit for each paid referral\n\n\
                         Choose a package below or just send me a channel name to get started!",
+                        user.id,  // for the bot name referral link
                         SINGLE_PACKAGE_PRICE,
                         BULK_PACKAGE_PRICE,
                         (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE,
                         referral_info,
-                        user.id
+                        user.id  // for the share your link
                     );
 
                     bot.send_message(msg.chat.id, intro_text)
@@ -652,7 +731,7 @@ impl TelegramBot {
                             • Referrals: <b>{}</b> (Paid: <b>{}</b>)\n\
                             • Next milestone reward in <b>{}</b> referrals\n\n\
                             🎁 <b>Referral Program:</b>\n\
-                            Share your link: <code>https://t.me/YourBot?start={}</code>\n\
+                            Share your link: <code>https://t.me/ScratchAuthorEgoBot?start={}</code>\n\
                             • Get credits at milestones: 1, 5, 10, 20, 30...\n\
                             • Get 1 credit for each paid referral\n\n\
                             Great job on your {} referrals! 🎉",
@@ -664,7 +743,7 @@ impl TelegramBot {
                             • Credits remaining: <b>{}</b>\n\
                             • Total analyses performed: <b>{}</b>\n\n\
                             🎁 <b>Referral Program:</b>\n\
-                            Share your link: <code>https://t.me/YourBot?start={}</code>\n\
+                            Share your link: <code>https://t.me/ScratchAuthorEgoBot?start={}</code>\n\
                             • Get credits at milestones: 1, 5, 10, 20, 30...\n\
                             • Get 1 credit for each paid referral",
                             user.analysis_credits, user.total_analyses_performed, user.id
@@ -672,7 +751,7 @@ impl TelegramBot {
                     };
 
                     let intro_text = format!(
-                        "🤖 <b>@ScratchAuthorEgoBot - Channel Analyzer</b>\n\n\
+                        "🤖 <b><a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a> - Channel Analyzer</b>\n\n\
                         Welcome back! I can analyze Telegram channels and provide insights.\n\n\
                         📋 <b>How to use:</b>\n\
                         • Send me a channel username (e.g., <code>@channelname</code>)\n\
@@ -685,6 +764,7 @@ impl TelegramBot {
                         • 🔥 Roast: Fun, brutally honest critique\n\n\
                         {}\n\n\
                         Just send me a channel name to get started!",
+                        user.id,
                         referral_section
                     );
 
@@ -844,6 +924,16 @@ impl TelegramBot {
         )
         .await?;
 
+        // timeout notice for long-running requests
+        bot.send_message(
+            user_chat_id,
+            "⏱️ <b>Timeout Notice</b>\n\n\
+            If you don't receive a response after 60 minutes, the request may have been lost.\n\
+            In that case, please try again - no credits will be consumed for failed requests.",
+        )
+        .parse_mode(ParseMode::Html)
+        .await?;
+
         // check if we'll hit rate limits before starting (with lock)
         let will_hit_rate_limits = {
             let engine = analysis_engine.lock().await;
@@ -880,7 +970,19 @@ impl TelegramBot {
         // prepare analysis data (with lock)
         let analysis_data = {
             let mut engine = analysis_engine.lock().await;
-            engine.prepare_analysis_data(&channel_name).await?
+            match engine.prepare_analysis_data(&channel_name).await {
+                Ok(data) => data,
+                Err(e) => {
+                    error!("Failed to prepare analysis data for channel {}: {}", channel_name, e);
+                    bot.send_message(
+                        user_chat_id,
+                        format!("❌ <b>Analysis Error</b>\n\nFailed to prepare analysis for channel {}. This could happen if:\n• The channel is private/restricted\n• The channel doesn't exist\n• There are network connectivity issues\n\nNo credits were consumed for this request.", channel_name),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                    return Err(e);
+                }
+            }
         };
 
         // check if we received 0 messages and raise error
@@ -904,25 +1006,54 @@ impl TelegramBot {
             cached_result
         } else {
             // generate prompt without lock
-            let prompt =
-                crate::analysis::AnalysisEngine::generate_analysis_prompt(&analysis_data.messages)?;
+            let prompt = match crate::analysis::AnalysisEngine::generate_analysis_prompt(&analysis_data.messages) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("Failed to generate analysis prompt for channel {}: {}", channel_name, e);
+                    bot.send_message(
+                        user_chat_id,
+                        "❌ <b>Analysis Error</b>\n\nFailed to generate analysis prompt. No credits were consumed.",
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                    return Err(e);
+                }
+            };
 
-            info!("Querying LLM for analysis...");
+            info!("Querying LLM for {} analysis of channel {}...", analysis_type, channel_name);
             // perform LLM call WITHOUT holding the lock
-            let mut result =
-                crate::analysis::AnalysisEngine::query_and_parse_analysis(&prompt).await?;
+            let mut result = match crate::analysis::AnalysisEngine::query_and_parse_analysis(&prompt).await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("Failed to query LLM for {} analysis of channel {}: {}", analysis_type, channel_name, e);
+                    bot.send_message(
+                        user_chat_id,
+                        "❌ <b>Analysis Error</b>\n\nFailed to complete analysis due to AI service issues. Please try again later.\n\nNo credits were consumed for this request.",
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                    return Err(e);
+                }
+            };
             result.messages_count = analysis_data.messages.len();
 
             // finish analysis (cache result) with lock
             {
                 let mut engine = analysis_engine.lock().await;
-                engine
-                    .finish_analysis(&analysis_data.cache_key, result.clone())
-                    .await?;
+                if let Err(e) = engine.finish_analysis(&analysis_data.cache_key, result.clone()).await {
+                    error!("Failed to cache analysis result for channel {}: {}", channel_name, e);
+                    // Continue execution - caching failure shouldn't stop the analysis
+                }
             }
 
             result
         };
+
+        // get user info for referral link
+        let (user_info, _) = user_manager
+            .get_or_create_user(telegram_user_id, None, None, None, None)
+            .await?;
+        let user_db_id = user_info.id;
 
         // consume credit after successful analysis
         let remaining_credits = match user_manager
@@ -959,7 +1090,7 @@ impl TelegramBot {
 
         // notify user that analysis is complete and send results with credit info
         let completion_msg = format!(
-            "✅ <b>{} Analysis Complete!</b> by @ScratchAuthorEgoBot\n\n\
+            "✅ <b>{} Analysis Complete!</b> by <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a>\n\n\
             📊 Your results are ready.\n\
             💳 Credits remaining: <code>{}</code>",
             analysis_type
@@ -969,6 +1100,7 @@ impl TelegramBot {
                 .to_uppercase()
                 .collect::<String>()
                 + &analysis_type[1..],
+            user_db_id,
             remaining_credits
         );
         bot.send_message(user_chat_id, completion_msg)
@@ -982,10 +1114,65 @@ impl TelegramBot {
             &channel_name,
             &analysis_type,
             result,
+            user_db_id,
         )
         .await?;
 
         Ok(())
+    }
+
+    /// splits a message into chunks that fit within Telegram's 4096 character limit
+    fn split_message_into_chunks(text: &str, max_length: usize) -> Vec<String> {
+        if text.len() <= max_length {
+            return vec![text.to_string()];
+        }
+
+        let mut chunks = Vec::new();
+        let mut current_chunk = String::new();
+        
+        // split by lines to avoid breaking in the middle of formatting
+        for line in text.lines() {
+            let line_with_newline = format!("{}\n", line);
+            
+            // if adding this line would exceed the limit, finalize current chunk
+            if current_chunk.len() + line_with_newline.len() > max_length {
+                if !current_chunk.is_empty() {
+                    chunks.push(current_chunk.trim_end().to_string());
+                    current_chunk.clear();
+                }
+                
+                // if single line is too long, split it at word boundaries
+                if line_with_newline.len() > max_length {
+                    let words: Vec<&str> = line.split_whitespace().collect();
+                    let mut word_chunk = String::new();
+                    
+                    for word in words {
+                        let word_with_space = format!("{} ", word);
+                        if word_chunk.len() + word_with_space.len() > max_length {
+                            if !word_chunk.is_empty() {
+                                chunks.push(word_chunk.trim_end().to_string());
+                                word_chunk.clear();
+                            }
+                        }
+                        word_chunk.push_str(&word_with_space);
+                    }
+                    
+                    if !word_chunk.is_empty() {
+                        current_chunk = word_chunk.trim_end().to_string();
+                    }
+                } else {
+                    current_chunk.push_str(&line_with_newline);
+                }
+            } else {
+                current_chunk.push_str(&line_with_newline);
+            }
+        }
+        
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk.trim_end().to_string());
+        }
+        
+        chunks
     }
 
     async fn send_single_analysis_to_user(
@@ -994,13 +1181,8 @@ impl TelegramBot {
         channel_name: &str,
         analysis_type: &str,
         result: AnalysisResult,
+        user_db_id: i32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let header = format!(
-            "📊 <b>Channel Analysis Results</b> by @ScratchAuthorEgoBot\n\n\
-            🎯 <b>Channel:</b> <code>{}</code>\n\n",
-            Self::escape_html(channel_name)
-        );
-
         let (analysis_emoji, analysis_content) = match analysis_type {
             "professional" => ("💼", &result.professional),
             "personal" => ("🧠", &result.personal),
@@ -1010,6 +1192,17 @@ impl TelegramBot {
 
         match analysis_content {
             Some(content) if !content.is_empty() => {
+                // convert LLM markdown content to HTML first
+                let html_content = Self::markdown_to_html_safe(content);
+                
+                // prepare header template that will be added to each part
+                let header = format!(
+                    "📊 <b>Channel Analysis Results</b> by <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a>\n\n\
+                    🎯 <b>Channel:</b> <code>{}</code>\n\n",
+                    user_db_id,
+                    Self::escape_html(channel_name)
+                );
+
                 let analysis_header = format!(
                     "{} <b>{} Analysis:</b>\n\n",
                     analysis_emoji,
@@ -1021,20 +1214,35 @@ impl TelegramBot {
                         .collect::<String>()
                         + &analysis_type[1..]
                 );
-                // convert LLM markdown content to HTML
-                let html_content = Self::markdown_to_html_safe(content);
-                let full_message = format!("{}{}{}", header, analysis_header, html_content);
 
-                bot.send_message(user_chat_id, full_message)
-                    .parse_mode(ParseMode::Html)
-                    .await?;
+                // calculate available space for content after headers
+                const MAX_MESSAGE_LENGTH: usize = 3072;
+                let headers_length = header.len() + analysis_header.len();
+                let available_content_length = MAX_MESSAGE_LENGTH.saturating_sub(headers_length + 50); // extra buffer for part indicators
+
+                // split content if needed
+                let content_chunks = Self::split_message_into_chunks(&html_content, available_content_length);
+                
+                for (i, chunk) in content_chunks.iter().enumerate() {
+                    let full_message = if content_chunks.len() > 1 {
+                        format!("{}{}{}\n\n<i>📄 Part {} of {}</i>", header, analysis_header, chunk, i + 1, content_chunks.len())
+                    } else {
+                        format!("{}{}{}", header, analysis_header, chunk)
+                    };
+
+                    bot.send_message(user_chat_id, full_message)
+                        .parse_mode(ParseMode::Html)
+                        .await?;
+                }
 
                 info!(
-                    "Sent {} analysis results to user for channel: {}",
-                    analysis_type, channel_name
+                    "Sent {} analysis results to user for channel: {} ({} parts)",
+                    analysis_type, channel_name, content_chunks.len()
                 );
             }
             _ => {
+                error!("No {} analysis content available for channel: {} (user: {})", 
+                       analysis_type, channel_name, user_chat_id);
                 bot.send_message(
                     user_chat_id,
                     format!(

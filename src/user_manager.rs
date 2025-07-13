@@ -59,6 +59,7 @@ pub struct ReferralRewardInfo {
     pub paid_rewards: i32,
     pub total_credits_awarded: i32,
     pub referrer_telegram_id: Option<i64>,
+    pub referrer_user_id: Option<i32>,
     pub is_celebration_milestone: bool,
     pub referral_count: i32,
 }
@@ -154,17 +155,22 @@ impl UserManager {
 
         // if user was referred, increment referrer's count and check for rewards
         if let Some(referrer_id) = referrer_user_id {
+            info!("Processing new referral: user {} was referred by user {}", telegram_user_id, referrer_id);
             match self.process_new_referral(referrer_id).await {
                 Ok(Some(reward_info)) => {
+                    info!("Referral processing successful for referrer {}: {} referrals, {} milestone credits, {} paid credits, celebration: {}", 
+                          referrer_id, reward_info.referral_count, reward_info.milestone_rewards, reward_info.paid_rewards, reward_info.is_celebration_milestone);
                     return Ok((user, Some(reward_info)));
                 }
                 Ok(None) => {
-                    // no rewards or milestones to report
+                    info!("Referral processed for referrer {} but no rewards or milestones triggered", referrer_id);
                 }
                 Err(e) => {
                     error!("Failed to process referral for user {}: {}", referrer_id, e);
                 }
             }
+        } else {
+            info!("New user {} created without referrer", telegram_user_id);
         }
 
         Ok((user, None))
@@ -175,6 +181,7 @@ impl UserManager {
         let client = self.pool.get().await?;
         
         // increment referrals count and get new count
+        info!("Incrementing referral count for referrer user {}", referrer_user_id);
         let row = client
             .query_one(
                 "UPDATE users SET referrals_count = referrals_count + 1 WHERE id = $1 RETURNING referrals_count, telegram_user_id",
@@ -185,13 +192,15 @@ impl UserManager {
         let new_referral_count: i32 = row.get(0);
         let telegram_user_id: i64 = row.get(1);
         
-        info!("Incremented referrals count for user {} to {}", referrer_user_id, new_referral_count);
+        info!("Successfully incremented referrals count for user {} (telegram_id: {}) to {}", referrer_user_id, telegram_user_id, new_referral_count);
         
         // check if this is a celebration milestone
         let is_celebration = Self::is_celebration_milestone(new_referral_count);
+        info!("Referral milestone check for user {}: count={}, is_celebration={}", referrer_user_id, new_referral_count, is_celebration);
         
         // check for credit rewards (every 5 referrals)
         let expected_milestone_rewards = Self::calculate_milestone_rewards(new_referral_count);
+        info!("Expected milestone rewards for {} referrals: {}", new_referral_count, expected_milestone_rewards);
         let existing_unpaid_rewards = client
             .query_one(
                 "SELECT COUNT(*) FROM referral_rewards WHERE referrer_user_id = $1 AND reward_type = 'unpaid_milestone'",
@@ -204,7 +213,10 @@ impl UserManager {
         if expected_milestone_rewards > existing_unpaid_rewards {
             let new_rewards = expected_milestone_rewards - existing_unpaid_rewards;
             milestone_rewards = new_rewards;
-            for _ in 0..new_rewards {
+            info!("Awarding {} new milestone rewards to user {} (expected: {}, existing: {})", 
+                  new_rewards, referrer_user_id, expected_milestone_rewards, existing_unpaid_rewards);
+            for i in 0..new_rewards {
+                info!("Awarding milestone reward {} of {} to user {}", i+1, new_rewards, referrer_user_id);
                 // award 1 credit for milestone
                 client
                     .execute(
@@ -220,21 +232,30 @@ impl UserManager {
                         &[&referrer_user_id],
                     )
                     .await?;
+                info!("Successfully awarded milestone reward {} to user {}", i+1, referrer_user_id);
             }
-            info!("Awarded {} milestone rewards to user {}", new_rewards, referrer_user_id);
+            info!("Completed awarding {} milestone rewards to user {}", new_rewards, referrer_user_id);
+        } else {
+            info!("No new milestone rewards for user {} (expected: {}, existing: {})", 
+                  referrer_user_id, expected_milestone_rewards, existing_unpaid_rewards);
         }
 
         // return info if there are rewards or if it's a celebration milestone
         if milestone_rewards > 0 || is_celebration {
+            info!("Returning reward info for user {}: milestone_rewards={}, is_celebration={}, referral_count={}", 
+                  referrer_user_id, milestone_rewards, is_celebration, new_referral_count);
             Ok(Some(ReferralRewardInfo {
                 milestone_rewards,
                 paid_rewards: 0,
                 total_credits_awarded: milestone_rewards,
                 referrer_telegram_id: Some(telegram_user_id),
+                referrer_user_id: Some(referrer_user_id),
                 is_celebration_milestone: is_celebration,
                 referral_count: new_referral_count,
             }))
         } else {
+            info!("No reward info to return for user {} (milestone_rewards={}, is_celebration={})", 
+                  referrer_user_id, milestone_rewards, is_celebration);
             Ok(None)
         }
     }
@@ -430,6 +451,7 @@ impl UserManager {
                 paid_rewards,
                 total_credits_awarded: milestone_rewards + paid_rewards,
                 referrer_telegram_id: if milestone_rewards > 0 || paid_rewards > 0 { Some(telegram_user_id) } else { None },
+                referrer_user_id: if milestone_rewards > 0 || paid_rewards > 0 { Some(user_id) } else { None },
                 is_celebration_milestone: Self::is_celebration_milestone(referrals_count),
                 referral_count: referrals_count,
             })
@@ -439,6 +461,7 @@ impl UserManager {
                 paid_rewards: 0,
                 total_credits_awarded: 0,
                 referrer_telegram_id: None,
+                referrer_user_id: None,
                 is_celebration_milestone: false,
                 referral_count: 0,
             })
@@ -447,6 +470,7 @@ impl UserManager {
 
     /// increments paid referrals count when a referred user makes a payment
     pub async fn record_paid_referral(&self, telegram_user_id: i64) -> Result<Option<ReferralRewardInfo>, Box<dyn Error + Send + Sync>> {
+        info!("Processing paid referral for user {}", telegram_user_id);
         let client = self.pool.get().await?;
         
         // find if this user was referred and update referrer's paid count
@@ -459,6 +483,7 @@ impl UserManager {
 
         if let Some(row) = row {
             if let Some(referrer_id) = row.get::<_, Option<i32>>(0) {
+                info!("User {} was referred by user {}, incrementing paid referral count", telegram_user_id, referrer_id);
                 // increment paid referrals count
                 client
                     .execute(
@@ -466,15 +491,23 @@ impl UserManager {
                         &[&referrer_id],
                     )
                     .await?;
+                info!("Successfully incremented paid referral count for referrer {}", referrer_id);
 
                 // check and award rewards
+                info!("Checking and awarding referral rewards for referrer {}", referrer_id);
                 let reward_info = self.check_and_award_referral_rewards(referrer_id).await?;
                 
-                info!("Recorded paid referral for user {}, referrer {}", telegram_user_id, referrer_id);
+                info!("Recorded paid referral for user {}, referrer {} - rewards: milestone={}, paid={}, total={}", 
+                      telegram_user_id, referrer_id, reward_info.milestone_rewards, reward_info.paid_rewards, reward_info.total_credits_awarded);
                 return Ok(Some(reward_info));
+            } else {
+                info!("User {} was not referred by anyone (referred_by_user_id is NULL)", telegram_user_id);
             }
+        } else {
+            info!("User {} not found in database", telegram_user_id);
         }
 
+        info!("No paid referral to record for user {}", telegram_user_id);
         Ok(None)
     }
 }

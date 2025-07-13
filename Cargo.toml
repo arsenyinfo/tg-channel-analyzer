@@ -46,3 +46,6 @@ rand = "0.8"
 scraper = "0.18"
 cookie_store = "0.21"
 url = "2.4"
+
+[dev-dependencies]
+tempfile = "3.0"

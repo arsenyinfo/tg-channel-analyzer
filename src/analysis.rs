@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
+use crate::backend_config::{BackendConfig, BackendRateLimiter, BackendType};
 use crate::cache::{AnalysisResult, CacheManager};
 use crate::session_manager::SessionManager;
 use crate::web_scraper::TelegramWebScraper;
-use crate::backend_config::{BackendConfig, BackendRateLimiter, BackendType};
 use deadpool_postgres::Pool;
 
 /// rate limiter for telegram api operations
@@ -304,8 +304,12 @@ impl AnalysisEngine {
     }
 
     pub async fn check_rate_limits(&self) -> bool {
-        let web_time = self.backend_rate_limiter.time_until_available(BackendType::WebScraping);
-        let api_time = self.backend_rate_limiter.time_until_available(BackendType::Api);
+        let web_time = self
+            .backend_rate_limiter
+            .time_until_available(BackendType::WebScraping);
+        let api_time = self
+            .backend_rate_limiter
+            .time_until_available(BackendType::Api);
         web_time.is_some() && api_time.is_some()
     }
 
@@ -315,16 +319,50 @@ impl AnalysisEngine {
     ) -> Result<AnalysisData, Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting analysis for channel: {}", channel_username);
 
-        let messages = match self.cache.load_channel_messages(channel_username).await
-        {
-            Some(cached_messages) => cached_messages,
+        let messages = match self.cache.load_channel_messages(channel_username).await {
+            Some(cached_messages) => {
+                info!(
+                    "Using cached messages for channel: {} ({} messages)",
+                    channel_username,
+                    cached_messages.len()
+                );
+                cached_messages
+            }
             None => {
-                info!("Fetching fresh messages from channel");
-                self.ensure_client().await?;
-                let (messages, _hit_rate_limits) = self.get_all_messages_with_rate_limit_info(channel_username).await?;
-                self.cache
+                info!("Fetching fresh messages from channel: {}", channel_username);
+                self.ensure_client().await.map_err(|e| {
+                    error!(
+                        "Failed to ensure client for channel {}: {}",
+                        channel_username, e
+                    );
+                    e
+                })?;
+                let (messages, _hit_rate_limits) = self
+                    .get_all_messages_with_rate_limit_info(channel_username)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Failed to fetch messages from channel {}: {}",
+                            channel_username, e
+                        );
+                        e
+                    })?;
+                info!(
+                    "Fetched {} messages from channel: {}",
+                    messages.len(),
+                    channel_username
+                );
+                if let Err(e) = self
+                    .cache
                     .save_channel_messages(channel_username, &messages)
-                    .await?;
+                    .await
+                {
+                    error!(
+                        "Failed to cache messages for channel {}: {}",
+                        channel_username, e
+                    );
+                    // Continue execution - caching failure shouldn't stop the analysis
+                }
                 messages
             }
         };
@@ -348,7 +386,6 @@ impl AnalysisEngine {
         Ok(())
     }
 
-
     async fn get_all_messages_with_rate_limit_info(
         &mut self,
         channel_username: &str,
@@ -356,12 +393,18 @@ impl AnalysisEngine {
         info!("Getting messages from {}", channel_username);
 
         // select backend based on rate limits (web scraping preferred)
-        let backend = self.backend_rate_limiter.select_available_backend(&self.backend_config.enabled_backends)
+        let backend = self
+            .backend_rate_limiter
+            .select_available_backend(&self.backend_config.enabled_backends)
             .unwrap_or(BackendType::WebScraping);
 
         // check if both backends are rate limited
-        let web_time = self.backend_rate_limiter.time_until_available(BackendType::WebScraping);
-        let api_time = self.backend_rate_limiter.time_until_available(BackendType::Api);
+        let web_time = self
+            .backend_rate_limiter
+            .time_until_available(BackendType::WebScraping);
+        let api_time = self
+            .backend_rate_limiter
+            .time_until_available(BackendType::Api);
         let hit_rate_limits = web_time.is_some() && api_time.is_some();
 
         // if chosen backend is not available, wait for the closest one
@@ -369,35 +412,85 @@ impl AnalysisEngine {
             let closest_backend = match (web_time, api_time) {
                 (None, _) => BackendType::WebScraping,
                 (_, None) => BackendType::Api,
-                (Some(web), Some(api)) => if web <= api { BackendType::WebScraping } else { BackendType::Api },
+                (Some(web), Some(api)) => {
+                    if web <= api {
+                        BackendType::WebScraping
+                    } else {
+                        BackendType::Api
+                    }
+                }
             };
-            
-            if let Some(wait_time) = self.backend_rate_limiter.time_until_available(closest_backend) {
-                info!("Waiting {}s for {} backend", wait_time.as_secs(), closest_backend.name());
-                self.backend_rate_limiter.wait_for_backend(closest_backend).await;
+
+            if let Some(wait_time) = self
+                .backend_rate_limiter
+                .time_until_available(closest_backend)
+            {
+                info!(
+                    "Waiting {}s for {} backend",
+                    wait_time.as_secs(),
+                    closest_backend.name()
+                );
+                self.backend_rate_limiter
+                    .wait_for_backend(closest_backend)
+                    .await;
             }
         }
 
         let messages = match backend {
             BackendType::WebScraping => {
                 info!("Using web scraping backend for {}", channel_username);
-                let channel_url = format!("https://t.me/{}", channel_username.trim_start_matches('@'));
-                let messages = self.web_scraper.scrape_channel_messages(&channel_url, 10).await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                self.backend_rate_limiter.record_backend_call(BackendType::WebScraping);
+                let channel_url =
+                    format!("https://t.me/{}", channel_username.trim_start_matches('@'));
+                let messages = self
+                    .web_scraper
+                    .scrape_channel_messages(&channel_url, 10)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Web scraping failed for channel {}: {}",
+                            channel_username, e
+                        );
+                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                    })?;
+                self.backend_rate_limiter
+                    .record_backend_call(BackendType::WebScraping);
                 messages
             }
             BackendType::Api => {
                 info!("Using API backend for {}", channel_username);
-                
+
                 // validate channel when using API backend
-                if !self.validate_channel(channel_username).await? {
-                    return Err("Channel not found or not accessible".into());
+                match self.validate_channel(channel_username).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        error!(
+                            "Channel validation failed for {}: channel not found or not accessible",
+                            channel_username
+                        );
+                        return Err("Channel not found or not accessible".into());
+                    }
+                    Err(e) => {
+                        error!("Channel validation error for {}: {}", channel_username, e);
+                        return Err(e);
+                    }
                 }
-                
-                self.ensure_client().await?;
-                let messages = self.get_all_messages_api(channel_username).await?;
-                self.backend_rate_limiter.record_backend_call(BackendType::Api);
+
+                self.ensure_client().await.map_err(|e| {
+                    error!("Failed to ensure client for API backend: {}", e);
+                    e
+                })?;
+                let messages = self
+                    .get_all_messages_api(channel_username)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Failed to get messages via API for channel {}: {}",
+                            channel_username, e
+                        );
+                        e
+                    })?;
+                self.backend_rate_limiter
+                    .record_backend_call(BackendType::Api);
                 messages
             }
         };
@@ -551,7 +644,7 @@ impl AnalysisEngine {
 
                     <professional>This part should contain a professional analysis of the author, including their expertise, background, and any relevant professional details, as an advice to the hiring manager, including potential issues</professional>
                     <personal>This part should contain a personal analysis of the author, as written by a professional psychologist for non-professional reader</personal>
-                    <roast>This part should contain a roast of the author, as written by a friend of theirs, that is somewhat harsh</roast>
+                    <roast>This part should contain a roast of the author, as written by a friend of theirs, that is somewhat harsh. Keep in mind author origin - e.g. eastern europe folks are very tolerant to harsh words, and need to make it REALLY hard</roast>
                     Each part should be around 2048 characters long, in the language of the messages.
 Messages:
 {}",
@@ -562,18 +655,125 @@ Messages:
     pub async fn query_and_parse_analysis(
         prompt: &str,
     ) -> Result<AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
-        let llm_response = query_llm(prompt, "gemini-2.5-pro").await?;
+        // helper function to check if analysis result is complete
+        fn is_analysis_complete(
+            professional: &Option<String>,
+            personal: &Option<String>,
+            roast: &Option<String>,
+        ) -> bool {
+            professional.is_some() && personal.is_some() && roast.is_some()
+        }
 
-        let professional = extract_tag(&llm_response.content, "professional");
-        let personal = extract_tag(&llm_response.content, "personal");
-        let roast = extract_tag(&llm_response.content, "roast");
+        // helper function to try a model with content retries
+        async fn try_model_with_content_retries(
+            prompt: &str,
+            model: &str,
+            api_retries: u32,
+            content_retries: u32,
+        ) -> Result<AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
+            // retry API calls
+            for api_attempt in 0..api_retries {
+                match query_llm(prompt, model).await {
+                    Ok(response) => {
+                        // retry content parsing
+                        for content_attempt in 0..content_retries {
+                            let professional = extract_tag(&response.content, "professional");
+                            let personal = extract_tag(&response.content, "personal");
+                            let roast = extract_tag(&response.content, "roast");
 
-        Ok(AnalysisResult {
-            professional,
-            personal,
-            roast,
-            messages_count: 0, // will be set by caller
-        })
+                            // log missing sections
+                            let mut missing_sections = Vec::new();
+                            if professional.is_none() {
+                                missing_sections.push("professional");
+                            }
+                            if personal.is_none() {
+                                missing_sections.push("personal");
+                            }
+                            if roast.is_none() {
+                                missing_sections.push("roast");
+                            }
+
+                            if !missing_sections.is_empty() {
+                                warn!(
+                                    "Missing analysis sections [{}] from {} (api_attempt: {}, content_attempt: {})",
+                                    missing_sections.join(", "),
+                                    model,
+                                    api_attempt + 1,
+                                    content_attempt + 1
+                                );
+                            }
+
+                            // if all sections are present, return immediately
+                            if is_analysis_complete(&professional, &personal, &roast) {
+                                info!("Complete analysis received from {} (api_attempt: {}, content_attempt: {})",
+                                      model, api_attempt + 1, content_attempt + 1);
+                                return Ok(AnalysisResult {
+                                    professional,
+                                    personal,
+                                    roast,
+                                    messages_count: 0,
+                                });
+                            }
+
+                            // if incomplete and not the last content attempt, retry with same response
+                            if content_attempt < content_retries - 1 {
+                                warn!(
+                                    "Retrying content parsing for {} (content_attempt: {})",
+                                    model,
+                                    content_attempt + 1
+                                );
+                                // in this case, we're re-parsing the same response, so we just continue the loop
+                                // but in practice, extract_tag is deterministic, so this won't help
+                                // this structure is here for future improvements like fuzzy parsing
+                            } else {
+                                // last content attempt failed, need new API call if available
+                                warn!("Content parsing failed for {} after {} attempts, need new API call",
+                                      model, content_retries);
+                                // if this was the last api attempt, we failed completely for this model
+                                if api_attempt == api_retries - 1 {
+                                    error!(
+                                        "Failed to get complete analysis from {} after all retries",
+                                        model
+                                    );
+                                    return Err(format!("Failed to get complete analysis from {} after {} API attempts and {} content attempts per API call", model, api_retries, content_retries).into());
+                                }
+                                break; // break content loop to try new API call
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("{} API attempt {} failed: {}", model, api_attempt + 1, e);
+                        if api_attempt == api_retries - 1 {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            // if we get here, all API attempts failed but didn't return Err - this shouldn't happen
+            Err(format!(
+                "Unexpected failure in {} after {} API attempts",
+                model, api_retries
+            )
+            .into())
+        }
+
+        // try gemini-2.5-flash with retries
+        match try_model_with_content_retries(prompt, "gemini-2.5-flash", 2, 2).await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                warn!("Gemini Flash failed with error: {}, trying fallback", e);
+            }
+        }
+
+        // try gemini-2.5-pro as fallback
+        info!("Falling back to gemini-2.5-pro");
+        match try_model_with_content_retries(prompt, "gemini-2.5-pro", 2, 2).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                error!("Gemini Pro fallback also failed: {}", e);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -648,7 +848,7 @@ async fn query_llm(
         }
 
         info!(
-            "Received response of length: {} (attempt {})",
+            "Received LLM response of length: {} (attempt {})",
             content.len(),
             attempt + 1
         );
