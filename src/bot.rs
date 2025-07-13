@@ -1,6 +1,7 @@
 use comrak::{markdown_to_html, ComrakOptions};
 use html_escape;
 use log::{error, info};
+use regex::Regex;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -16,7 +17,7 @@ use crate::user_manager::{UserManager, UserManagerError};
 use deadpool_postgres::Pool;
 
 // payment configuration constants
-const SINGLE_PACKAGE_PRICE: u32 = 30;
+const SINGLE_PACKAGE_PRICE: u32 = 40;
 const BULK_PACKAGE_PRICE: u32 = 200;
 const SINGLE_PACKAGE_AMOUNT: i32 = 1;
 const BULK_PACKAGE_AMOUNT: i32 = 10;
@@ -26,9 +27,9 @@ const BULK_PACKAGE_AMOUNT: i32 = 10;
 pub enum Command {
     #[command(description = "start the bot")]
     Start,
-    #[command(description = "buy 1 analysis for 10 star")]
+    #[command(description = "buy 1 analysis for 40 stars")]
     Buy1,
-    #[command(description = "buy 10 analyses for 50 stars")]
+    #[command(description = "buy 10 analyses for 200 stars")]
     Buy10,
 }
 
@@ -39,6 +40,26 @@ pub struct TelegramBot {
 }
 
 impl TelegramBot {
+    fn validate_and_normalize_channel(text: &str) -> Option<String> {
+        // regex for valid telegram channel username (5-32 chars, alphanumeric and underscore)
+        let channel_regex = Regex::new(r"^@([a-zA-Z0-9_]{5,32})$").unwrap();
+        
+        // regex for t.me links
+        let tme_regex = Regex::new(r"^(?:https?://)?t\.me/([a-zA-Z0-9_]{5,32})$").unwrap();
+        
+        // check if it's already in @channel format
+        if channel_regex.is_match(text) {
+            return Some(text.to_string());
+        }
+        
+        // check if it's a t.me link and extract channel name
+        if let Some(captures) = tme_regex.captures(text) {
+            return Some(format!("@{}", &captures[1]));
+        }
+        
+        None
+    }
+
     fn create_payment_keyboard() -> InlineKeyboardMarkup {
         let single_button = InlineKeyboardButton::callback(
             format!(
@@ -248,6 +269,58 @@ impl TelegramBot {
                     "Successfully processed payment: {} credits for user {}",
                     credits, telegram_user_id
                 );
+
+                // process referral rewards if user was referred
+                match user_manager.record_paid_referral(telegram_user_id).await {
+                    Ok(Some(reward_info)) => {
+                        if let Some(referrer_telegram_id) = reward_info.referrer_telegram_id {
+                            // send notification to referrer
+                            let reward_msg = if reward_info.paid_rewards > 0 && reward_info.milestone_rewards > 0 {
+                                format!(
+                                    "🎉 <b>Referral Rewards!</b>\n\n\
+                                    You've earned <b>{}</b> credits:\n\
+                                    • {} credit(s) for paid referral\n\
+                                    • {} credit(s) for milestone bonus\n\n\
+                                    Keep sharing your referral link to earn more!",
+                                    reward_info.total_credits_awarded,
+                                    reward_info.paid_rewards,
+                                    reward_info.milestone_rewards
+                                )
+                            } else if reward_info.paid_rewards > 0 {
+                                format!(
+                                    "🎉 <b>Referral Reward!</b>\n\n\
+                                    You've earned <b>{}</b> credit(s) for a paid referral!\n\n\
+                                    Keep sharing your referral link to earn more!",
+                                    reward_info.paid_rewards
+                                )
+                            } else if reward_info.milestone_rewards > 0 {
+                                format!(
+                                    "🎉 <b>Milestone Reward!</b>\n\n\
+                                    You've earned <b>{}</b> credit(s) for reaching a referral milestone!\n\n\
+                                    Keep sharing your referral link to earn more!",
+                                    reward_info.milestone_rewards
+                                )
+                            } else {
+                                String::new()
+                            };
+
+                            if !reward_msg.is_empty() {
+                                let _ = bot.send_message(
+                                    ChatId(referrer_telegram_id), 
+                                    reward_msg
+                                )
+                                .parse_mode(ParseMode::Html)
+                                .await;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // no referral rewards
+                    }
+                    Err(e) => {
+                        error!("Failed to process paid referral for user {}: {}", telegram_user_id, e);
+                    }
+                }
             }
             Err(e) => {
                 error!(
@@ -364,10 +437,11 @@ impl TelegramBot {
                                     query.from.username.as_deref(),
                                     Some(query.from.first_name.as_str()),
                                     query.from.last_name.as_deref(),
+                                    None, // no referral in callback queries
                                 )
                                 .await
                             {
-                                Ok(user) => user,
+                                Ok((user, _)) => user,
                                 Err(e) => {
                                     error!("Failed to get user: {}", e);
                                     bot.send_message(
@@ -461,6 +535,25 @@ impl TelegramBot {
     ) -> ResponseResult<()> {
         match cmd {
             Command::Start => {
+                // parse referral code from message text
+                let referrer_user_id = if let Some(text) = msg.text() {
+                    if let Some(args) = text.strip_prefix("/start ") {
+                        if let Ok(user_id) = args.trim().parse::<i32>() {
+                            // validate that referrer exists
+                            match user_manager.validate_referrer(user_id).await {
+                                Ok(true) => Some(user_id),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 // get user info from telegram message
                 let telegram_user_id = msg.from.as_ref().map(|user| user.id.0 as i64).unwrap_or(0);
                 let username = msg.from.as_ref().and_then(|user| user.username.as_deref());
@@ -468,11 +561,11 @@ impl TelegramBot {
                 let last_name = msg.from.as_ref().and_then(|user| user.last_name.as_deref());
 
                 // get or create user to check credit balance
-                let user = match user_manager
-                    .get_or_create_user(telegram_user_id, username, first_name, last_name)
+                let (user, maybe_reward_info) = match user_manager
+                    .get_or_create_user(telegram_user_id, username, first_name, last_name, referrer_user_id)
                     .await
                 {
-                    Ok(user) => user,
+                    Ok((user, reward_info)) => (user, reward_info),
                     Err(e) => {
                         log::error!("Failed to get/create user: {}", e);
                         bot.send_message(msg.chat.id, "❌ Sorry, there was an error accessing your account. Please try again later.")
@@ -481,8 +574,33 @@ impl TelegramBot {
                     }
                 };
 
+                // send referral milestone notification if applicable
+                if let Some(reward_info) = maybe_reward_info {
+                    if let Some(referrer_telegram_id) = reward_info.referrer_telegram_id {
+                        let reward_msg = format!(
+                            "🎉 <b>Milestone Reward!</b>\n\n\
+                            You've earned <b>{}</b> credit(s) for reaching a referral milestone!\n\n\
+                            Keep sharing your referral link to earn more!",
+                            reward_info.total_credits_awarded
+                        );
+
+                        let _ = bot.send_message(
+                            ChatId(referrer_telegram_id), 
+                            reward_msg
+                        )
+                        .parse_mode(ParseMode::Html)
+                        .await;
+                    }
+                }
+
                 if user.analysis_credits <= 0 {
                     // user has no credits - show pricing and payment options
+                    let referral_info = if user.referrals_count > 0 {
+                        format!("You have {} referrals! 🎉", user.referrals_count)
+                    } else {
+                        "Start earning free credits by referring friends!".to_string()
+                    };
+
                     let intro_text = format!(
                         "🤖 <b>@ScratchAuthorEgoBot - Channel Analyzer</b>\n\n\
                         Welcome! I can analyze Telegram channels and provide insights.\n\n\
@@ -498,10 +616,16 @@ impl TelegramBot {
                         💰 <b>Pricing:</b>\n\
                         • 1 analysis: {} ⭐ stars\n\
                         • 10 analyses: {} ⭐ stars (save {} stars!)\n\n\
+                        🎁 <b>Referral Program:</b> {}\n\
+                        Share your link: <code>https://t.me/YourBot?start={}</code>\n\
+                        • Get credits at milestones: 1, 5, 10, 20, 30...\n\
+                        • Get 1 credit for each paid referral\n\n\
                         Choose a package below or just send me a channel name to get started!",
                         SINGLE_PACKAGE_PRICE,
                         BULK_PACKAGE_PRICE,
-                        (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE
+                        (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE,
+                        referral_info,
+                        user.id
                     );
 
                     bot.send_message(msg.chat.id, intro_text)
@@ -510,6 +634,43 @@ impl TelegramBot {
                         .await?;
                 } else {
                     // user has credits - show welcome without pricing
+                    let referral_section = if user.referrals_count > 0 {
+                        let next_milestone = if user.referrals_count < 1 {
+                            1
+                        } else if user.referrals_count < 5 {
+                            5
+                        } else if user.referrals_count < 10 {
+                            10
+                        } else {
+                            ((user.referrals_count / 10) + 1) * 10
+                        };
+                        let referrals_to_next = next_milestone - user.referrals_count;
+                        format!(
+                            "💳 <b>Your Status:</b>\n\
+                            • Credits remaining: <b>{}</b>\n\
+                            • Total analyses performed: <b>{}</b>\n\
+                            • Referrals: <b>{}</b> (Paid: <b>{}</b>)\n\
+                            • Next milestone reward in <b>{}</b> referrals\n\n\
+                            🎁 <b>Referral Program:</b>\n\
+                            Share your link: <code>https://t.me/YourBot?start={}</code>\n\
+                            • Get credits at milestones: 1, 5, 10, 20, 30...\n\
+                            • Get 1 credit for each paid referral\n\n\
+                            Great job on your {} referrals! 🎉",
+                            user.analysis_credits, user.total_analyses_performed, user.referrals_count, user.paid_referrals_count, referrals_to_next, user.id, user.referrals_count
+                        )
+                    } else {
+                        format!(
+                            "💳 <b>Your Status:</b>\n\
+                            • Credits remaining: <b>{}</b>\n\
+                            • Total analyses performed: <b>{}</b>\n\n\
+                            🎁 <b>Referral Program:</b>\n\
+                            Share your link: <code>https://t.me/YourBot?start={}</code>\n\
+                            • Get credits at milestones: 1, 5, 10, 20, 30...\n\
+                            • Get 1 credit for each paid referral",
+                            user.analysis_credits, user.total_analyses_performed, user.id
+                        )
+                    };
+
                     let intro_text = format!(
                         "🤖 <b>@ScratchAuthorEgoBot - Channel Analyzer</b>\n\n\
                         Welcome back! I can analyze Telegram channels and provide insights.\n\n\
@@ -522,11 +683,9 @@ impl TelegramBot {
                         • 💼 Professional: Expert assessment for hiring\n\
                         • 🧠 Personal: Psychological profile insights\n\
                         • 🔥 Roast: Fun, brutally honest critique\n\n\
-                        💳 <b>Your Status:</b>\n\
-                        • Credits remaining: <b>{}</b>\n\
-                        • Total analyses performed: <b>{}</b>\n\n\
+                        {}\n\n\
                         Just send me a channel name to get started!",
-                        user.analysis_credits, user.total_analyses_performed
+                        referral_section
                     );
 
                     bot.send_message(msg.chat.id, intro_text)
@@ -569,9 +728,9 @@ impl TelegramBot {
         if let Some(text) = msg.text() {
             let text = text.trim();
 
-            // check if message looks like a channel username
-            if text.starts_with('@') && text.len() > 1 {
-                info!("Received channel analysis request: {}", text);
+            // validate and normalize channel input
+            if let Some(channel_name) = Self::validate_and_normalize_channel(text) {
+                info!("Received channel analysis request: {}", channel_name);
 
                 // get user info from telegram message
                 let telegram_user_id = msg.from.as_ref().map(|user| user.id.0 as i64).unwrap_or(0);
@@ -581,10 +740,10 @@ impl TelegramBot {
 
                 // get or create user and check credits
                 let user = match user_manager
-                    .get_or_create_user(telegram_user_id, username, first_name, last_name)
+                    .get_or_create_user(telegram_user_id, username, first_name, last_name, None)
                     .await
                 {
-                    Ok(user) => user,
+                    Ok((user, _)) => user,
                     Err(e) => {
                         error!("Failed to get/create user: {}", e);
                         bot.send_message(
@@ -636,12 +795,12 @@ impl TelegramBot {
                 let selection_msg = format!(
                     "🎯 <b>Channel:</b> <code>{}</code>\n\n\
                     Please choose the type of analysis you'd like to perform:",
-                    Self::escape_html(text)
+                    Self::escape_html(&channel_name)
                 );
 
                 bot.send_message(msg.chat.id, selection_msg)
                     .parse_mode(ParseMode::Html)
-                    .reply_markup(Self::create_analysis_selection_keyboard(text))
+                    .reply_markup(Self::create_analysis_selection_keyboard(&channel_name))
                     .await?;
             } else {
                 // send help message for invalid input
@@ -724,6 +883,17 @@ impl TelegramBot {
             engine.prepare_analysis_data(&channel_name).await?
         };
 
+        // check if we received 0 messages and raise error
+        if analysis_data.messages.is_empty() {
+            bot.send_message(
+                user_chat_id,
+                "❌ <b>Analysis Error</b>\n\nNo messages found in the channel. This could happen if:\n• The channel is private/restricted\n• The channel has no recent messages\n• There are network connectivity issues\n\nNo credits were consumed for this request.",
+            )
+            .parse_mode(ParseMode::Html)
+            .await?;
+            return Err("No messages found in channel".into());
+        }
+
         // check for cached result (with lock)
         let cached_result = {
             let engine = analysis_engine.lock().await;
@@ -756,7 +926,7 @@ impl TelegramBot {
 
         // consume credit after successful analysis
         let remaining_credits = match user_manager
-            .consume_credit(telegram_user_id, &channel_name)
+            .consume_credit(telegram_user_id, &channel_name, &analysis_type)
             .await
         {
             Ok(credits) => credits,

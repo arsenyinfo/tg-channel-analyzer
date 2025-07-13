@@ -119,7 +119,7 @@ impl MigrationManager {
     }
 
     fn latest_version() -> i32 {
-        2 // increment this when adding new migrations
+        3 // increment this when adding new migrations
     }
 
     async fn run_pending_migrations(
@@ -143,6 +143,34 @@ impl MigrationManager {
                         CREATE INDEX idx_user_analysis_choices_user_id ON user_analysis_choices(user_id);
                         CREATE INDEX idx_user_analysis_choices_telegram_id ON user_analysis_choices(telegram_user_id);
                         CREATE INDEX idx_user_analysis_choices_created ON user_analysis_choices(created_at);
+                    "#;
+                    transaction.batch_execute(migration_sql).await?;
+                }
+                3 => {
+                    // add analysis_type field to user_analyses table and referral system
+                    let migration_sql = r#"
+                        ALTER TABLE user_analyses 
+                        ADD COLUMN analysis_type VARCHAR(50) CHECK (analysis_type IN ('professional', 'personal', 'roast'));
+
+                        -- Add referral tracking columns to users table
+                        ALTER TABLE users 
+                        ADD COLUMN referred_by_user_id INTEGER REFERENCES users(id),
+                        ADD COLUMN referrals_count INTEGER NOT NULL DEFAULT 0,
+                        ADD COLUMN paid_referrals_count INTEGER NOT NULL DEFAULT 0;
+
+                        -- Create referral_rewards table for tracking credit awards
+                        CREATE TABLE referral_rewards (
+                            id SERIAL PRIMARY KEY,
+                            referrer_user_id INTEGER NOT NULL REFERENCES users(id),
+                            referee_user_id INTEGER NOT NULL REFERENCES users(id),
+                            reward_type VARCHAR(20) NOT NULL CHECK (reward_type IN ('unpaid_milestone', 'paid_user')),
+                            credits_awarded INTEGER NOT NULL,
+                            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                        );
+
+                        CREATE INDEX idx_referral_rewards_referrer ON referral_rewards(referrer_user_id);
+                        CREATE INDEX idx_referral_rewards_referee ON referral_rewards(referee_user_id);
+                        CREATE INDEX idx_users_referred_by ON users(referred_by_user_id);
                     "#;
                     transaction.batch_execute(migration_sql).await?;
                 }
