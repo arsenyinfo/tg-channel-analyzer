@@ -6,7 +6,7 @@ use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{
     CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
-    LinkPreviewOptions, ParseMode, PreCheckoutQuery, SuccessfulPayment,
+    ParseMode, PreCheckoutQuery, SuccessfulPayment,
 };
 use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
@@ -1006,38 +1006,6 @@ impl TelegramBot {
         .await?;
 
 
-        // check if we'll hit rate limits before starting (with lock)
-        let will_hit_rate_limits = {
-            let engine = analysis_engine.lock().await;
-            let cached = engine
-                .cache
-                .load_channel_messages(&channel_name)
-                .await
-                .is_some();
-            if !cached {
-                engine.check_rate_limits().await
-            } else {
-                false
-            }
-        };
-
-        // notify user about high load BEFORE starting analysis
-        if will_hit_rate_limits {
-            let high_load_msg = "⚠️ <b>High Load Notice</b>\n\n\
-                This may take longer than usual.\n\n\
-                🔧 <b>For better performance:</b>\n\
-                Consider running your own instance with your API keys from the 🔗 <a href=\"https://github.com/arsenyinfo/tg-channel-analyzer/\">GitHub Repository</a>";
-            bot.send_message(user_chat_id, high_load_msg)
-                .parse_mode(ParseMode::Html)
-                .link_preview_options(LinkPreviewOptions {
-                    is_disabled: true,
-                    url: None,
-                    prefer_small_media: false,
-                    prefer_large_media: false,
-                    show_above_text: false,
-                })
-                .await?;
-        }
 
         // prepare analysis data (with lock)
         let analysis_data = {

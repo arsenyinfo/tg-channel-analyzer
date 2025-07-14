@@ -344,15 +344,6 @@ impl AnalysisEngine {
         unreachable!()
     }
 
-    pub async fn check_rate_limits(&self) -> bool {
-        let web_time = self
-            .backend_rate_limiter
-            .time_until_available(BackendType::WebScraping);
-        let api_time = self
-            .backend_rate_limiter
-            .time_until_available(BackendType::Api);
-        web_time.is_some() && api_time.is_some()
-    }
 
     pub async fn prepare_analysis_data(
         &mut self,
