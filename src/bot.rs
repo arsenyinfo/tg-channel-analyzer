@@ -924,15 +924,6 @@ impl TelegramBot {
         )
         .await?;
 
-        // timeout notice for long-running requests
-        bot.send_message(
-            user_chat_id,
-            "⏱️ <b>Timeout Notice</b>\n\n\
-            If you don't receive a response after 60 minutes, the request may have been lost.\n\
-            In that case, please try again - no credits will be consumed for failed requests.",
-        )
-        .parse_mode(ParseMode::Html)
-        .await?;
 
         // check if we'll hit rate limits before starting (with lock)
         let will_hit_rate_limits = {

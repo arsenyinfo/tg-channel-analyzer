@@ -9,7 +9,7 @@ use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::backend_config::{BackendConfig, BackendRateLimiter, BackendType};
 use crate::cache::{AnalysisResult, CacheManager};
@@ -21,6 +21,47 @@ use deadpool_postgres::Pool;
 struct TelegramRateLimiter {
     username_resolution_last_call: Arc<Mutex<Option<Instant>>>,
     message_iteration_last_call: Arc<Mutex<Option<Instant>>>,
+}
+
+/// global rate limiter for gemini api operations
+struct GeminiRateLimiter {
+    last_call: Arc<Mutex<Option<Instant>>>,
+}
+
+impl GeminiRateLimiter {
+    fn new() -> Self {
+        Self {
+            last_call: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// wait for gemini api rate limit (1 request per second)
+    async fn wait_for_api_call(&self) {
+        let mut last_call = self.last_call.lock().await;
+
+        if let Some(last_time) = *last_call {
+            let elapsed = last_time.elapsed();
+            let min_interval = Duration::from_secs(1);
+
+            if elapsed < min_interval {
+                let wait_time = min_interval - elapsed;
+                info!(
+                    "Rate limiting Gemini API: waiting {}ms",
+                    wait_time.as_millis()
+                );
+                sleep(wait_time).await;
+            }
+        }
+
+        *last_call = Some(Instant::now());
+    }
+}
+
+/// global gemini rate limiter instance
+static GEMINI_RATE_LIMITER: std::sync::OnceLock<GeminiRateLimiter> = std::sync::OnceLock::new();
+
+fn get_gemini_rate_limiter() -> &'static GeminiRateLimiter {
+    GEMINI_RATE_LIMITER.get_or_init(|| GeminiRateLimiter::new())
 }
 
 impl TelegramRateLimiter {
@@ -640,13 +681,68 @@ impl AnalysisEngine {
         let messages_json = serde_json::to_string_pretty(messages)?;
 
         Ok(format!(
-            "Given the following messages from a Telegram channel, analyze the author profile and write three blocks of text in the following format:
+            "You are an expert analyst tasked with creating a comprehensive personality profile based on Telegram channel messages. Analyze the writing style, topics discussed, opinions expressed, and behavioral patterns to understand the author's character.
 
-                    <professional>This part should contain a professional analysis of the author, including their expertise, background, and any relevant professional details, as an advice to the hiring manager, including potential issues</professional>
-                    <personal>This part should contain a personal analysis of the author, as written by a professional psychologist for non-professional reader</personal>
-                    <roast>This part should contain a roast of the author, as written by a friend of theirs, that is somewhat harsh. Keep in mind author origin - e.g. eastern europe folks are very tolerant to harsh words, and need to make it REALLY hard</roast>
-                    Each part should be around 2048 characters long, in the language of the messages.
-Messages:
+CRITICAL REQUIREMENTS:
+1. Write in the same language as the messages (detect automatically)
+2. Each section must be approximately 2048 characters long
+3. Use ONLY the provided XML tags exactly as shown
+4. Base analysis solely on the message content provided
+5. Do not make assumptions about gender, age, or location unless clearly evident
+
+OUTPUT FORMAT (use these exact tags):
+
+<professional>
+Write a detailed professional assessment suitable for a hiring manager. Focus on:
+- Technical skills and expertise demonstrated
+- Communication style and professionalism
+- Leadership qualities or lack thereof
+- Work ethic and reliability indicators
+- Potential red flags or concerns for employers
+- Industry knowledge and thought leadership
+- Team collaboration potential
+
+Tone: Formal, objective, balanced - highlight both strengths and weaknesses
+Length: ~2048 characters
+</professional>
+
+<personal>
+Write a psychological personality analysis for a general audience. Focus on:
+- Core personality traits and characteristics
+- Emotional intelligence and social skills
+- Decision-making patterns and cognitive style
+- Values, beliefs, and motivations
+- Relationship patterns and social behavior
+- Stress responses and coping mechanisms
+- Growth mindset vs fixed mindset indicators
+
+Tone: Insightful, empathetic, professional psychological assessment
+Length: ~2048 characters
+</personal>
+
+<roast>
+Write a sharp, witty critique as if from a close friend who knows them well. Focus on:
+- Quirks, habits, and annoying tendencies
+- Contradictions in their behavior or beliefs
+- Pretentious or hypocritical moments
+- Social media behavior and online persona
+- Pet peeves others might have about them
+- Blind spots and areas of self-delusion
+
+Tone: Brutally honest, sharp humor, keeping in mind the cultural context (e.g. Eastern European directness)
+Length: ~2048 characters
+Note: Adjust harshness based on cultural context - Eastern Europeans typically appreciate more direct criticism
+</roast>
+
+ANALYSIS GUIDELINES:
+- Look for patterns across multiple messages, not isolated incidents
+- Consider context and nuance, not just surface-level content
+- Identify both explicit statements and implied attitudes
+- Note communication style: formal vs casual, technical vs accessible
+- Observe emotional regulation and reaction patterns
+- Consider the audience they're writing for and how they adapt their voice
+
+Messages to analyze:
 {}",
             messages_json
         ))
@@ -792,6 +888,7 @@ fn extract_tag(text: &str, tag: &str) -> Option<String> {
 
 const MAX_RETRIES: u32 = 3;
 const BASE_DELAY_MS: u64 = 1000;
+const GEMINI_TIMEOUT_SECS: u64 = 300;
 
 async fn query_llm(
     prompt: &str,
@@ -799,10 +896,18 @@ async fn query_llm(
 ) -> Result<LLMResponse, Box<dyn std::error::Error + Send + Sync>> {
     info!("Querying LLM with model: {}", model);
 
+    // apply rate limiting before each attempt
+    get_gemini_rate_limiter().wait_for_api_call().await;
+
     for attempt in 0..=MAX_RETRIES {
-        let response = match gemini_rs::chat(model).send_message(prompt).await {
-            Ok(resp) => resp,
-            Err(e) => {
+        let response = match timeout(
+            Duration::from_secs(GEMINI_TIMEOUT_SECS),
+            gemini_rs::chat(model).send_message(prompt),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
                 if attempt == MAX_RETRIES {
                     error!(
                         "Failed to get response from Gemini API after {} attempts: {:?}",
@@ -818,6 +923,27 @@ async fn query_llm(
                     attempt + 1,
                     MAX_RETRIES + 1,
                     e,
+                    delay.as_millis()
+                );
+                sleep(delay).await;
+                continue;
+            }
+            Err(_timeout) => {
+                if attempt == MAX_RETRIES {
+                    error!(
+                        "Gemini API call timed out after {} attempts ({}s timeout)",
+                        MAX_RETRIES + 1,
+                        GEMINI_TIMEOUT_SECS
+                    );
+                    return Err("Gemini API call timed out".into());
+                }
+
+                let delay = calculate_delay(attempt);
+                warn!(
+                    "Gemini API call timed out (attempt {}/{}): {}s timeout. Retrying in {}ms",
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                    GEMINI_TIMEOUT_SECS,
                     delay.as_millis()
                 );
                 sleep(delay).await;
