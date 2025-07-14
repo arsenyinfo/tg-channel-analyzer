@@ -51,6 +51,7 @@ pub struct User {
     pub referred_by_user_id: Option<i32>,
     pub referrals_count: i32,
     pub paid_referrals_count: i32,
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +104,7 @@ impl UserManager {
         // try to get existing user first
         if let Some(row) = client
             .query_opt(
-                "SELECT id, telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count 
+                "SELECT id, telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language 
                  FROM users WHERE telegram_user_id = $1",
                 &[&telegram_user_id],
             )
@@ -120,6 +121,7 @@ impl UserManager {
                 referred_by_user_id: row.get(7),
                 referrals_count: row.get(8),
                 paid_referrals_count: row.get(9),
+                language: row.get(10),
             };
             info!("Found existing user: {} (credits: {})", telegram_user_id, user.analysis_credits);
             return Ok((user, None));
@@ -128,9 +130,9 @@ impl UserManager {
         // create new user with default credits
         let row = client
             .query_one(
-                "INSERT INTO users (telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count) 
-                 VALUES ($1, $2, $3, $4, 1, 0, $5, 0, 0) 
-                 RETURNING id, telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count",
+                "INSERT INTO users (telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language) 
+                 VALUES ($1, $2, $3, $4, 1, 0, $5, 0, 0, NULL) 
+                 RETURNING id, telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language",
                 &[&telegram_user_id, &username, &first_name, &last_name, &referrer_user_id],
             )
             .await?;
@@ -146,6 +148,7 @@ impl UserManager {
             referred_by_user_id: row.get(7),
             referrals_count: row.get(8),
             paid_referrals_count: row.get(9),
+            language: row.get(10),
         };
 
         info!(

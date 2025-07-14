@@ -119,7 +119,7 @@ impl MigrationManager {
     }
 
     fn latest_version() -> i32 {
-        3 // increment this when adding new migrations
+        4 // increment this when adding new migrations
     }
 
     async fn run_pending_migrations(
@@ -171,6 +171,27 @@ impl MigrationManager {
                         CREATE INDEX idx_referral_rewards_referrer ON referral_rewards(referrer_user_id);
                         CREATE INDEX idx_referral_rewards_referee ON referral_rewards(referee_user_id);
                         CREATE INDEX idx_users_referred_by ON users(referred_by_user_id);
+                    "#;
+                    transaction.batch_execute(migration_sql).await?;
+                }
+                4 => {
+                    // add message queue table for bulk messaging and language field to users
+                    let migration_sql = r#"
+                        CREATE TABLE message_queue (
+                            id SERIAL PRIMARY KEY,
+                            telegram_user_id BIGINT NOT NULL,
+                            message TEXT NOT NULL,
+                            parse_mode VARCHAR(20) DEFAULT 'HTML',
+                            status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+                            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                            sent_at TIMESTAMP WITH TIME ZONE,
+                            error_message TEXT
+                        );
+
+                        CREATE INDEX idx_message_queue_status ON message_queue(status, created_at);
+
+                        -- Add language field to users table
+                        ALTER TABLE users ADD COLUMN language VARCHAR(2);
                     "#;
                     transaction.batch_execute(migration_sql).await?;
                 }

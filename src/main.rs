@@ -71,8 +71,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pool = CacheManager::create_pool().await?;
     MigrationManager::run_migrations(&pool).await?;
 
+    // wrap pool in Arc for sharing
+    let pool = Arc::new(pool);
+    
     // initialize user manager with shared pool
-    let user_manager = Arc::new(UserManager::new(pool.clone()));
+    let user_manager = Arc::new(UserManager::new((*pool).clone()));
 
     let bot = TelegramBot::new(&bot_token, user_manager, pool).await?;
     bot.run().await;

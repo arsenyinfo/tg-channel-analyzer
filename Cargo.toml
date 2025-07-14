@@ -8,6 +8,10 @@ default-run = "tg-main"
 name = "authorize"
 path = "src/bin/authorize.rs"
 
+[[bin]]
+name = "bulk_messenger"
+path = "src/bin/bulk_messenger.rs"
+
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }

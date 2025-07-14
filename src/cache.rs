@@ -1,4 +1,5 @@
 use deadpool_postgres::{Config, Pool, Runtime};
+use std::sync::Arc;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -9,11 +10,11 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use crate::analysis::MessageDict;
 
 pub struct CacheManager {
-    pool: Pool,
+    pool: Arc<Pool>,
 }
 
 impl CacheManager {
-    pub fn new(pool: Pool) -> Self {
+    pub fn new(pool: Arc<Pool>) -> Self {
         Self { pool }
     }
 

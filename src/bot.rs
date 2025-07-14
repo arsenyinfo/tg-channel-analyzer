@@ -37,6 +37,7 @@ pub struct TelegramBot {
     bot: Bot,
     analysis_engine: Arc<Mutex<AnalysisEngine>>,
     user_manager: Arc<UserManager>,
+    pool: Arc<Pool>,
 }
 
 impl TelegramBot {
@@ -103,6 +104,78 @@ impl TelegramBot {
     fn escape_html(text: &str) -> String {
         // use proper HTML escaping library
         html_escape::encode_text(text).to_string()
+    }
+
+    async fn run_message_queue_processor(bot: Bot, pool: Arc<Pool>) {
+        info!("Starting message queue processor");
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+        
+        loop {
+            interval.tick().await;
+            
+            let client = match pool.get().await {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("Failed to get database connection for queue processor: {}", e);
+                    continue;
+                }
+            };
+            
+            // get next pending message
+            let row = match client.query_opt(
+                "SELECT id, telegram_user_id, message, parse_mode 
+                 FROM message_queue 
+                 WHERE status = 'pending' 
+                 ORDER BY created_at 
+                 LIMIT 1 
+                 FOR UPDATE SKIP LOCKED",
+                &[],
+            ).await {
+                Ok(row) => row,
+                Err(e) => {
+                    error!("Failed to query message queue: {}", e);
+                    continue;
+                }
+            };
+            
+            if let Some(row) = row {
+                let id: i32 = row.get(0);
+                let user_id: i64 = row.get(1);
+                let message: String = row.get(2);
+                let parse_mode: String = row.get(3);
+                
+                // send message
+                let send_result = if parse_mode.to_uppercase() == "HTML" {
+                    bot.send_message(ChatId(user_id), &message)
+                        .parse_mode(ParseMode::Html)
+                        .await
+                } else {
+                    bot.send_message(ChatId(user_id), &message)
+                        .parse_mode(ParseMode::MarkdownV2)
+                        .await
+                };
+                
+                match send_result {
+                    Ok(_) => {
+                        if let Err(e) = client.execute(
+                            "UPDATE message_queue SET status = 'sent', sent_at = NOW() WHERE id = $1",
+                            &[&id],
+                        ).await {
+                            error!("Failed to update message status to sent: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        if let Err(e) = client.execute(
+                            "UPDATE message_queue SET status = 'failed', error_message = $2 WHERE id = $1",
+                            &[&id, &error_msg],
+                        ).await {
+                            error!("Failed to update message status to failed: {}", e);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn markdown_to_html_safe(text: &str) -> String {
@@ -182,15 +255,16 @@ impl TelegramBot {
     pub async fn new(
         bot_token: &str,
         user_manager: Arc<UserManager>,
-        pool: Pool,
+        pool: Arc<Pool>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let bot = Bot::new(bot_token);
-        let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new(pool)?));
+        let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new(pool.clone())?));
 
         Ok(Self {
             bot,
             analysis_engine,
             user_manager,
+            pool,
         })
     }
 
@@ -360,6 +434,13 @@ impl TelegramBot {
 
     pub async fn run(&self) {
         info!("Starting Telegram bot...");
+
+        // spawn message queue processor
+        let bot_clone = self.bot.clone();
+        let pool_clone = self.pool.clone();
+        tokio::spawn(async move {
+            Self::run_message_queue_processor(bot_clone, pool_clone).await;
+        });
 
         let handler = dptree::entry()
             .branch(Update::filter_pre_checkout_query().endpoint(Self::handle_pre_checkout_query))

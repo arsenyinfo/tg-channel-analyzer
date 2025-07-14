@@ -126,7 +126,7 @@ pub struct AnalysisEngine {
 }
 
 impl AnalysisEngine {
-    pub fn new(pool: Pool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(pool: Arc<Pool>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let api_id = env::var("TG_API_ID")
             .map_err(|_| "TG_API_ID environment variable is required")?
             .parse::<i32>()
