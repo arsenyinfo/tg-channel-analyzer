@@ -108,6 +108,7 @@ impl UserManager {
         first_name: Option<&str>,
         last_name: Option<&str>,
         referrer_user_id: Option<i32>,
+        language_code: Option<&str>,
     ) -> Result<(User, Option<ReferralRewardInfo>), Box<dyn Error + Send + Sync>> {
         let client = self.pool.get().await?;
 
@@ -120,7 +121,7 @@ impl UserManager {
             )
             .await?
         {
-            let user = User {
+            let mut user = User {
                 id: row.get(0),
                 telegram_user_id: row.get(1),
                 username: row.get(2),
@@ -133,7 +134,26 @@ impl UserManager {
                 paid_referrals_count: row.get(9),
                 language: row.get(10),
             };
-            info!("Found existing user: {} (credits: {})", telegram_user_id, user.analysis_credits);
+            
+            // update language if provided and different from stored
+            if let Some(lang) = language_code {
+                if user.language.as_deref() != Some(lang) {
+                    if let Err(e) = client
+                        .execute(
+                            "UPDATE users SET language = $1, updated_at = NOW() WHERE telegram_user_id = $2",
+                            &[&lang, &telegram_user_id],
+                        )
+                        .await
+                    {
+                        error!("Failed to update user language: {}", e);
+                    } else {
+                        user.language = Some(lang.to_string());
+                        info!("Updated language for user {} to {}", telegram_user_id, lang);
+                    }
+                }
+            }
+            
+            info!("Found existing user: {} (credits: {}, language: {:?})", telegram_user_id, user.analysis_credits, user.language);
             return Ok((user, None));
         }
 
@@ -141,9 +161,9 @@ impl UserManager {
         let row = client
             .query_one(
                 "INSERT INTO users (telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language) 
-                 VALUES ($1, $2, $3, $4, 1, 0, $5, 0, 0, NULL) 
+                 VALUES ($1, $2, $3, $4, 1, 0, $5, 0, 0, $6) 
                  RETURNING id, telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language",
-                &[&telegram_user_id, &username, &first_name, &last_name, &referrer_user_id],
+                &[&telegram_user_id, &username, &first_name, &last_name, &referrer_user_id, &language_code],
             )
             .await?;
 

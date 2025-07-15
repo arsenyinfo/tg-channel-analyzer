@@ -319,10 +319,11 @@ impl TelegramBot {
         payment: SuccessfulPayment,
     ) -> ResponseResult<()> {
         let telegram_user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+        let language_code = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
 
         // get user info for referral link
         let (user, _) = match ctx.user_manager
-            .get_or_create_user(telegram_user_id, None, None, None, None)
+            .get_or_create_user(telegram_user_id, None, None, None, None, language_code)
             .await
         {
             Ok(result) => result,
@@ -571,6 +572,7 @@ impl TelegramBot {
                                     Some(query.from.first_name.as_str()),
                                     query.from.last_name.as_deref(),
                                     None, // no referral in callback queries
+                                    query.from.language_code.as_deref(),
                                 )
                                 .await
                             {
@@ -736,10 +738,11 @@ impl TelegramBot {
                 let username = msg.from.as_ref().and_then(|user| user.username.as_deref());
                 let first_name = msg.from.as_ref().map(|user| user.first_name.as_str());
                 let last_name = msg.from.as_ref().and_then(|user| user.last_name.as_deref());
+                let language_code = msg.from.as_ref().and_then(|user| user.language_code.as_deref());
 
                 // get or create user to check credit balance
                 let (user, maybe_reward_info) = match ctx.user_manager
-                    .get_or_create_user(telegram_user_id, username, first_name, last_name, referrer_user_id)
+                    .get_or_create_user(telegram_user_id, username, first_name, last_name, referrer_user_id, language_code)
                     .await
                 {
                     Ok((user, reward_info)) => (user, reward_info),
@@ -953,10 +956,11 @@ impl TelegramBot {
                 let username = msg.from.as_ref().and_then(|user| user.username.as_deref());
                 let first_name = msg.from.as_ref().map(|user| user.first_name.as_str());
                 let last_name = msg.from.as_ref().and_then(|user| user.last_name.as_deref());
+                let language_code = msg.from.as_ref().and_then(|user| user.language_code.as_deref());
 
                 // get or create user and check credits
                 let user = match ctx.user_manager
-                    .get_or_create_user(telegram_user_id, username, first_name, last_name, None)
+                    .get_or_create_user(telegram_user_id, username, first_name, last_name, None, language_code)
                     .await
                 {
                     Ok((user, _)) => user,
