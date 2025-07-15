@@ -117,7 +117,7 @@ pub struct AnalysisEngine {
     api_id: i32,
     api_hash: String,
     pub cache: CacheManager,
-    resolved_channels: HashMap<String, Chat>,
+    resolved_channels: HashMap<String, Arc<Chat>>,
     rate_limiter: TelegramRateLimiter,
     session_files: Vec<String>,
     web_scraper: TelegramWebScraper,
@@ -306,7 +306,7 @@ impl AnalysisEngine {
                     );
                     // cache the resolved channel
                     self.resolved_channels
-                        .insert(clean_username.to_string(), chat);
+                        .insert(clean_username.to_string(), Arc::new(chat));
                     return Ok(true);
                 }
                 Ok(None) => {
@@ -557,9 +557,9 @@ impl AnalysisEngine {
                         if let Some(ref ch) = channel {
                             // cache the newly resolved channel
                             self.resolved_channels
-                                .insert(clean_username.to_string(), ch.clone());
+                                .insert(clean_username.to_string(), Arc::new(ch.clone()));
                         }
-                        break channel;
+                        break channel.map(Arc::new);
                     }
                     Err(e) => {
                         if attempt == MAX_RETRIES {
@@ -595,7 +595,7 @@ impl AnalysisEngine {
             let client = self.client.as_ref().ok_or("Client not initialized")?;
             for attempt in 0..=MAX_RETRIES {
                 self.rate_limiter.wait_for_message_iteration().await;
-                let mut message_iter = client.iter_messages(&chat);
+                let mut message_iter = client.iter_messages(chat.as_ref());
                 let mut current_messages = Vec::new();
                 let mut current_skipped = 0;
 

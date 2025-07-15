@@ -3,22 +3,23 @@ use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum UserManagerError {
-    InsufficientCredits(i64), // telegram_user_id
-    UserNotFound(i64),        // telegram_user_id
+    UserNotFound(i32),        // user_id
+    InsufficientCredits(i32), // user_id
     DatabaseError(Box<dyn Error + Send + Sync>),
 }
 
 impl fmt::Display for UserManagerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            UserManagerError::InsufficientCredits(user_id) => {
-                write!(f, "User {} has insufficient credits", user_id)
-            }
             UserManagerError::UserNotFound(user_id) => {
-                write!(f, "User {} not found", user_id)
+                write!(f, "User with id {} not found", user_id)
+            }
+            UserManagerError::InsufficientCredits(user_id) => {
+                write!(f, "User with id {} has insufficient credits", user_id)
             }
             UserManagerError::DatabaseError(e) => write!(f, "Database error: {}", e),
         }
@@ -55,6 +56,15 @@ pub struct User {
 }
 
 #[derive(Debug, Clone)]
+pub struct PendingAnalysis {
+    pub id: i32,
+    pub user_id: i32,
+    pub telegram_user_id: i64,  // kept for bot notification purposes
+    pub channel_name: String,
+    pub analysis_type: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReferralRewardInfo {
     pub milestone_rewards: i32,
     pub paid_rewards: i32,
@@ -66,11 +76,11 @@ pub struct ReferralRewardInfo {
 }
 
 pub struct UserManager {
-    pool: Pool,
+    pool: Arc<Pool>,
 }
 
 impl UserManager {
-    pub fn new(pool: Pool) -> Self {
+    pub fn new(pool: Arc<Pool>) -> Self {
         Self { pool }
     }
 
@@ -263,34 +273,69 @@ impl UserManager {
         }
     }
 
-    /// consumes one credit and records the analysis
-    pub async fn consume_credit(
+
+    /// marks analysis as failed
+    pub async fn mark_analysis_failed(&self, analysis_id: i32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE user_analyses SET status = 'failed' WHERE id = $1",
+                &[&analysis_id],
+            )
+            .await?;
+        info!("Marked analysis {} as failed", analysis_id);
+        Ok(())
+    }
+
+    /// creates a pending analysis record without consuming credit
+    pub async fn create_pending_analysis(
         &self,
-        telegram_user_id: i64,
+        user_id: i32,
         channel_name: &str,
         analysis_type: &str,
+    ) -> Result<i32, UserManagerError> {
+        let client = self.pool.get().await?;
+
+        // create pending analysis record
+        let analysis_id = client
+            .query_one(
+                "INSERT INTO user_analyses (user_id, channel_name, credits_used, analysis_type, status) VALUES ($1, $2, 0, $3, 'pending') RETURNING id",
+                &[&user_id, &channel_name, &analysis_type],
+            )
+            .await?
+            .get::<_, i32>(0);
+
+        info!("Created pending analysis {} for user {} (channel: {})", analysis_id, user_id, channel_name);
+        Ok(analysis_id)
+    }
+
+    /// atomically consumes credit, marks analysis completed, and returns remaining credits
+    pub async fn atomic_complete_analysis(
+        &self,
+        analysis_id: i32,
+        user_id: i32,
     ) -> Result<i32, UserManagerError> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
 
-        // check and update credits atomically
+        // consume credit only if user has sufficient credits
         let row = transaction
             .query_opt(
                 "UPDATE users SET analysis_credits = analysis_credits - 1, total_analyses_performed = total_analyses_performed + 1, updated_at = NOW() 
-                 WHERE telegram_user_id = $1 AND analysis_credits > 0 
-                 RETURNING id, analysis_credits",
-                &[&telegram_user_id],
+                 WHERE id = $1 AND analysis_credits > 0 
+                 RETURNING analysis_credits",
+                &[&user_id],
             )
             .await?;
 
-        let (user_id, remaining_credits) = match row {
-            Some(row) => (row.get::<_, i32>(0), row.get::<_, i32>(1)),
+        let remaining_credits = match row {
+            Some(row) => row.get::<_, i32>(0),
             None => {
-                // check if user exists to provide more specific error before rolling back
+                // check if user exists to provide more specific error
                 let user_exists = transaction
                     .query_opt(
-                        "SELECT 1 FROM users WHERE telegram_user_id = $1",
-                        &[&telegram_user_id],
+                        "SELECT 1 FROM users WHERE id = $1",
+                        &[&user_id],
                     )
                     .await?
                     .is_some();
@@ -298,34 +343,60 @@ impl UserManager {
                 transaction.rollback().await?;
                 
                 return if user_exists {
-                    Err(UserManagerError::InsufficientCredits(telegram_user_id))
+                    Err(UserManagerError::InsufficientCredits(user_id))
                 } else {
-                    Err(UserManagerError::UserNotFound(telegram_user_id))
+                    Err(UserManagerError::UserNotFound(user_id))
                 };
             }
         };
 
-        // record the analysis in audit trail
+        // mark analysis as completed
         transaction
             .execute(
-                "INSERT INTO user_analyses (user_id, channel_name, credits_used, analysis_type) VALUES ($1, $2, 1, $3)",
-                &[&user_id, &channel_name, &analysis_type],
+                "UPDATE user_analyses SET status = 'completed', credits_used = 1 WHERE id = $1",
+                &[&analysis_id],
             )
             .await?;
 
         transaction.commit().await?;
 
-        info!(
-            "User {} consumed 1 credit for channel {}, remaining: {}",
-            telegram_user_id, channel_name, remaining_credits
-        );
+        info!("Atomically completed analysis {} for user {} (remaining credits: {})", analysis_id, user_id, remaining_credits);
         Ok(remaining_credits)
+    }
+
+    /// gets all pending analyses for recovery
+    pub async fn get_pending_analyses(&self) -> Result<Vec<PendingAnalysis>, Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT ua.id, ua.user_id, u.telegram_user_id, ua.channel_name, ua.analysis_type 
+                 FROM user_analyses ua 
+                 JOIN users u ON ua.user_id = u.id 
+                 WHERE ua.status = 'pending' 
+                 ORDER BY ua.analysis_timestamp ASC",
+                &[],
+            )
+            .await?;
+
+        let pending_analyses: Vec<PendingAnalysis> = rows
+            .into_iter()
+            .map(|row| PendingAnalysis {
+                id: row.get(0),
+                user_id: row.get(1),
+                telegram_user_id: row.get(2),
+                channel_name: row.get(3),
+                analysis_type: row.get(4),
+            })
+            .collect();
+
+        info!("Found {} pending analyses for recovery", pending_analyses.len());
+        Ok(pending_analyses)
     }
 
     /// adds credits to user (for future payment integration)
     pub async fn add_credits(
         &self,
-        telegram_user_id: i64,
+        user_id: i32,
         credits_to_add: i32,
     ) -> Result<i32, Box<dyn Error + Send + Sync>> {
         let client = self.pool.get().await?;
@@ -333,9 +404,9 @@ impl UserManager {
         let row = client
             .query_opt(
                 "UPDATE users SET analysis_credits = analysis_credits + $2, updated_at = NOW() 
-                 WHERE telegram_user_id = $1 
+                 WHERE id = $1 
                  RETURNING analysis_credits",
-                &[&telegram_user_id, &credits_to_add],
+                &[&user_id, &credits_to_add],
             )
             .await?;
 
@@ -344,12 +415,12 @@ impl UserManager {
                 let new_balance: i32 = row.get(0);
                 info!(
                     "Added {} credits to user {}, new balance: {}",
-                    credits_to_add, telegram_user_id, new_balance
+                    credits_to_add, user_id, new_balance
                 );
                 Ok(new_balance)
             }
             None => {
-                error!("User {} not found when adding credits", telegram_user_id);
+                error!("User {} not found when adding credits", user_id);
                 Err("User not found".into())
             }
         }
@@ -472,21 +543,21 @@ impl UserManager {
     }
 
     /// increments paid referrals count when a referred user makes a payment
-    pub async fn record_paid_referral(&self, telegram_user_id: i64) -> Result<Option<ReferralRewardInfo>, Box<dyn Error + Send + Sync>> {
-        info!("Processing paid referral for user {}", telegram_user_id);
+    pub async fn record_paid_referral(&self, user_id: i32) -> Result<Option<ReferralRewardInfo>, Box<dyn Error + Send + Sync>> {
+        info!("Processing paid referral for user {}", user_id);
         let client = self.pool.get().await?;
         
         // find if this user was referred and update referrer's paid count
         let row = client
             .query_opt(
-                "SELECT referred_by_user_id FROM users WHERE telegram_user_id = $1",
-                &[&telegram_user_id],
+                "SELECT referred_by_user_id FROM users WHERE id = $1",
+                &[&user_id],
             )
             .await?;
 
         if let Some(row) = row {
             if let Some(referrer_id) = row.get::<_, Option<i32>>(0) {
-                info!("User {} was referred by user {}, incrementing paid referral count", telegram_user_id, referrer_id);
+                info!("User {} was referred by user {}, incrementing paid referral count", user_id, referrer_id);
                 // increment paid referrals count
                 client
                     .execute(
@@ -501,16 +572,16 @@ impl UserManager {
                 let reward_info = self.check_and_award_referral_rewards(referrer_id).await?;
                 
                 info!("Recorded paid referral for user {}, referrer {} - rewards: milestone={}, paid={}, total={}", 
-                      telegram_user_id, referrer_id, reward_info.milestone_rewards, reward_info.paid_rewards, reward_info.total_credits_awarded);
+                      user_id, referrer_id, reward_info.milestone_rewards, reward_info.paid_rewards, reward_info.total_credits_awarded);
                 return Ok(Some(reward_info));
             } else {
-                info!("User {} was not referred by anyone (referred_by_user_id is NULL)", telegram_user_id);
+                info!("User {} was not referred by anyone (referred_by_user_id is NULL)", user_id);
             }
         } else {
-            info!("User {} not found in database", telegram_user_id);
+            info!("User {} not found in database", user_id);
         }
 
-        info!("No paid referral to record for user {}", telegram_user_id);
+        info!("No paid referral to record for user {}", user_id);
         Ok(None)
     }
 }

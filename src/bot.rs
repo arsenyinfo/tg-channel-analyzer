@@ -34,10 +34,17 @@ pub enum Command {
 }
 
 pub struct TelegramBot {
-    bot: Bot,
+    bot: Arc<Bot>,
     analysis_engine: Arc<Mutex<AnalysisEngine>>,
     user_manager: Arc<UserManager>,
     pool: Arc<Pool>,
+}
+
+#[derive(Clone)]
+pub struct BotContext {
+    pub bot: Arc<Bot>,
+    pub analysis_engine: Arc<Mutex<AnalysisEngine>>,
+    pub user_manager: Arc<UserManager>,
 }
 
 impl TelegramBot {
@@ -106,7 +113,7 @@ impl TelegramBot {
         html_escape::encode_text(text).to_string()
     }
 
-    async fn run_message_queue_processor(bot: Bot, pool: Arc<Pool>) {
+    async fn run_message_queue_processor(bot: Arc<Bot>, pool: Arc<Pool>) {
         info!("Starting message queue processor");
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
         
@@ -257,7 +264,7 @@ impl TelegramBot {
         user_manager: Arc<UserManager>,
         pool: Arc<Pool>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let bot = Bot::new(bot_token);
+        let bot = Arc::new(Bot::new(bot_token));
         let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new(pool.clone())?));
 
         Ok(Self {
@@ -269,7 +276,7 @@ impl TelegramBot {
     }
 
     async fn send_payment_invoice(
-        bot: Bot,
+        bot: Arc<Bot>,
         chat_id: ChatId,
         credits: i32,
         stars: u32,
@@ -295,10 +302,10 @@ impl TelegramBot {
         Ok(())
     }
 
-    async fn handle_pre_checkout_query(bot: Bot, query: PreCheckoutQuery) -> ResponseResult<()> {
+    async fn handle_pre_checkout_query(ctx: BotContext, query: PreCheckoutQuery) -> ResponseResult<()> {
         // approve all pre-checkout queries for digital goods
         // in a real implementation, you might want to add additional validation
-        bot.answer_pre_checkout_query(query.id, true).await?;
+        ctx.bot.answer_pre_checkout_query(query.id, true).await?;
         info!(
             "Approved pre-checkout query for {} stars",
             query.total_amount
@@ -307,23 +314,23 @@ impl TelegramBot {
     }
 
     async fn handle_successful_payment(
-        bot: Bot,
+        ctx: BotContext,
         msg: Message,
         payment: SuccessfulPayment,
-        user_manager: Arc<UserManager>,
     ) -> ResponseResult<()> {
         let telegram_user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
 
         // get user info for referral link
-        let user_db_id = match user_manager
+        let (user, _) = match ctx.user_manager
             .get_or_create_user(telegram_user_id, None, None, None, None)
             .await
         {
-            Ok((user_info, _)) => user_info.id,
+            Ok(result) => result,
             Err(e) => {
                 error!("Failed to get user info during payment: {}", e);
-                // continue with payment processing even if we can't get the referral link
-                0
+                ctx.bot.send_message(msg.chat.id, "❌ Error processing payment. Please contact support.")
+                    .await?;
+                return Ok(());
             }
         };
 
@@ -338,18 +345,18 @@ impl TelegramBot {
         };
 
         // add credits to user account
-        match user_manager.add_credits(telegram_user_id, credits).await {
+        match ctx.user_manager.add_credits(user.id, credits).await {
             Ok(new_balance) => {
                 let success_msg = format!(
                     "🎉 <b>Payment Successful!</b> - <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a>\n\n\
                     ✅ Added {} credits to your account\n\
                     💳 New balance: {} credits\n\n\
                     You can now analyze channels by sending me a channel username like <code>@channelname</code>",
-                    user_db_id,
+                    user.id,
                     credits, new_balance
                 );
 
-                bot.send_message(msg.chat.id, success_msg)
+                ctx.bot.send_message(msg.chat.id, success_msg)
                     .parse_mode(ParseMode::Html)
                     .await?;
 
@@ -359,7 +366,7 @@ impl TelegramBot {
                 );
 
                 // process referral rewards if user was referred
-                match user_manager.record_paid_referral(telegram_user_id).await {
+                match ctx.user_manager.record_paid_referral(user.id).await {
                     Ok(Some(reward_info)) => {
                         if let Some(referrer_telegram_id) = reward_info.referrer_telegram_id {
                             // send notification to referrer
@@ -399,7 +406,7 @@ impl TelegramBot {
                             };
 
                             if !reward_msg.is_empty() {
-                                let _ = bot.send_message(
+                                let _ = ctx.bot.send_message(
                                     ChatId(referrer_telegram_id), 
                                     reward_msg
                                 )
@@ -421,7 +428,7 @@ impl TelegramBot {
                     "Failed to add credits after payment for user {}: {}",
                     telegram_user_id, e
                 );
-                bot.send_message(
+                ctx.bot.send_message(
                     msg.chat.id,
                     "⚠️ Payment received but failed to add credits. Please contact support with your payment ID."
                 )
@@ -442,15 +449,40 @@ impl TelegramBot {
             Self::run_message_queue_processor(bot_clone, pool_clone).await;
         });
 
+        // create context for all handlers
+        let ctx = BotContext {
+            bot: self.bot.clone(),
+            analysis_engine: self.analysis_engine.clone(),
+            user_manager: self.user_manager.clone(),
+        };
+
         let handler = dptree::entry()
-            .branch(Update::filter_pre_checkout_query().endpoint(Self::handle_pre_checkout_query))
-            .branch(Update::filter_callback_query().endpoint(Self::handle_callback_query))
+            .branch(Update::filter_pre_checkout_query().endpoint({
+                let ctx = ctx.clone();
+                move |query: PreCheckoutQuery| {
+                    let ctx = ctx.clone();
+                    async move { Self::handle_pre_checkout_query(ctx, query).await }
+                }
+            }))
+            .branch(Update::filter_callback_query().endpoint({
+                let ctx = ctx.clone();
+                move |query: CallbackQuery| {
+                    let ctx = ctx.clone();
+                    async move { Self::handle_callback_query(ctx, query).await }
+                }
+            }))
             .branch(
                 Update::filter_message()
                     .branch(
                         dptree::entry()
                             .filter_command::<Command>()
-                            .endpoint(Self::handle_command),
+                            .endpoint({
+                                let ctx = ctx.clone();
+                                move |msg: Message, cmd: Command| {
+                                    let ctx = ctx.clone();
+                                    async move { Self::handle_command(ctx, msg, cmd).await }
+                                }
+                            }),
                     )
                     .branch(
                         dptree::entry()
@@ -459,22 +491,24 @@ impl TelegramBot {
                                     .cloned()
                                     .map(|payment| (msg, payment))
                             })
-                            .endpoint(
-                                |(msg, payment): (Message, SuccessfulPayment),
-                                 bot: Bot,
-                                 user_manager: Arc<UserManager>| {
-                                    Self::handle_successful_payment(bot, msg, payment, user_manager)
-                                },
-                            ),
+                            .endpoint({
+                                let ctx = ctx.clone();
+                                move |(msg, payment): (Message, SuccessfulPayment)| {
+                                    let ctx = ctx.clone();
+                                    async move { Self::handle_successful_payment(ctx, msg, payment).await }
+                                }
+                            }),
                     )
-                    .branch(dptree::endpoint(Self::handle_message)),
+                    .branch(dptree::endpoint({
+                        let ctx = ctx.clone();
+                        move |msg: Message| {
+                            let ctx = ctx.clone();
+                            async move { Self::handle_message(ctx, msg).await }
+                        }
+                    })),
             );
 
         Dispatcher::builder(self.bot.clone(), handler)
-            .dependencies(dptree::deps![
-                self.analysis_engine.clone(),
-                self.user_manager.clone()
-            ])
             .error_handler(
                 teloxide::error_handlers::LoggingErrorHandler::with_custom_text(
                     "An error from the update listener",
@@ -487,17 +521,15 @@ impl TelegramBot {
     }
 
     async fn handle_callback_query(
-        bot: Bot,
+        ctx: BotContext,
         query: CallbackQuery,
-        analysis_engine: Arc<Mutex<AnalysisEngine>>,
-        user_manager: Arc<UserManager>,
     ) -> ResponseResult<()> {
         if let Some(data) = &query.data {
             if let Some(message) = &query.message {
                 match data.as_str() {
                     "buy_single" => {
                         Self::send_payment_invoice(
-                            bot.clone(),
+                            ctx.bot.clone(),
                             message.chat().id,
                             SINGLE_PACKAGE_AMOUNT,
                             SINGLE_PACKAGE_PRICE,
@@ -506,11 +538,11 @@ impl TelegramBot {
                         )
                         .await?;
 
-                        bot.answer_callback_query(&query.id).await?;
+                        ctx.bot.answer_callback_query(&query.id).await?;
                     }
                     "buy_bulk" => {
                         Self::send_payment_invoice(
-                            bot.clone(),
+                            ctx.bot.clone(),
                             message.chat().id,
                             BULK_PACKAGE_AMOUNT,
                             BULK_PACKAGE_PRICE,
@@ -520,7 +552,7 @@ impl TelegramBot {
                         )
                         .await?;
 
-                        bot.answer_callback_query(&query.id).await?;
+                        ctx.bot.answer_callback_query(&query.id).await?;
                     }
                     callback_data if callback_data.starts_with("analysis_") => {
                         // parse analysis type and channel from callback data
@@ -532,7 +564,7 @@ impl TelegramBot {
                             let telegram_user_id = query.from.id.0 as i64;
 
                             // check if user has credits before starting analysis
-                            let user = match user_manager
+                            let user = match ctx.user_manager
                                 .get_or_create_user(
                                     telegram_user_id,
                                     query.from.username.as_deref(),
@@ -545,7 +577,7 @@ impl TelegramBot {
                                 Ok((user, _)) => user,
                                 Err(e) => {
                                     error!("Failed to get user: {}", e);
-                                    bot.send_message(
+                                    ctx.bot.send_message(
                                         message.chat().id,
                                         "❌ Failed to check credits. Please try again.",
                                     )
@@ -559,21 +591,40 @@ impl TelegramBot {
                                 let message_text = "❌ No analysis credits available.\n\n\
                                     You need credits to analyze channels. Choose a package below:";
 
-                                bot.send_message(message.chat().id, message_text)
+                                ctx.bot.send_message(message.chat().id, message_text)
                                     .reply_markup(Self::create_payment_keyboard())
                                     .await?;
 
-                                bot.answer_callback_query(&query.id).await?;
+                                ctx.bot.answer_callback_query(&query.id).await?;
                                 return Ok(());
                             }
 
+                            // create pending analysis record first
+                            let analysis_id = match ctx.user_manager.create_pending_analysis(
+                                user.id,
+                                &channel_name,
+                                &analysis_type,
+                            ).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    let error_msg = match e {
+                                        UserManagerError::UserNotFound(_) => "❌ User not found. Please try again.",
+                                        _ => "❌ Failed to start analysis. Please try again.",
+                                    };
+                                    let _ = ctx.bot.send_message(message.chat().id, error_msg).await;
+                                    ctx.bot.answer_callback_query(&query.id).await?;
+                                    return Ok(());
+                                }
+                            };
+
                             // start analysis in background
-                            let bot_clone = bot.clone();
+                            let bot_clone = ctx.bot.clone();
                             let user_chat_id = message.chat().id;
                             let channel_name_clone = channel_name.to_string();
                             let analysis_type_clone = analysis_type.to_string();
-                            let analysis_engine_clone = analysis_engine.clone();
-                            let user_manager_clone = user_manager.clone();
+                            let analysis_engine_clone = ctx.analysis_engine.clone();
+                            let user_manager_clone = ctx.user_manager.clone();
+                            let user_manager_error_clone = ctx.user_manager.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = Self::perform_single_analysis(
@@ -583,10 +634,16 @@ impl TelegramBot {
                                     analysis_type_clone.clone(),
                                     analysis_engine_clone,
                                     user_manager_clone,
-                                    telegram_user_id,
+                                    user.id,
+                                    analysis_id,
                                 )
                                 .await
                                 {
+                                    // mark analysis as failed
+                                    if let Err(mark_err) = user_manager_error_clone.mark_analysis_failed(analysis_id).await {
+                                        error!("Failed to mark analysis {} as failed: {}", analysis_id, mark_err);
+                                    }
+
                                     if let Some(user_error) =
                                         e.downcast_ref::<crate::user_manager::UserManagerError>()
                                     {
@@ -621,10 +678,10 @@ impl TelegramBot {
                             });
                         }
 
-                        bot.answer_callback_query(&query.id).await?;
+                        ctx.bot.answer_callback_query(&query.id).await?;
                     }
                     _ => {
-                        bot.answer_callback_query(&query.id).await?;
+                        ctx.bot.answer_callback_query(&query.id).await?;
                     }
                 }
             }
@@ -633,10 +690,9 @@ impl TelegramBot {
     }
 
     async fn handle_command(
-        bot: Bot,
+        ctx: BotContext,
         msg: Message,
         cmd: Command,
-        user_manager: Arc<UserManager>,
     ) -> ResponseResult<()> {
         match cmd {
             Command::Start => {
@@ -648,7 +704,7 @@ impl TelegramBot {
                         if let Ok(user_id) = args.trim().parse::<i32>() {
                             info!("Parsed referrer user ID: {}", user_id);
                             // validate that referrer exists
-                            match user_manager.validate_referrer(user_id).await {
+                            match ctx.user_manager.validate_referrer(user_id).await {
                                 Ok(true) => {
                                     info!("Referrer user ID {} validated successfully", user_id);
                                     Some(user_id)
@@ -682,14 +738,14 @@ impl TelegramBot {
                 let last_name = msg.from.as_ref().and_then(|user| user.last_name.as_deref());
 
                 // get or create user to check credit balance
-                let (user, maybe_reward_info) = match user_manager
+                let (user, maybe_reward_info) = match ctx.user_manager
                     .get_or_create_user(telegram_user_id, username, first_name, last_name, referrer_user_id)
                     .await
                 {
                     Ok((user, reward_info)) => (user, reward_info),
                     Err(e) => {
                         log::error!("Failed to get/create user: {}", e);
-                        bot.send_message(msg.chat.id, "❌ Sorry, there was an error accessing your account. Please try again later.")
+                        ctx.bot.send_message(msg.chat.id, "❌ Sorry, there was an error accessing your account. Please try again later.")
                             .await?;
                         return Ok(());
                     }
@@ -733,7 +789,7 @@ impl TelegramBot {
 
                         if !reward_msg.is_empty() {
                             info!("Sending referral notification to telegram user {}: {}", referrer_telegram_id, reward_msg.replace("\n", " "));
-                            match bot.send_message(
+                            match ctx.bot.send_message(
                                 ChatId(referrer_telegram_id), 
                                 reward_msg
                             )
@@ -788,7 +844,7 @@ impl TelegramBot {
                         user.id  // for the share your link
                     );
 
-                    bot.send_message(msg.chat.id, intro_text)
+                    ctx.bot.send_message(msg.chat.id, intro_text)
                         .parse_mode(ParseMode::Html)
                         .reply_markup(Self::create_payment_keyboard())
                         .await?;
@@ -849,14 +905,14 @@ impl TelegramBot {
                         referral_section
                     );
 
-                    bot.send_message(msg.chat.id, intro_text)
+                    ctx.bot.send_message(msg.chat.id, intro_text)
                         .parse_mode(ParseMode::Html)
                         .await?;
                 }
             }
             Command::Buy1 => {
                 Self::send_payment_invoice(
-                    bot,
+                    ctx.bot,
                     msg.chat.id,
                     SINGLE_PACKAGE_AMOUNT,
                     SINGLE_PACKAGE_PRICE,
@@ -867,7 +923,7 @@ impl TelegramBot {
             }
             Command::Buy10 => {
                 Self::send_payment_invoice(
-                    bot,
+                    ctx.bot,
                     msg.chat.id,
                     BULK_PACKAGE_AMOUNT,
                     BULK_PACKAGE_PRICE,
@@ -882,9 +938,8 @@ impl TelegramBot {
     }
 
     async fn handle_message(
-        bot: Bot,
+        ctx: BotContext,
         msg: Message,
-        user_manager: Arc<UserManager>,
     ) -> ResponseResult<()> {
         if let Some(text) = msg.text() {
             let text = text.trim();
@@ -900,14 +955,14 @@ impl TelegramBot {
                 let last_name = msg.from.as_ref().and_then(|user| user.last_name.as_deref());
 
                 // get or create user and check credits
-                let user = match user_manager
+                let user = match ctx.user_manager
                     .get_or_create_user(telegram_user_id, username, first_name, last_name, None)
                     .await
                 {
                     Ok((user, _)) => user,
                     Err(e) => {
                         error!("Failed to get/create user: {}", e);
-                        bot.send_message(
+                        ctx.bot.send_message(
                             msg.chat.id,
                             "❌ Error processing user request. Please try again later.",
                         )
@@ -935,7 +990,7 @@ impl TelegramBot {
                         user.total_analyses_performed
                     );
 
-                    bot.send_message(msg.chat.id, no_credits_msg)
+                    ctx.bot.send_message(msg.chat.id, no_credits_msg)
                         .parse_mode(ParseMode::Html)
                         .reply_markup(Self::create_payment_keyboard())
                         .await?;
@@ -948,7 +1003,7 @@ impl TelegramBot {
                     💳 Credits remaining after analysis: <code>{}</code>",
                     user.analysis_credits - 1
                 );
-                bot.send_message(msg.chat.id, credits_msg)
+                ctx.bot.send_message(msg.chat.id, credits_msg)
                     .parse_mode(ParseMode::Html)
                     .await?;
 
@@ -959,13 +1014,13 @@ impl TelegramBot {
                     Self::escape_html(&channel_name)
                 );
 
-                bot.send_message(msg.chat.id, selection_msg)
+                ctx.bot.send_message(msg.chat.id, selection_msg)
                     .parse_mode(ParseMode::Html)
                     .reply_markup(Self::create_analysis_selection_keyboard(&channel_name))
                     .await?;
             } else {
                 // send help message for invalid input
-                bot.send_message(
+                ctx.bot.send_message(
                     msg.chat.id,
                     "❓ Please send a valid channel username starting with '@' (e.g., @channelname)\n\nUse /start to see the full instructions.",
                 ).await?;
@@ -974,14 +1029,15 @@ impl TelegramBot {
         Ok(())
     }
 
-    async fn perform_single_analysis(
-        bot: Bot,
+    pub async fn perform_single_analysis(
+        bot: Arc<Bot>,
         user_chat_id: ChatId,
         channel_name: String,
         analysis_type: String,
         analysis_engine: Arc<Mutex<AnalysisEngine>>,
         user_manager: Arc<UserManager>,
-        telegram_user_id: i64,
+        user_id: i32,
+        analysis_id: i32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!(
             "Starting {} analysis for channel: {}",
@@ -1090,40 +1146,18 @@ impl TelegramBot {
         };
 
         // get user info for referral link
-        let (user_info, _) = user_manager
-            .get_or_create_user(telegram_user_id, None, None, None, None)
-            .await?;
-        let user_db_id = user_info.id;
-
-        // consume credit after successful analysis
+        // ATOMIC OPERATION: consume credit + mark completed + send result (protected from shutdown)
         let remaining_credits = match user_manager
-            .consume_credit(telegram_user_id, &channel_name, &analysis_type)
+            .atomic_complete_analysis(analysis_id, user_id)
             .await
         {
             Ok(credits) => credits,
             Err(e) => {
-                match &e {
-                    UserManagerError::InsufficientCredits(user_id) => {
-                        info!(
-                            "User {} has insufficient credits for channel {}",
-                            user_id, channel_name
-                        );
-                    }
-                    UserManagerError::UserNotFound(user_id) => {
-                        error!("User {} not found during credit consumption", user_id);
-                    }
-                    UserManagerError::DatabaseError(db_err) => {
-                        error!(
-                            "Database error while consuming credit for user {}: {}",
-                            telegram_user_id, db_err
-                        );
-                    }
+                error!("Failed to atomically complete analysis {}: {}", analysis_id, e);
+                // mark as failed if atomic completion failed
+                if let Err(mark_err) = user_manager.mark_analysis_failed(analysis_id).await {
+                    error!("Failed to mark analysis {} as failed: {}", analysis_id, mark_err);
                 }
-                bot.send_message(
-                    user_chat_id,
-                    "⚠️ Analysis completed but failed to update credits. Please contact support.",
-                )
-                .await?;
                 return Err(Box::new(e));
             }
         };
@@ -1140,7 +1174,7 @@ impl TelegramBot {
                 .to_uppercase()
                 .collect::<String>()
                 + &analysis_type[1..],
-            user_db_id,
+            user_id,
             remaining_credits
         );
         bot.send_message(user_chat_id, completion_msg)
@@ -1154,16 +1188,21 @@ impl TelegramBot {
             &channel_name,
             &analysis_type,
             result,
-            user_db_id,
+            user_id,
         )
         .await?;
 
         Ok(())
     }
 
-    /// splits a message into chunks that fit within Telegram's 4096 character limit
+    /// counts UTF-16 code units as Telegram does for message length limits
+    fn count_utf16_code_units(text: &str) -> usize {
+        text.encode_utf16().count()
+    }
+
+    /// splits a message into chunks that fit within Telegram's 4096 UTF-16 code unit limit
     fn split_message_into_chunks(text: &str, max_length: usize) -> Vec<String> {
-        if text.len() <= max_length {
+        if Self::count_utf16_code_units(text) <= max_length {
             return vec![text.to_string()];
         }
 
@@ -1175,20 +1214,20 @@ impl TelegramBot {
             let line_with_newline = format!("{}\n", line);
             
             // if adding this line would exceed the limit, finalize current chunk
-            if current_chunk.len() + line_with_newline.len() > max_length {
+            if Self::count_utf16_code_units(&current_chunk) + Self::count_utf16_code_units(&line_with_newline) > max_length {
                 if !current_chunk.is_empty() {
                     chunks.push(current_chunk.trim_end().to_string());
                     current_chunk.clear();
                 }
                 
                 // if single line is too long, split it at word boundaries
-                if line_with_newline.len() > max_length {
+                if Self::count_utf16_code_units(&line_with_newline) > max_length {
                     let words: Vec<&str> = line.split_whitespace().collect();
                     let mut word_chunk = String::new();
                     
                     for word in words {
                         let word_with_space = format!("{} ", word);
-                        if word_chunk.len() + word_with_space.len() > max_length {
+                        if Self::count_utf16_code_units(&word_chunk) + Self::count_utf16_code_units(&word_with_space) > max_length {
                             if !word_chunk.is_empty() {
                                 chunks.push(word_chunk.trim_end().to_string());
                                 word_chunk.clear();
@@ -1216,12 +1255,12 @@ impl TelegramBot {
     }
 
     async fn send_single_analysis_to_user(
-        bot: Bot,
+        bot: Arc<Bot>,
         user_chat_id: ChatId,
         channel_name: &str,
         analysis_type: &str,
         result: AnalysisResult,
-        user_db_id: i32,
+        user_id: i32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (analysis_emoji, analysis_content) = match analysis_type {
             "professional" => ("💼", &result.professional),
@@ -1239,7 +1278,7 @@ impl TelegramBot {
                 let header = format!(
                     "📊 <b>Channel Analysis Results</b> by <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a>\n\n\
                     🎯 <b>Channel:</b> <code>{}</code>\n\n",
-                    user_db_id,
+                    user_id,
                     Self::escape_html(channel_name)
                 );
 
@@ -1255,10 +1294,10 @@ impl TelegramBot {
                         + &analysis_type[1..]
                 );
 
-                // calculate available space for content after headers
-                const MAX_MESSAGE_LENGTH: usize = 3072;
-                let headers_length = header.len() + analysis_header.len();
-                let available_content_length = MAX_MESSAGE_LENGTH.saturating_sub(headers_length + 50); // extra buffer for part indicators
+                // calculate available space for content after headers (using UTF-16 code units as Telegram does)
+                const MAX_MESSAGE_LENGTH: usize = 3584;
+                let headers_length = Self::count_utf16_code_units(&header) + Self::count_utf16_code_units(&analysis_header);
+                let available_content_length = MAX_MESSAGE_LENGTH.saturating_sub(headers_length + 100); // buffer for part indicators
 
                 // split content if needed
                 let content_chunks = Self::split_message_into_chunks(&html_content, available_content_length);

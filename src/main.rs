@@ -7,6 +7,7 @@ mod session_manager;
 mod user_manager;
 mod web_scraper;
 
+use analysis::AnalysisEngine;
 use bot::TelegramBot;
 use cache::CacheManager;
 use clap::Parser;
@@ -15,6 +16,7 @@ use migrations::MigrationManager;
 use session_manager::SessionManager;
 use std::env;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use user_manager::UserManager;
 
 #[derive(Parser)]
@@ -75,10 +77,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pool = Arc::new(pool);
     
     // initialize user manager with shared pool
-    let user_manager = Arc::new(UserManager::new((*pool).clone()));
+    let user_manager = Arc::new(UserManager::new(pool.clone()));
+
+    // recover pending analyses from previous session
+    info!("Recovering pending analyses...");
+    recover_pending_analyses(user_manager.clone(), &bot_token).await?;
 
     let bot = TelegramBot::new(&bot_token, user_manager, pool).await?;
     bot.run().await;
 
+    Ok(())
+}
+
+/// recovers and resumes pending analyses from previous session
+async fn recover_pending_analyses(
+    user_manager: Arc<UserManager>,
+    bot_token: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let pending_analyses = user_manager.get_pending_analyses().await?;
+    
+    if pending_analyses.is_empty() {
+        info!("No pending analyses to recover");
+        return Ok(());
+    }
+
+    info!("Found {} pending analyses to recover", pending_analyses.len());
+
+    // create analysis engine for recovery
+    let pool = CacheManager::create_pool().await?;
+    let pool = Arc::new(pool);
+    let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new(pool)?));
+    
+    // create bot instance for recovery
+    let bot = Arc::new(teloxide::Bot::new(bot_token));
+
+    for analysis in pending_analyses {
+        let bot_clone = bot.clone();
+        let analysis_engine_clone = analysis_engine.clone();
+        let user_manager_clone = user_manager.clone();
+        
+        info!(
+            "Resuming analysis {} for user {} (channel: {}, type: {})",
+            analysis.id, analysis.telegram_user_id, analysis.channel_name, analysis.analysis_type
+        );
+
+        tokio::spawn(async move {
+            if let Err(e) = TelegramBot::perform_single_analysis(
+                bot_clone,
+                teloxide::types::ChatId(analysis.telegram_user_id),
+                analysis.channel_name.clone(),
+                analysis.analysis_type.clone(),
+                analysis_engine_clone,
+                user_manager_clone.clone(),
+                analysis.user_id,
+                analysis.id,
+            ).await {
+                error!("Failed to recover analysis {}: {}", analysis.id, e);
+                // mark as failed if recovery failed
+                if let Err(mark_err) = user_manager_clone.mark_analysis_failed(analysis.id).await {
+                    error!("Failed to mark recovered analysis {} as failed: {}", analysis.id, mark_err);
+                }
+            }
+        });
+    }
+
+    info!("Started recovery for all pending analyses");
     Ok(())
 }
