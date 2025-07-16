@@ -104,6 +104,7 @@ impl TelegramRateLimiter {
 pub struct MessageDict {
     pub date: Option<String>,
     pub message: Option<String>,
+    pub images: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -613,6 +614,7 @@ impl AnalysisEngine {
                         current_messages.push(MessageDict {
                             date: Some(message.date().to_rfc2822()),
                             message: Some(message.text().to_string()),
+                            images: None, // Telegram API messages don't include images in this context
                         });
 
                         if current_messages.len() >= 200 {
@@ -669,7 +671,16 @@ impl AnalysisEngine {
     pub fn generate_analysis_prompt(
         messages: &[MessageDict],
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let messages_json = serde_json::to_string_pretty(messages)?;
+        // create a version of messages without image URLs for LLM analysis
+        let messages_for_llm: Vec<MessageDict> = messages.iter().map(|msg| {
+            MessageDict {
+                date: msg.date.clone(),
+                message: msg.message.clone(),
+                images: None, // exclude images from LLM analysis
+            }
+        }).collect();
+        
+        let messages_json = serde_json::to_string_pretty(&messages_for_llm)?;
 
         Ok(format!(
             "You are an expert analyst tasked with creating a comprehensive personality profile based on Telegram channel messages. Analyze the writing style, topics discussed, opinions expressed, and behavioral patterns to understand the author's character.

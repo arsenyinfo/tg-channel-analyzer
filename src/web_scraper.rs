@@ -288,6 +288,9 @@ impl TelegramWebScraper {
         
         let text_selector = Selector::parse("div.tgme_widget_message_text")
             .map_err(|e| WebScrapingError::ParseError(format!("Invalid selector: {}", e)))?;
+        
+        let image_selector = Selector::parse("a.tgme_widget_message_photo_wrap")
+            .map_err(|e| WebScrapingError::ParseError(format!("Invalid selector: {}", e)))?;
 
         let mut messages = Vec::new();
         let mut all_message_ids = Vec::new();
@@ -320,15 +323,44 @@ impl TelegramWebScraper {
                 continue; // skip forwarded messages
             }
 
+            // extract images
+            let mut image_urls = Vec::new();
+            for image_elem in wrap.select(&image_selector) {
+                if let Some(style_attr) = image_elem.value().attr("style") {
+                    // extract URL from background-image: url('...')
+                    if style_attr.contains("background-image") {
+                        if let Some(start) = style_attr.find("url('") {
+                            let url_start = start + 5;
+                            if let Some(end) = style_attr[url_start..].find("')") {
+                                let image_url = &style_attr[url_start..url_start + end];
+                                // skip emoji images and duplicates
+                                if !image_url.contains("/emoji/") && !image_urls.contains(&image_url.to_string()) {
+                                    image_urls.push(image_url.to_string());
+                                    debug!("Found image URL: {}", image_url);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // find the message text container
             if let Some(text_elem) = wrap.select(&text_selector).next() {
                 let text = text_elem.text().collect::<Vec<_>>().join("\n").trim().to_string();
-                if !text.is_empty() && current_message_id.is_some() {
+                if (!text.is_empty() || !image_urls.is_empty()) && current_message_id.is_some() {
                     messages.push(MessageDict {
                         date: None, // date extraction can be added later if needed
                         message: Some(text),
+                        images: if image_urls.is_empty() { None } else { Some(image_urls) },
                     });
                 }
+            } else if !image_urls.is_empty() && current_message_id.is_some() {
+                // message with only images, no text
+                messages.push(MessageDict {
+                    date: None,
+                    message: None,
+                    images: Some(image_urls),
+                });
             }
         }
 
