@@ -2,17 +2,17 @@ use grammers_client::{types::Chat, Client, Config, InitParams};
 use grammers_session::Session;
 use log::{error, info, warn};
 use rand::Rng;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 use crate::backend_config::{BackendConfig, BackendRateLimiter, BackendType};
 use crate::cache::{AnalysisResult, CacheManager};
+use crate::llm::{calculate_delay, extract_tag, query_llm, MAX_RETRIES};
 use crate::session_manager::SessionManager;
 use crate::web_scraper::TelegramWebScraper;
 use deadpool_postgres::Pool;
@@ -23,46 +23,6 @@ struct TelegramRateLimiter {
     message_iteration_last_call: Arc<Mutex<Option<Instant>>>,
 }
 
-/// global rate limiter for gemini api operations
-struct GeminiRateLimiter {
-    last_call: Arc<Mutex<Option<Instant>>>,
-}
-
-impl GeminiRateLimiter {
-    fn new() -> Self {
-        Self {
-            last_call: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    /// wait for gemini api rate limit (1 request per second)
-    async fn wait_for_api_call(&self) {
-        let mut last_call = self.last_call.lock().await;
-
-        if let Some(last_time) = *last_call {
-            let elapsed = last_time.elapsed();
-            let min_interval = Duration::from_secs(1);
-
-            if elapsed < min_interval {
-                let wait_time = min_interval - elapsed;
-                info!(
-                    "Rate limiting Gemini API: waiting {}ms",
-                    wait_time.as_millis()
-                );
-                sleep(wait_time).await;
-            }
-        }
-
-        *last_call = Some(Instant::now());
-    }
-}
-
-/// global gemini rate limiter instance
-static GEMINI_RATE_LIMITER: std::sync::OnceLock<GeminiRateLimiter> = std::sync::OnceLock::new();
-
-fn get_gemini_rate_limiter() -> &'static GeminiRateLimiter {
-    GEMINI_RATE_LIMITER.get_or_init(|| GeminiRateLimiter::new())
-}
 
 impl TelegramRateLimiter {
     fn new() -> Self {
@@ -875,119 +835,3 @@ Messages to analyze:
     }
 }
 
-#[derive(Debug)]
-struct LLMResponse {
-    content: String,
-}
-
-fn extract_tag(text: &str, tag: &str) -> Option<String> {
-    let pattern = format!(r"(?s)<{}>(.*?)</{}>", tag, tag);
-    let re = Regex::new(&pattern).ok()?;
-    re.captures(text)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().trim().to_string())
-}
-
-const MAX_RETRIES: u32 = 3;
-const BASE_DELAY_MS: u64 = 1000;
-const GEMINI_TIMEOUT_SECS: u64 = 300;
-
-async fn query_llm(
-    prompt: &str,
-    model: &str,
-) -> Result<LLMResponse, Box<dyn std::error::Error + Send + Sync>> {
-    info!("Querying LLM with model: {}", model);
-
-    // apply rate limiting before each attempt
-    get_gemini_rate_limiter().wait_for_api_call().await;
-
-    for attempt in 0..=MAX_RETRIES {
-        let response = match timeout(
-            Duration::from_secs(GEMINI_TIMEOUT_SECS),
-            gemini_rs::chat(model).send_message(prompt),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                if attempt == MAX_RETRIES {
-                    error!(
-                        "Failed to get response from Gemini API after {} attempts: {:?}",
-                        MAX_RETRIES + 1,
-                        e
-                    );
-                    return Err(e.into());
-                }
-
-                let delay = calculate_delay(attempt);
-                warn!(
-                    "Gemini API call failed (attempt {}/{}): {:?}. Retrying in {}ms",
-                    attempt + 1,
-                    MAX_RETRIES + 1,
-                    e,
-                    delay.as_millis()
-                );
-                sleep(delay).await;
-                continue;
-            }
-            Err(_timeout) => {
-                if attempt == MAX_RETRIES {
-                    error!(
-                        "Gemini API call timed out after {} attempts ({}s timeout)",
-                        MAX_RETRIES + 1,
-                        GEMINI_TIMEOUT_SECS
-                    );
-                    return Err("Gemini API call timed out".into());
-                }
-
-                let delay = calculate_delay(attempt);
-                warn!(
-                    "Gemini API call timed out (attempt {}/{}): {}s timeout. Retrying in {}ms",
-                    attempt + 1,
-                    MAX_RETRIES + 1,
-                    GEMINI_TIMEOUT_SECS,
-                    delay.as_millis()
-                );
-                sleep(delay).await;
-                continue;
-            }
-        };
-
-        let content = response.to_string();
-
-        if content.is_empty() {
-            if attempt == MAX_RETRIES {
-                error!(
-                    "Received empty response from Gemini API after {} attempts",
-                    MAX_RETRIES + 1
-                );
-                return Err("Empty response from Gemini API".into());
-            }
-
-            let delay = calculate_delay(attempt);
-            warn!(
-                "Received empty response from Gemini API (attempt {}/{}). Retrying in {}ms",
-                attempt + 1,
-                MAX_RETRIES + 1,
-                delay.as_millis()
-            );
-            sleep(delay).await;
-            continue;
-        }
-
-        info!(
-            "Received LLM response of length: {} (attempt {})",
-            content.len(),
-            attempt + 1
-        );
-        return Ok(LLMResponse { content });
-    }
-
-    unreachable!()
-}
-
-fn calculate_delay(attempt: u32) -> Duration {
-    let base_delay = BASE_DELAY_MS * (1 << attempt); // exponential backoff: 1s, 2s, 4s
-    let jitter = fastrand::u64(0..=base_delay / 4); // add up to 25% jitter
-    Duration::from_millis(base_delay + jitter)
-}
