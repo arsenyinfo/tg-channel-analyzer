@@ -12,6 +12,10 @@ path = "src/bin/authorize.rs"
 name = "bulk_messenger"
 path = "src/bin/bulk_messenger.rs"
 
+[[bin]]
+name = "custom_prompt"
+path = "src/bin/custom_prompt.rs"
+
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"

@@ -2,10 +2,12 @@ mod analysis;
 mod backend_config;
 mod bot;
 mod cache;
+mod handlers;
 mod llm;
 mod migrations;
 mod session_manager;
 mod user_manager;
+mod utils;
 mod web_scraper;
 
 use analysis::AnalysisEngine;
