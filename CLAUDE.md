@@ -61,7 +61,13 @@ DATABASE_URL=postgresql://username:password@host/database
 ### Core Components
 
 - **`main.rs`**: Entry point, handles initialization, session validation, database setup, and analysis recovery
-- **`bot.rs`**: Telegram bot implementation with payment system (Telegram Stars) and user interaction
+- **`bot.rs`**: Main bot orchestration and initialization
+- **`handlers/`**: Modular bot handlers for different interaction types
+  - **`command_handler.rs`**: Handles bot commands and user interactions
+  - **`callback_handler.rs`**: Manages inline keyboard callbacks and UI interactions
+  - **`payment_handler.rs`**: Telegram Stars payment system integration
+- **`utils/`**: Utility modules for common functionality
+  - **`message_formatter.rs`**: Message formatting and templating utilities
 - **`analysis.rs`**: Core analysis engine that processes channels using LLM and rate limiting
 - **`session_manager.rs`**: Manages Telegram user sessions for channel access, handles validation and discovery
 - **`user_manager.rs`**: Database operations for users, analyses, and state management
