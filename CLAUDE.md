@@ -94,8 +94,36 @@ DATABASE_URL=postgresql://username:password@host/database
 
 - Sessions stored in `sessions/{phone_number}.session` files
 - Automatic discovery and validation on startup
-- Multiple sessions supported for load balancing
+- Multiple sessions supported for load balancing and rate limit distribution
+- Session rotation automatically handles Telegram API rate limits
 - Use `cargo run --bin authorize` to create new sessions
+- Sessions are validated on startup and invalid ones are automatically excluded
+
+### Referral System
+
+- Users can generate referral links: `https://t.me/BotName?start=ref_{user_id}`
+- Automatic referral tracking when new users join via referral link
+- Milestone rewards: 1 credit awarded at 1, 5, 10, 20, 30+ referrals
+- Additional 1 credit bonus when referred user makes their first payment
+- Referral notifications sent automatically for milestones
+- Tracked in `referral_rewards` table with referrer/referee relationships
+
+### Web Scraping
+
+- **`web_scraper.rs`**: Fallback mechanism for accessing channel data when Telegram API access fails
+- Uses headless browser simulation to scrape public channel previews from t.me URLs
+- Extracts channel metadata: title, description, subscriber count, recent posts
+- Results are cached in `cache/channels/` to minimize redundant requests
+- Automatically triggered when channel access fails through regular API
+
+### Message Queue System
+
+- **`message_queue`** table ensures reliable message delivery even during bot downtime
+- Supports bulk notifications and user engagement campaigns
+- Automatic retry mechanism with exponential backoff for failed messages
+- Message processing runs continuously in background
+- Use `cargo run --bin inactive_user_notifier` for re-engagement campaigns (example of bulk messaging)
+- Messages marked as sent/failed with detailed error tracking
 
 ### Testing
 
