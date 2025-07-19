@@ -5,6 +5,8 @@ mod cache;
 mod handlers;
 mod llm;
 mod migrations;
+mod prompts;
+mod rate_limiters;
 mod session_manager;
 mod user_manager;
 mod utils;

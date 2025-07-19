@@ -1,3 +1,5 @@
+pub mod analysis_query;
+
 use base64::{engine::general_purpose, Engine as _};
 use image::{GenericImageView, ImageFormat};
 use log::{error, info, warn};

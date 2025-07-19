@@ -5,6 +5,8 @@ pub mod cache;
 pub mod handlers;
 pub mod llm;
 pub mod migrations;
+pub mod prompts;
+pub mod rate_limiters;
 pub mod session_manager;
 pub mod user_manager;
 pub mod utils;

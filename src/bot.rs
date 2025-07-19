@@ -410,7 +410,7 @@ impl TelegramBot {
             cached_result
         } else {
             // generate prompt without lock
-            let prompt = match crate::analysis::AnalysisEngine::generate_analysis_prompt(&analysis_data.messages) {
+            let prompt = match crate::prompts::analysis::generate_analysis_prompt(&analysis_data.messages) {
                 Ok(p) => p,
                 Err(e) => {
                     error!("Failed to generate analysis prompt for channel {}: {}", channel_name, e);
@@ -426,7 +426,7 @@ impl TelegramBot {
 
             info!("Querying LLM for {} analysis of channel {}...", analysis_type, channel_name);
             // perform LLM call WITHOUT holding the lock
-            let mut result = match crate::analysis::AnalysisEngine::query_and_parse_analysis(&prompt).await {
+            let mut result = match crate::llm::analysis_query::query_and_parse_analysis(&prompt).await {
                 Ok(r) => r,
                 Err(e) => {
                     error!("Failed to query LLM for {} analysis of channel {}: {}", analysis_type, channel_name, e);
