@@ -1,9 +1,9 @@
-use log::{error, info};
+use log::{error, info, warn};
 use regex::Regex;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{
-    CallbackQuery, ChatId,
+    CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup,
     ParseMode, PreCheckoutQuery, SuccessfulPayment,
 };
 use teloxide::utils::command::BotCommands;
@@ -11,8 +11,9 @@ use tokio::sync::Mutex;
 
 use crate::analysis::AnalysisEngine;
 use crate::cache::AnalysisResult;
-use crate::handlers::{PaymentHandler, CallbackHandler, CommandHandler, payment_handler::{SINGLE_PACKAGE_PRICE, BULK_PACKAGE_PRICE, BULK_PACKAGE_AMOUNT}};
+use crate::handlers::{PaymentHandler, CallbackHandler, CommandHandler, GroupHandler, payment_handler::{SINGLE_PACKAGE_PRICE, BULK_PACKAGE_PRICE, BULK_PACKAGE_AMOUNT}};
 use crate::user_manager::UserManager;
+use crate::user_session::{SessionManager, SessionState};
 use crate::utils::MessageFormatter;
 use deadpool_postgres::Pool;
 
@@ -33,6 +34,8 @@ pub struct TelegramBot {
     user_manager: Arc<UserManager>,
     pool: Arc<Pool>,
     payment_handler: PaymentHandler,
+    group_handler: GroupHandler,
+    session_manager: Arc<SessionManager>,
 }
 
 #[derive(Clone)]
@@ -41,6 +44,8 @@ pub struct BotContext {
     pub analysis_engine: Arc<Mutex<AnalysisEngine>>,
     pub user_manager: Arc<UserManager>,
     pub payment_handler: PaymentHandler,
+    pub group_handler: GroupHandler,
+    pub session_manager: Arc<SessionManager>,
 }
 
 impl TelegramBot {
@@ -147,6 +152,8 @@ impl TelegramBot {
         let bot = Arc::new(Bot::new(bot_token));
         let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new(pool.clone())?));
         let payment_handler = PaymentHandler::new(user_manager.clone());
+        let group_handler = GroupHandler::new(pool.clone());
+        let session_manager = Arc::new(SessionManager::new());
 
         Ok(Self {
             bot,
@@ -154,6 +161,8 @@ impl TelegramBot {
             user_manager,
             pool,
             payment_handler,
+            group_handler,
+            session_manager,
         })
     }
 
@@ -162,6 +171,30 @@ impl TelegramBot {
 
     pub async fn run(&self) {
         info!("Starting Telegram bot...");
+
+        // get and log bot info at startup
+        info!("Fetching bot info...");
+        match self.bot.get_me().await {
+            Ok(me) => {
+                info!("Bot started successfully!");
+                info!("Bot ID: {}", me.id);
+                info!("Bot username: @{}", me.username.as_deref().unwrap_or("NO_USERNAME"));
+                info!("Bot name: {}", me.first_name);
+                if me.can_join_groups {
+                    info!("Bot CAN join groups");
+                } else {
+                    warn!("Bot CANNOT join groups - this will prevent group analysis!");
+                }
+                if me.can_read_all_group_messages {
+                    info!("Bot CAN read all group messages");
+                } else {
+                    warn!("Bot CANNOT read all group messages - group analysis may not work properly!");
+                }
+            }
+            Err(e) => {
+                error!("Failed to get bot info at startup: {}", e);
+            }
+        }
 
         // spawn message queue processor
         let bot_clone = self.bot.clone();
@@ -176,7 +209,12 @@ impl TelegramBot {
             analysis_engine: self.analysis_engine.clone(),
             user_manager: self.user_manager.clone(),
             payment_handler: self.payment_handler.clone(),
+            group_handler: self.group_handler.clone(),
+            session_manager: self.session_manager.clone(),
         };
+        
+        // create group handler with clone for the handler tree
+        let group_handler = self.group_handler.clone();
 
         let handler = dptree::entry()
             .branch(Update::filter_pre_checkout_query().endpoint({
@@ -223,9 +261,11 @@ impl TelegramBot {
                     )
                     .branch(dptree::endpoint({
                         let ctx = ctx.clone();
+                        let group_handler = group_handler.clone();
                         move |msg: Message| {
                             let ctx = ctx.clone();
-                            async move { Self::handle_message(ctx, msg).await }
+                            let group_handler = group_handler.clone();
+                            async move { Self::handle_message(ctx, msg, group_handler).await }
                         }
                     })),
             );
@@ -247,93 +287,183 @@ impl TelegramBot {
     async fn handle_message(
         ctx: BotContext,
         msg: Message,
+        group_handler: GroupHandler,
     ) -> ResponseResult<()> {
+        
+        // check if message is from a group chat
+        if msg.chat.is_group() || msg.chat.is_supergroup() {
+            // handle group messages
+            return group_handler.handle_group_message(ctx, msg).await;
+        }
+        
         if let Some(text) = msg.text() {
             let text = text.trim();
 
-            // validate and normalize channel input
-            if let Some(channel_name) = Self::validate_and_normalize_channel(text) {
-                info!("Received channel analysis request: {}", channel_name);
+            // get user ID for session management
+            let user_id = msg.from.as_ref().map(|user| user.id.0 as i64).unwrap_or(0);
+            
+            // check user session state
+            let session_state = ctx.session_manager.get_session(user_id).await;
+            
+            match session_state {
+                SessionState::ChannelAnalysisAwaitingInput => {
+                    // user is in channel analysis mode, validate input
+                    if let Some(channel_name) = Self::validate_and_normalize_channel(text) {
+                        // set session to selecting analysis type
+                        ctx.session_manager.set_session(
+                            user_id, 
+                            SessionState::ChannelAnalysisSelectingType { channel_name: channel_name.clone() }
+                        ).await;
+                        
+                        // send analysis type selection
+                        let selection_msg = format!(
+                            "🎯 <b>Channel:</b> <code>{}</code>\n\n\
+                            Please choose the type of analysis you'd like to perform:",
+                            MessageFormatter::escape_html(&channel_name)
+                        );
 
-                // get user info from telegram message
-                let telegram_user_id = msg.from.as_ref().map(|user| user.id.0 as i64).unwrap_or(0);
-                let username = msg.from.as_ref().and_then(|user| user.username.as_deref());
-                let first_name = msg.from.as_ref().map(|user| user.first_name.as_str());
-                let last_name = msg.from.as_ref().and_then(|user| user.last_name.as_deref());
-                let language_code = msg.from.as_ref().and_then(|user| user.language_code.as_deref());
-
-                // get or create user and check credits
-                let user = match ctx.user_manager
-                    .get_or_create_user(telegram_user_id, username, first_name, last_name, None, language_code)
-                    .await
-                {
-                    Ok((user, _)) => user,
-                    Err(e) => {
-                        error!("Failed to get/create user: {}", e);
+                        ctx.bot.send_message(msg.chat.id, selection_msg)
+                            .parse_mode(ParseMode::Html)
+                            .reply_markup(Self::create_channel_analysis_selection_keyboard(&channel_name))
+                            .await?;
+                    } else {
+                        // invalid channel input
                         ctx.bot.send_message(
                             msg.chat.id,
-                            "❌ Error processing user request. Please try again later.",
-                        )
-                        .await?;
-                        return Ok(());
+                            "❌ Please send a valid channel username starting with '@' (e.g., @channelname) or a t.me link.\n\nUse /start to return to the main menu.",
+                        ).await?;
                     }
-                };
-
-                // check if user has credits
-                if user.analysis_credits <= 0 {
-                    let no_credits_msg = format!(
-                        "❌ <b>No Analysis Credits Available</b>\n\n\
-                        You have used all your free analysis credits.\n\n\
-                        💰 <b>Purchase More Credits:</b>\n\
-                        • 1 analysis for {} ⭐ stars\n\
-                        • 10 analyses for {} ⭐ stars (save {} stars!)\n\n\
-                        📊 <b>Your Stats:</b>\n\
-                        • Credits remaining: <code>{}</code>\n\
-                        • Total analyses performed: <code>{}</code>\n\n\
-                        Choose a package below to continue analyzing channels!",
-                        SINGLE_PACKAGE_PRICE,
-                        BULK_PACKAGE_PRICE,
-                        (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE,
-                        user.analysis_credits,
-                        user.total_analyses_performed
-                    );
-
-                    ctx.bot.send_message(msg.chat.id, no_credits_msg)
-                        .parse_mode(ParseMode::Html)
-                        .reply_markup(CallbackHandler::create_payment_keyboard())
-                        .await?;
                     return Ok(());
                 }
-
-                // send immediate response with credit info
-                let credits_msg = format!(
-                    "🔍 Starting analysis...\n\n\
-                    💳 Credits remaining after analysis: <code>{}</code>",
-                    user.analysis_credits - 1
-                );
-                ctx.bot.send_message(msg.chat.id, credits_msg)
-                    .parse_mode(ParseMode::Html)
-                    .await?;
-
-                // show analysis type selection directly (validation will happen during analysis)
-                let selection_msg = format!(
-                    "🎯 <b>Channel:</b> <code>{}</code>\n\n\
-                    Please choose the type of analysis you'd like to perform:",
-                    MessageFormatter::escape_html(&channel_name)
-                );
-
-                ctx.bot.send_message(msg.chat.id, selection_msg)
-                    .parse_mode(ParseMode::Html)
-                    .reply_markup(CallbackHandler::create_analysis_selection_keyboard(&channel_name))
-                    .await?;
-            } else {
-                // send help message for invalid input
-                ctx.bot.send_message(
-                    msg.chat.id,
-                    "❓ Please send a valid channel username starting with '@' (e.g., @channelname)\n\nUse /start to see the full instructions.",
-                ).await?;
+                SessionState::Idle => {
+                    // fallback for backward compatibility - handle as normal channel input
+                    if let Some(channel_name) = Self::validate_and_normalize_channel(text) {
+                        Self::handle_legacy_channel_input(ctx, msg, channel_name).await?;
+                        return Ok(());
+                    } else {
+                        // send help message for invalid input
+                        ctx.bot.send_message(
+                            msg.chat.id,
+                            "❓ Please use the menu buttons or send a valid channel username starting with '@' (e.g., @channelname).\n\nUse /start to see the main menu.",
+                        ).await?;
+                        return Ok(());
+                    }
+                }
+                _ => {
+                    // user is in some other state, ignore text input or reset to idle
+                    ctx.session_manager.clear_session(user_id).await;
+                    ctx.bot.send_message(
+                        msg.chat.id,
+                        "Session reset. Please use /start to return to the main menu.",
+                    ).await?;
+                    return Ok(());
+                }
             }
         }
+        Ok(())
+    }
+
+    fn create_channel_analysis_selection_keyboard(channel_name: &str) -> InlineKeyboardMarkup {
+        let professional_button = InlineKeyboardButton::callback(
+            "💼 Professional Analysis",
+            format!("channel_analysis_professional_{}", channel_name),
+        );
+        let personal_button = InlineKeyboardButton::callback(
+            "🧠 Personal Analysis", 
+            format!("channel_analysis_personal_{}", channel_name),
+        );
+        let roast_button = InlineKeyboardButton::callback(
+            "🔥 Roast Analysis",
+            format!("channel_analysis_roast_{}", channel_name),
+        );
+
+        InlineKeyboardMarkup::new(vec![
+            vec![professional_button],
+            vec![personal_button],
+            vec![roast_button],
+        ])
+    }
+
+    // legacy handler for backward compatibility
+    async fn handle_legacy_channel_input(
+        ctx: BotContext,
+        msg: Message,
+        channel_name: String,
+    ) -> ResponseResult<()> {
+        info!("Received channel analysis request: {}", channel_name);
+
+        // get user info from telegram message
+        let telegram_user_id = msg.from.as_ref().map(|user| user.id.0 as i64).unwrap_or(0);
+        let username = msg.from.as_ref().and_then(|user| user.username.as_deref());
+        let first_name = msg.from.as_ref().map(|user| user.first_name.as_str());
+        let last_name = msg.from.as_ref().and_then(|user| user.last_name.as_deref());
+        let language_code = msg.from.as_ref().and_then(|user| user.language_code.as_deref());
+
+        // get or create user and check credits
+        let user = match ctx.user_manager
+            .get_or_create_user(telegram_user_id, username, first_name, last_name, None, language_code)
+            .await
+        {
+            Ok((user, _)) => user,
+            Err(e) => {
+                error!("Failed to get/create user: {}", e);
+                ctx.bot.send_message(
+                    msg.chat.id,
+                    "❌ Error processing user request. Please try again later.",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        // check if user has credits
+        if user.analysis_credits <= 0 {
+            let no_credits_msg = format!(
+                "❌ <b>No Analysis Credits Available</b>\n\n\
+                You have used all your free analysis credits.\n\n\
+                💰 <b>Purchase More Credits:</b>\n\
+                • 1 analysis for {} ⭐ stars\n\
+                • 10 analyses for {} ⭐ stars (save {} stars!)\n\n\
+                📊 <b>Your Stats:</b>\n\
+                • Credits remaining: <code>{}</code>\n\
+                • Total analyses performed: <code>{}</code>\n\n\
+                Choose a package below to continue analyzing channels!",
+                SINGLE_PACKAGE_PRICE,
+                BULK_PACKAGE_PRICE,
+                (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE,
+                user.analysis_credits,
+                user.total_analyses_performed
+            );
+
+            ctx.bot.send_message(msg.chat.id, no_credits_msg)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(CallbackHandler::create_payment_keyboard())
+                .await?;
+            return Ok(());
+        }
+
+        // send immediate response with credit info
+        let credits_msg = format!(
+            "🔍 Starting analysis...\n\n\
+            💳 Credits remaining after analysis: <code>{}</code>",
+            user.analysis_credits - 1
+        );
+        ctx.bot.send_message(msg.chat.id, credits_msg)
+            .parse_mode(ParseMode::Html)
+            .await?;
+
+        // show analysis type selection directly (validation will happen during analysis)
+        let selection_msg = format!(
+            "🎯 <b>Channel:</b> <code>{}</code>\n\n\
+            Please choose the type of analysis you'd like to perform:",
+            MessageFormatter::escape_html(&channel_name)
+        );
+
+        ctx.bot.send_message(msg.chat.id, selection_msg)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(CallbackHandler::create_analysis_selection_keyboard(&channel_name))
+            .await?;
+        
         Ok(())
     }
 
@@ -582,6 +712,312 @@ impl TelegramBot {
                 )
                 .await?;
             }
+        }
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn parse_group_analysis_request(text: &str) -> Option<i64> {
+        // try parsing as "Group -123456789" format first
+        if text.starts_with("Group ") {
+            if let Some(chat_id_str) = text.strip_prefix("Group ") {
+                if let Ok(chat_id) = chat_id_str.parse::<i64>() {
+                    return Some(chat_id);
+                }
+            }
+        }
+        
+        // try parsing as direct chat ID (negative numbers for groups)
+        if let Ok(chat_id) = text.parse::<i64>() {
+            if chat_id < 0 {  // negative chat IDs are typically groups/supergroups
+                return Some(chat_id);
+            }
+        }
+        
+        None
+    }
+
+    #[allow(dead_code)]
+    async fn handle_group_analysis_request(
+        ctx: BotContext,
+        msg: Message,
+        chat_id: i64,
+    ) -> ResponseResult<()> {
+        // get user info from telegram message
+        let telegram_user_id = msg.from.as_ref().map(|user| user.id.0 as i64).unwrap_or(0);
+        let username = msg.from.as_ref().and_then(|user| user.username.as_deref());
+        let first_name = msg.from.as_ref().map(|user| user.first_name.as_str());
+        let last_name = msg.from.as_ref().and_then(|user| user.last_name.as_deref());
+
+        // verify user is member of the group
+        let user_groups = match ctx.group_handler.get_user_groups(telegram_user_id).await {
+            Ok(groups) => groups,
+            Err(e) => {
+                error!("Failed to get user groups for {}: {}", telegram_user_id, e);
+                ctx.bot.send_message(msg.chat.id, "❌ Error accessing group information.")
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        if !user_groups.contains(&chat_id) {
+            ctx.bot.send_message(
+                msg.chat.id, 
+                "❌ You don't have access to this group analysis. You need to be a member of the group when the analysis was performed."
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // check if analysis exists for this group
+        let analysis = match ctx.group_handler.get_available_analyses(chat_id).await {
+            Ok(Some(analysis)) => analysis,
+            Ok(None) => {
+                ctx.bot.send_message(
+                    msg.chat.id,
+                    "❌ No analysis available for this group. The group needs to trigger an analysis first by mentioning the bot."
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(e) => {
+                error!("Failed to get group analysis for {}: {}", chat_id, e);
+                ctx.bot.send_message(msg.chat.id, "❌ Error accessing group analysis.")
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        // get or create user and check credits
+        let user = match ctx.user_manager
+            .get_or_create_user(telegram_user_id, username, first_name, last_name, None, None)
+            .await
+        {
+            Ok((user, _)) => user,
+            Err(e) => {
+                error!("Failed to get/create user: {}", e);
+                ctx.bot.send_message(msg.chat.id, "❌ Error processing user request.")
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        // check if user has credits
+        if user.analysis_credits <= 0 {
+            let no_credits_msg = format!(
+                "❌ <b>No Analysis Credits Available</b>\n\n\
+                You need 1 credit to access group analysis results.\n\n\
+                💰 <b>Purchase Credits:</b>\n\
+                • 1 analysis for {} ⭐ stars\n\
+                • 10 analyses for {} ⭐ stars (save {} stars!)\n\n\
+                📊 <b>Your Stats:</b>\n\
+                • Credits remaining: <code>{}</code>\n\
+                • Total analyses performed: <code>{}</code>",
+                SINGLE_PACKAGE_PRICE,
+                BULK_PACKAGE_PRICE,
+                (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE,
+                user.analysis_credits,
+                user.total_analyses_performed
+            );
+
+            ctx.bot.send_message(msg.chat.id, no_credits_msg)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(CallbackHandler::create_payment_keyboard())
+                .await?;
+            return Ok(());
+        }
+
+        // consume credit and store access record
+        match ctx.user_manager.consume_credit_for_group_analysis(user.id).await {
+            Ok(_) => {},
+            Err(e) => {
+                error!("Failed to consume credit for user {}: {}", user.id, e);
+                ctx.bot.send_message(msg.chat.id, "❌ Error processing credit consumption.")
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        // send analysis results
+        Self::send_group_analysis_results(&ctx, &msg, &analysis).await?;
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    async fn send_group_analysis_results(
+        ctx: &BotContext,
+        msg: &Message,
+        analysis: &crate::handlers::group_handler::GroupAnalysisData,
+    ) -> ResponseResult<()> {
+        let analyzed_users: Vec<String> = analysis.analyzed_users.iter()
+            .map(|user| {
+                if let Some(username) = &user.username {
+                    format!("@{}", username)
+                } else if let Some(first_name) = &user.first_name {
+                    first_name.clone()
+                } else {
+                    format!("User {}", user.telegram_user_id)
+                }
+            })
+            .collect();
+
+        let header_msg = format!(
+            "🎭 <b>Group Analysis Results</b>\n\n\
+            📊 <b>Analysis Summary:</b>\n\
+            • Messages analyzed: <code>{}</code>\n\
+            • Users analyzed: <code>{}</code>\n\
+            • Analysis date: <code>{}</code>\n\n\
+            <b>Analyzed members:</b> {}\n\n",
+            analysis.message_count,
+            analysis.analyzed_users.len(),
+            analysis.analysis_timestamp.format("%Y-%m-%d %H:%M UTC"),
+            analyzed_users.join(", ")
+        );
+
+        // send header first
+        ctx.bot.send_message(msg.chat.id, header_msg)
+            .parse_mode(ParseMode::Html)
+            .await?;
+
+        // send each analysis type
+        if let Some(professional) = &analysis.professional {
+            let professional_msg = format!(
+                "💼 <b>Professional Analysis</b>\n\n{}",
+                MessageFormatter::escape_html(professional)
+            );
+            ctx.bot.send_message(msg.chat.id, professional_msg)
+                .parse_mode(ParseMode::Html)
+                .await?;
+        }
+
+        if let Some(personal) = &analysis.personal {
+            let personal_msg = format!(
+                "🧠 <b>Personal Analysis</b>\n\n{}",
+                MessageFormatter::escape_html(personal)
+            );
+            ctx.bot.send_message(msg.chat.id, personal_msg)
+                .parse_mode(ParseMode::Html)
+                .await?;
+        }
+
+        if let Some(roast) = &analysis.roast {
+            let roast_msg = format!(
+                "🔥 <b>Roast Analysis</b>\n\n{}",
+                MessageFormatter::escape_html(roast)
+            );
+            ctx.bot.send_message(msg.chat.id, roast_msg)
+                .parse_mode(ParseMode::Html)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn handle_group_analysis_request_direct(
+        ctx: BotContext,
+        user_chat_id: ChatId,
+        chat_id: i64,
+        user: crate::user_manager::User,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // verify user is member of the group
+        let user_groups = ctx.group_handler.get_user_groups(user.telegram_user_id).await?;
+        if !user_groups.contains(&chat_id) {
+            ctx.bot.send_message(
+                user_chat_id, 
+                "❌ You don't have access to this group analysis. You need to be a member of the group when the analysis was performed."
+            ).await?;
+            return Ok(());
+        }
+
+        // check if analysis exists for this group
+        let analysis = match ctx.group_handler.get_available_analyses(chat_id).await? {
+            Some(analysis) => analysis,
+            None => {
+                ctx.bot.send_message(
+                    user_chat_id,
+                    "❌ No analysis available for this group. The group needs to trigger an analysis first by mentioning the bot."
+                ).await?;
+                return Ok(());
+            }
+        };
+
+        // consume credit and store access record
+        ctx.user_manager.consume_credit_for_group_analysis(user.id).await?;
+
+        // send analysis results
+        Self::send_group_analysis_results_direct(&ctx, user_chat_id, &analysis).await?;
+        
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    async fn send_group_analysis_results_direct(
+        ctx: &BotContext,
+        chat_id: ChatId,
+        analysis: &crate::handlers::group_handler::GroupAnalysisData,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let analyzed_users: Vec<String> = analysis.analyzed_users.iter()
+            .map(|user| {
+                if let Some(username) = &user.username {
+                    format!("@{}", username)
+                } else if let Some(first_name) = &user.first_name {
+                    first_name.clone()
+                } else {
+                    format!("User {}", user.telegram_user_id)
+                }
+            })
+            .collect();
+
+        let header_msg = format!(
+            "🎭 <b>Group Analysis Results</b>\n\n\
+            📊 <b>Analysis Summary:</b>\n\
+            • Messages analyzed: <code>{}</code>\n\
+            • Users analyzed: <code>{}</code>\n\
+            • Analysis date: <code>{}</code>\n\n\
+            <b>Analyzed members:</b> {}\n\n",
+            analysis.message_count,
+            analysis.analyzed_users.len(),
+            analysis.analysis_timestamp.format("%Y-%m-%d %H:%M UTC"),
+            analyzed_users.join(", ")
+        );
+
+        // send header first
+        ctx.bot.send_message(chat_id, header_msg)
+            .parse_mode(ParseMode::Html)
+            .await?;
+
+        // send each analysis type
+        if let Some(professional) = &analysis.professional {
+            let professional_msg = format!(
+                "💼 <b>Professional Analysis</b>\n\n{}",
+                MessageFormatter::escape_html(professional)
+            );
+            ctx.bot.send_message(chat_id, professional_msg)
+                .parse_mode(ParseMode::Html)
+                .await?;
+        }
+
+        if let Some(personal) = &analysis.personal {
+            let personal_msg = format!(
+                "🧠 <b>Personal Analysis</b>\n\n{}",
+                MessageFormatter::escape_html(personal)
+            );
+            ctx.bot.send_message(chat_id, personal_msg)
+                .parse_mode(ParseMode::Html)
+                .await?;
+        }
+
+        if let Some(roast) = &analysis.roast {
+            let roast_msg = format!(
+                "🔥 <b>Roast Analysis</b>\n\n{}",
+                MessageFormatter::escape_html(roast)
+            );
+            ctx.bot.send_message(chat_id, roast_msg)
+                .parse_mode(ParseMode::Html)
+                .await?;
         }
 
         Ok(())

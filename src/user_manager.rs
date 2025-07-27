@@ -413,6 +413,44 @@ impl UserManager {
         Ok(pending_analyses)
     }
 
+    /// consume 1 credit for group analysis access 
+    pub async fn consume_credit_for_group_analysis(
+        &self,
+        user_id: i32,
+    ) -> Result<i32, UserManagerError> {
+        let client = self.pool.get().await?;
+        
+        let row = client
+            .query_opt(
+                "UPDATE users SET analysis_credits = analysis_credits - 1, total_analyses_performed = total_analyses_performed + 1, updated_at = NOW() 
+                 WHERE id = $1 AND analysis_credits > 0 
+                 RETURNING analysis_credits",
+                &[&user_id],
+            )
+            .await?;
+
+        match row {
+            Some(row) => {
+                let remaining_credits: i32 = row.get(0);
+                info!("Consumed 1 credit for group analysis for user {}, remaining: {}", user_id, remaining_credits);
+                Ok(remaining_credits)
+            }
+            None => {
+                // check if user exists to provide more specific error
+                let user_exists = client
+                    .query_opt("SELECT 1 FROM users WHERE id = $1", &[&user_id])
+                    .await?
+                    .is_some();
+
+                if user_exists {
+                    Err(UserManagerError::InsufficientCredits(user_id))
+                } else {
+                    Err(UserManagerError::UserNotFound(user_id))
+                }
+            }
+        }
+    }
+
     /// adds credits to user (for future payment integration)
     pub async fn add_credits(
         &self,
@@ -603,5 +641,28 @@ impl UserManager {
 
         info!("No paid referral to record for user {}", user_id);
         Ok(None)
+    }
+
+    /// records access to a group analysis for tracking and billing purposes
+    pub async fn record_group_analysis_access(
+        &self,
+        user_id: i32,
+        group_analysis_id: i32,
+        analysis_type: &str,
+        target_user_id: i64,
+    ) -> Result<(), UserManagerError> {
+        let client = self.pool.get().await?;
+        
+        client
+            .execute(
+                "INSERT INTO group_analysis_access (user_id, group_analysis_id, analysis_type, target_user_id) 
+                 VALUES ($1, $2, $3, $4)",
+                &[&user_id, &group_analysis_id, &analysis_type, &target_user_id],
+            )
+            .await?;
+
+        info!("Recorded group analysis access: user_id={}, group_analysis_id={}, analysis_type={}, target_user_id={}", 
+              user_id, group_analysis_id, analysis_type, target_user_id);
+        Ok(())
     }
 }

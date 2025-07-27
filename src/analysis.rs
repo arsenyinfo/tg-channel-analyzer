@@ -29,6 +29,7 @@ pub struct AnalysisData {
     pub cache_key: String,
 }
 
+
 pub struct AnalysisEngine {
     client: Option<Client>,
     api_id: i32,
@@ -322,6 +323,8 @@ impl AnalysisEngine {
             cache_key,
         })
     }
+
+
 
     pub async fn finish_analysis(
         &mut self,

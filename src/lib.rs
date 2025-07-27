@@ -9,5 +9,6 @@ pub mod prompts;
 pub mod rate_limiters;
 pub mod session_manager;
 pub mod user_manager;
+pub mod user_session;
 pub mod utils;
 pub mod web_scraper;

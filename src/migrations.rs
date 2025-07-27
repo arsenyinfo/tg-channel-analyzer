@@ -119,7 +119,7 @@ impl MigrationManager {
     }
 
     fn latest_version() -> i32 {
-        4 // increment this when adding new migrations
+        5 // increment this when adding new migrations
     }
 
     async fn run_pending_migrations(
@@ -196,6 +196,80 @@ impl MigrationManager {
                         -- Add status column to user_analyses for task resumption
                         ALTER TABLE user_analyses ADD COLUMN status VARCHAR(20) DEFAULT 'completed' CHECK (status IN ('pending', 'completed', 'failed'));
                         CREATE INDEX idx_user_analyses_status ON user_analyses(status, analysis_timestamp);
+                    "#;
+                    transaction.batch_execute(migration_sql).await?;
+                }
+                5 => {
+                    // add group chat analysis tables
+                    let migration_sql = r#"
+                        -- Store group chat metadata
+                        CREATE TABLE group_chats (
+                            id SERIAL PRIMARY KEY,
+                            chat_id BIGINT NOT NULL UNIQUE,
+                            title VARCHAR(255),
+                            chat_type VARCHAR(50) NOT NULL DEFAULT 'group',
+                            member_count INTEGER,
+                            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                        );
+
+                        -- Store group messages (last N per group)
+                        CREATE TABLE group_messages (
+                            id SERIAL PRIMARY KEY,
+                            chat_id BIGINT NOT NULL,
+                            telegram_user_id BIGINT NOT NULL,
+                            username VARCHAR(255),
+                            first_name VARCHAR(255),
+                            message_text TEXT NOT NULL,
+                            message_id BIGINT,
+                            timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                        );
+
+                        -- Store group analysis results
+                        CREATE TABLE group_analyses (
+                            id SERIAL PRIMARY KEY,
+                            chat_id BIGINT NOT NULL,
+                            analysis_data JSONB NOT NULL,
+                            analyzed_users JSONB NOT NULL, -- array of user objects that were analyzed
+                            message_count_when_analyzed INTEGER NOT NULL,
+                            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                            notified_at TIMESTAMP WITH TIME ZONE
+                        );
+
+                        -- Track user membership in groups for access control
+                        CREATE TABLE group_memberships (
+                            id SERIAL PRIMARY KEY,
+                            chat_id BIGINT NOT NULL,
+                            telegram_user_id BIGINT NOT NULL,
+                            username VARCHAR(255),
+                            first_name VARCHAR(255),
+                            message_count INTEGER NOT NULL DEFAULT 0,
+                            last_message_at TIMESTAMP WITH TIME ZONE,
+                            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                            UNIQUE(chat_id, telegram_user_id)
+                        );
+
+                        -- Track paid access to group analyses
+                        CREATE TABLE group_analysis_access (
+                            id SERIAL PRIMARY KEY,
+                            user_id INTEGER NOT NULL REFERENCES users(id),
+                            group_analysis_id INTEGER NOT NULL REFERENCES group_analyses(id),
+                            analysis_type VARCHAR(50) CHECK (analysis_type IN ('professional', 'personal', 'roast')),
+                            target_user_id BIGINT NOT NULL DEFAULT 0,
+                            accessed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                        );
+
+                        -- Create indexes for efficient queries
+                        CREATE INDEX idx_group_chats_chat_id ON group_chats(chat_id);
+                        CREATE INDEX idx_group_messages_chat_id ON group_messages(chat_id);
+                        CREATE INDEX idx_group_messages_timestamp ON group_messages(chat_id, timestamp DESC);
+                        CREATE INDEX idx_group_messages_user ON group_messages(telegram_user_id);
+                        CREATE INDEX idx_group_analyses_chat_id ON group_analyses(chat_id, created_at DESC);
+                        CREATE INDEX idx_group_memberships_chat_id ON group_memberships(chat_id);
+                        CREATE INDEX idx_group_memberships_user_id ON group_memberships(telegram_user_id);
+                        CREATE INDEX idx_group_memberships_activity ON group_memberships(chat_id, message_count DESC);
+                        CREATE INDEX idx_group_analysis_access_user ON group_analysis_access(user_id);
+                        CREATE INDEX idx_group_analysis_access_detailed ON group_analysis_access(user_id, group_analysis_id, analysis_type, target_user_id);
                     "#;
                     transaction.batch_execute(migration_sql).await?;
                 }

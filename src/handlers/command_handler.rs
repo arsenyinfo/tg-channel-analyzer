@@ -1,6 +1,6 @@
 use log::{error, info};
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, ParseMode};
+use teloxide::types::{ChatId, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup};
 
 use crate::bot::{BotContext, Command};
 use crate::handlers::{PaymentHandler, CallbackHandler, payment_handler::{SINGLE_PACKAGE_PRICE, BULK_PACKAGE_PRICE, SINGLE_PACKAGE_AMOUNT, BULK_PACKAGE_AMOUNT}};
@@ -75,12 +75,11 @@ impl CommandHandler {
         // send referral milestone notification if applicable
         Self::send_referral_notifications(&ctx, maybe_reward_info).await;
 
-        // send appropriate welcome message based on user's credit balance
-        if user.analysis_credits <= 0 {
-            Self::send_no_credits_welcome(&ctx, &msg, &user).await?;
-        } else {
-            Self::send_credits_available_welcome(&ctx, &msg, &user).await?;
-        }
+        // check for available group analyses
+        let available_groups = Self::get_user_group_analyses(&ctx, user_info.telegram_user_id).await;
+
+        // send welcome message with main menu
+        Self::send_welcome_with_menu(&ctx, &msg, &user, !available_groups.is_empty()).await?;
 
         Ok(())
     }
@@ -194,6 +193,7 @@ impl CommandHandler {
         }
     }
 
+    #[allow(dead_code)]
     async fn send_no_credits_welcome(ctx: &BotContext, msg: &Message, user: &crate::user_manager::User) -> ResponseResult<()> {
         let referral_info = if user.referrals_count > 0 {
             format!("You have {} referrals! 🎉", user.referrals_count)
@@ -237,13 +237,64 @@ impl CommandHandler {
         Ok(())
     }
 
-    async fn send_credits_available_welcome(ctx: &BotContext, msg: &Message, user: &crate::user_manager::User) -> ResponseResult<()> {
+    async fn get_user_group_analyses(ctx: &BotContext, telegram_user_id: i64) -> Vec<(i64, String)> {
+        match ctx.group_handler.get_user_groups(telegram_user_id).await {
+            Ok(chat_ids) => {
+                let mut available_groups = Vec::new();
+                for chat_id in chat_ids {
+                    if let Ok(Some(analysis)) = ctx.group_handler.get_available_analyses(chat_id).await {
+                        if !analysis.analyzed_users.is_empty() {
+                            // get real group name from database
+                            let group_name = match ctx.group_handler.get_group_name(chat_id).await {
+                                Ok(Some(name)) => name,
+                                _ => format!("Group {}", chat_id), // fallback to ID
+                            };
+                            available_groups.push((chat_id, group_name));
+                        }
+                    }
+                }
+                available_groups
+            },
+            Err(e) => {
+                error!("Failed to get user groups for {}: {}", telegram_user_id, e);
+                Vec::new()
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    async fn send_credits_available_welcome(ctx: &BotContext, msg: &Message, user: &crate::user_manager::User, available_groups: &[(i64, String)]) -> ResponseResult<()> {
         let referral_section = Self::build_referral_section(user);
+
+        let group_analysis_section = if !available_groups.is_empty() {
+            let group_list = available_groups.iter()
+                .take(3)
+                .map(|(_, name)| format!("• {}", name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            
+            let additional_groups = if available_groups.len() > 3 {
+                format!(" and {} more", available_groups.len() - 3)
+            } else {
+                String::new()
+            };
+
+            format!(
+                "🎭 <b>Group Analysis Available!</b>\n\
+                You have access to group analyses{} for 1 credit each:\n\
+                {}\n\n\
+                Send me a group ID to access the analysis!\n\n",
+                additional_groups,
+                group_list
+            )
+        } else {
+            String::new()
+        };
 
         let intro_text = format!(
             "🤖 <b><a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a> - Channel Analyzer</b>\n\n\
             Welcome back! I can analyze Telegram channels and provide insights.\n\n\
-            📋 <b>How to use:</b>\n\
+            {}📋 <b>How to use:</b>\n\
             • Send me a channel username (e.g., <code>@channelname</code>)\n\
             • I'll validate the channel and show analysis options\n\
             • Choose your preferred analysis type\n\
@@ -255,11 +306,56 @@ impl CommandHandler {
             {}\n\n\
             Just send me a channel name to get started!",
             user.id,
+            group_analysis_section,
             referral_section
         );
 
         ctx.bot.send_message(msg.chat.id, intro_text)
             .parse_mode(ParseMode::Html)
+            .await?;
+
+        Ok(())
+    }
+
+    fn create_main_menu_keyboard(has_group_analyses: bool) -> InlineKeyboardMarkup {
+        let mut keyboard = vec![
+            vec![InlineKeyboardButton::callback("📊 Analyze Channel", "menu_channels")],
+        ];
+        
+        if has_group_analyses {
+            keyboard.push(vec![InlineKeyboardButton::callback("🎭 View Group Analysis", "menu_groups")]);
+        }
+        
+        keyboard.push(vec![InlineKeyboardButton::callback("💰 Buy Credits", "menu_buy")]);
+        
+        InlineKeyboardMarkup::new(keyboard)
+    }
+
+    async fn send_welcome_with_menu(ctx: &BotContext, msg: &Message, user: &crate::user_manager::User, has_group_analyses: bool) -> ResponseResult<()> {
+        let referral_section = Self::build_referral_section(user);
+        
+        let group_status = if has_group_analyses {
+            "✅ You have group analyses available!\n\n"
+        } else {
+            ""
+        };
+
+        let intro_text = format!(
+            "🤖 <b><a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a> - Channel Analyzer</b>\n\n\
+            Welcome! I can analyze Telegram channels and group chats.\n\n\
+            {}⚡ <b>Analysis Types:</b>\n\
+            • 💼 Professional: Expert assessment for hiring\n\
+            • 🧠 Personal: Psychological profile insights\n\
+            • 🔥 Roast: Fun, brutally honest critique\n\n\
+            {}Choose an option below to get started!",
+            user.id,
+            group_status,
+            referral_section
+        );
+
+        ctx.bot.send_message(msg.chat.id, intro_text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(Self::create_main_menu_keyboard(has_group_analyses))
             .await?;
 
         Ok(())

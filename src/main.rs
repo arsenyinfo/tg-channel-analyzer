@@ -9,6 +9,7 @@ mod prompts;
 mod rate_limiters;
 mod session_manager;
 mod user_manager;
+mod user_session;
 mod utils;
 mod web_scraper;
 

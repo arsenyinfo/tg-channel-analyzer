@@ -41,7 +41,7 @@ clap = { version = "4.0", features = ["derive"] }
 teloxide = { version = "0.14", features = ["macros"] }
 tokio-stream = "0.1"
 fastrand = "2.0"
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"] }
 deadpool-postgres = "0.14"
 dotenvy = "0.15"
 tokio-postgres-rustls = "0.12"
