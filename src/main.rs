@@ -13,12 +13,13 @@ mod utils;
 mod web_scraper;
 
 use analysis::AnalysisEngine;
-use bot::TelegramBot;
+use bot::{ChannelLocks, TelegramBot};
 use cache::CacheManager;
 use clap::Parser;
 use log::{error, info};
 use migrations::MigrationManager;
 use session_manager::SessionManager;
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -100,7 +101,7 @@ async fn recover_pending_analyses(
     bot_token: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pending_analyses = user_manager.get_pending_analyses().await?;
-    
+
     if pending_analyses.is_empty() {
         info!("No pending analyses to recover");
         return Ok(());
@@ -112,15 +113,19 @@ async fn recover_pending_analyses(
     let pool = CacheManager::create_pool().await?;
     let pool = Arc::new(pool);
     let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new(pool)?));
-    
+
     // create bot instance for recovery
     let bot = Arc::new(teloxide::Bot::new(bot_token));
+
+    // create channel locks for recovery
+    let channel_locks: ChannelLocks = Arc::new(Mutex::new(HashMap::new()));
 
     for analysis in pending_analyses {
         let bot_clone = bot.clone();
         let analysis_engine_clone = analysis_engine.clone();
         let user_manager_clone = user_manager.clone();
-        
+        let channel_locks_clone = channel_locks.clone();
+
         info!(
             "Resuming analysis {} for user {} (channel: {}, type: {})",
             analysis.id, analysis.telegram_user_id, analysis.channel_name, analysis.analysis_type
@@ -136,6 +141,7 @@ async fn recover_pending_analyses(
                 user_manager_clone.clone(),
                 analysis.user_id,
                 analysis.id,
+                channel_locks_clone,
             ).await {
                 error!("Failed to recover analysis {}: {}", analysis.id, e);
                 // mark as failed if recovery failed

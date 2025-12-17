@@ -212,11 +212,12 @@ impl CallbackHandler {
         analysis_id: i32,
     ) {
         use crate::bot::TelegramBot;
-        
+
         let bot_clone = ctx.bot.clone();
         let analysis_engine_clone = ctx.analysis_engine.clone();
         let user_manager_clone = ctx.user_manager.clone();
         let user_manager_error_clone = ctx.user_manager.clone();
+        let channel_locks_clone = ctx.channel_locks.clone();
 
         tokio::spawn(async move {
             if let Err(e) = TelegramBot::perform_single_analysis(
@@ -228,6 +229,7 @@ impl CallbackHandler {
                 user_manager_clone,
                 user.id,
                 analysis_id,
+                channel_locks_clone,
             )
             .await
             {

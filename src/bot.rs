@@ -1,5 +1,6 @@
 use log::{error, info};
 use regex::Regex;
+use std::collections::HashMap;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -15,6 +16,9 @@ use crate::handlers::{PaymentHandler, CallbackHandler, CommandHandler, payment_h
 use crate::user_manager::UserManager;
 use crate::utils::MessageFormatter;
 use deadpool_postgres::Pool;
+
+// per-channel locks to prevent concurrent LLM calls for the same channel
+pub type ChannelLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Supported commands:")]
@@ -41,6 +45,7 @@ pub struct BotContext {
     pub analysis_engine: Arc<Mutex<AnalysisEngine>>,
     pub user_manager: Arc<UserManager>,
     pub payment_handler: PaymentHandler,
+    pub channel_locks: ChannelLocks,
 }
 
 impl TelegramBot {
@@ -176,6 +181,7 @@ impl TelegramBot {
             analysis_engine: self.analysis_engine.clone(),
             user_manager: self.user_manager.clone(),
             payment_handler: self.payment_handler.clone(),
+            channel_locks: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let handler = dptree::entry()
@@ -346,6 +352,7 @@ impl TelegramBot {
         user_manager: Arc<UserManager>,
         user_id: i32,
         analysis_id: i32,
+        channel_locks: ChannelLocks,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!(
             "Starting {} analysis for channel: {}",
@@ -400,13 +407,25 @@ impl TelegramBot {
             return Err("No messages found in channel".into());
         }
 
-        // check for cached result (with lock)
+        // get or create per-channel lock to prevent concurrent LLM calls
+        let channel_lock = {
+            let mut locks = channel_locks.lock().await;
+            locks.entry(channel_name.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        // acquire channel lock before checking cache and calling LLM
+        let _channel_guard = channel_lock.lock().await;
+
+        // check for cached result (re-check after acquiring channel lock)
         let cached_result = {
             let engine = analysis_engine.lock().await;
             engine.cache.load_llm_result(&analysis_data.cache_key).await
         };
 
         let result = if let Some(cached_result) = cached_result {
+            info!("Using cached LLM result for channel {}", channel_name);
             cached_result
         } else {
             // generate prompt without lock
@@ -425,7 +444,7 @@ impl TelegramBot {
             };
 
             info!("Querying LLM for {} analysis of channel {}...", analysis_type, channel_name);
-            // perform LLM call WITHOUT holding the lock
+            // perform LLM call (protected by channel lock)
             let mut result = match crate::llm::analysis_query::query_and_parse_analysis(&prompt).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -441,7 +460,7 @@ impl TelegramBot {
             };
             result.messages_count = analysis_data.messages.len();
 
-            // finish analysis (cache result) with lock
+            // cache the result
             {
                 let mut engine = analysis_engine.lock().await;
                 if let Err(e) = engine.finish_analysis(&analysis_data.cache_key, result.clone()).await {
