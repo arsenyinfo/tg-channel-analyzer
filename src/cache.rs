@@ -34,7 +34,9 @@ impl CacheManager {
         Ok(config.create_pool(Some(Runtime::Tokio1), tls)?)
     }
 
-    // channel message cache
+    // channel message cache (7-day TTL)
+    const CHANNEL_CACHE_TTL_DAYS: i32 = 7;
+
     pub async fn load_channel_messages(&self, channel_name: &str) -> Option<Vec<MessageDict>> {
         let client = match self.pool.get().await {
             Ok(client) => client,
@@ -46,8 +48,10 @@ impl CacheManager {
 
         match client
             .query_opt(
-                "SELECT messages_data FROM channel_messages WHERE channel_name = $1",
-                &[&channel_name],
+                "SELECT messages_data FROM channel_messages
+                 WHERE channel_name = $1
+                 AND updated_at > NOW() - INTERVAL '1 day' * $2",
+                &[&channel_name, &Self::CHANNEL_CACHE_TTL_DAYS],
             )
             .await
         {
@@ -72,7 +76,7 @@ impl CacheManager {
                 }
             }
             Ok(None) => {
-                info!("No cache found for channel {}", channel_name);
+                info!("No cache found for channel {} (or cache expired)", channel_name);
                 None
             }
             Err(e) => {
