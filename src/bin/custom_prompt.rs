@@ -99,7 +99,7 @@ Please provide your analysis based on the above messages."#,
 
     // query LLM
     info!("Sending prompt to LLM...");
-    match query_llm(&full_prompt, "gemini-2.5-flash").await {
+    match query_llm(&full_prompt, "gemini-3-flash-preview").await {
         Ok(response) => {
             // print response directly to stdout
             println!("{}", response.content);

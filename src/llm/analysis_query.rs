@@ -107,11 +107,11 @@ pub async fn query_and_parse_analysis(
         .into())
     }
 
-    // try gemini-2.5-flash with retries
-    match try_model_with_content_retries(prompt, "gemini-2.5-flash", 2, 2).await {
+    // try gemini-3-flash-preview with retries
+    match try_model_with_content_retries(prompt, "gemini-3-flash-preview", 2, 2).await {
         Ok(result) => return Ok(result),
         Err(e) => {
-            warn!("Gemini Flash failed with error: {}, trying fallback", e);
+            warn!("Gemini 3 Flash failed with error: {}, trying fallback", e);
         }
     }
 
