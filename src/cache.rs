@@ -1,10 +1,10 @@
 use deadpool_postgres::{Config, Pool, Runtime};
-use std::sync::Arc;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::analysis::MessageDict;
@@ -35,7 +35,7 @@ impl CacheManager {
     }
 
     // channel message cache (7-day TTL)
-    const CHANNEL_CACHE_TTL_DAYS: i32 = 7;
+    const CHANNEL_CACHE_TTL_DAYS: f64 = 7.0;
 
     pub async fn load_channel_messages(&self, channel_name: &str) -> Option<Vec<MessageDict>> {
         let client = match self.pool.get().await {
@@ -76,7 +76,10 @@ impl CacheManager {
                 }
             }
             Ok(None) => {
-                info!("No cache found for channel {} (or cache expired)", channel_name);
+                info!(
+                    "No cache found for channel {} (or cache expired)",
+                    channel_name
+                );
                 None
             }
             Err(e) => {
