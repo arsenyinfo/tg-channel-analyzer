@@ -18,8 +18,11 @@ use deadpool_postgres::Pool;
 
 #[derive(Serialize, Deserialize, Debug, Hash)]
 pub struct MessageDict {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<String>>,
 }
 
@@ -260,7 +263,6 @@ impl AnalysisEngine {
 
         unreachable!()
     }
-
 
     pub async fn prepare_analysis_data(
         &mut self,
@@ -533,7 +535,7 @@ impl AnalysisEngine {
                             images: None, // Telegram API messages don't include images in this context
                         });
 
-                        if current_messages.len() >= 200 {
+                        if current_messages.len() >= 100 {
                             break;
                         }
                     }
@@ -583,6 +585,4 @@ impl AnalysisEngine {
         info!("Retrieved {} messages, skipped {}", messages.len(), skipped);
         Ok(messages)
     }
-
 }
-

@@ -1,14 +1,12 @@
 use log::{error, info};
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{
-    ChatId, LabeledPrice, ParseMode, PreCheckoutQuery, SuccessfulPayment,
-};
+use teloxide::types::{ChatId, LabeledPrice, ParseMode, PreCheckoutQuery, SuccessfulPayment};
 
 use crate::user_manager::UserManager;
 
 // payment configuration constants
-pub const SINGLE_PACKAGE_PRICE: u32 = 40;
+pub const SINGLE_PACKAGE_PRICE: u32 = 50;
 pub const BULK_PACKAGE_PRICE: u32 = 200;
 pub const SINGLE_PACKAGE_AMOUNT: i32 = 1;
 pub const BULK_PACKAGE_AMOUNT: i32 = 10;
@@ -74,15 +72,19 @@ impl PaymentHandler {
         let language_code = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
 
         // get user info for referral link
-        let (user, _) = match self.user_manager
+        let (user, _) = match self
+            .user_manager
             .get_or_create_user(telegram_user_id, None, None, None, None, language_code)
             .await
         {
             Ok(result) => result,
             Err(e) => {
                 error!("Failed to get user info during payment: {}", e);
-                bot.send_message(msg.chat.id, "❌ Error processing payment. Please contact support.")
-                    .await?;
+                bot.send_message(
+                    msg.chat.id,
+                    "❌ Error processing payment. Please contact support.",
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -120,7 +122,10 @@ impl PaymentHandler {
 
                 // process referral rewards if user was referred
                 if let Err(e) = self.process_referral_rewards(bot, user.id).await {
-                    error!("Failed to process referral rewards for user {}: {}", user.id, e);
+                    error!(
+                        "Failed to process referral rewards for user {}: {}",
+                        user.id, e
+                    );
                 }
             }
             Err(e) => {
@@ -148,7 +153,9 @@ impl PaymentHandler {
             Ok(Some(reward_info)) => {
                 if let Some(referrer_telegram_id) = reward_info.referrer_telegram_id {
                     // send notification to referrer
-                    let reward_msg = if reward_info.paid_rewards > 0 && reward_info.milestone_rewards > 0 {
+                    let reward_msg = if reward_info.paid_rewards > 0
+                        && reward_info.milestone_rewards > 0
+                    {
                         format!(
                             "🎉 <b>Referral Rewards!</b>\n\n\
                             You've earned <b>{}</b> credits (Total referrals: <b>{}</b>):\n\
@@ -184,12 +191,10 @@ impl PaymentHandler {
                     };
 
                     if !reward_msg.is_empty() {
-                        let _ = bot.send_message(
-                            ChatId(referrer_telegram_id), 
-                            reward_msg
-                        )
-                        .parse_mode(ParseMode::Html)
-                        .await;
+                        let _ = bot
+                            .send_message(ChatId(referrer_telegram_id), reward_msg)
+                            .parse_mode(ParseMode::Html)
+                            .await;
                     }
                 }
             }
@@ -197,7 +202,10 @@ impl PaymentHandler {
                 // no referral rewards
             }
             Err(e) => {
-                error!("Failed to process paid referral for user {}: {}", user_id, e);
+                error!(
+                    "Failed to process paid referral for user {}: {}",
+                    user_id, e
+                );
             }
         }
         Ok(())

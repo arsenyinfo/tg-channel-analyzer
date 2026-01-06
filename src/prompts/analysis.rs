@@ -4,14 +4,17 @@ pub fn generate_analysis_prompt(
     messages: &[MessageDict],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // create a version of messages without image URLs for LLM analysis
-    let messages_for_llm: Vec<MessageDict> = messages.iter().map(|msg| {
-        MessageDict {
-            date: msg.date.clone(),
-            message: msg.message.clone(),
-            images: None, // exclude images from LLM analysis
-        }
-    }).collect();
-    
+    let messages_for_llm: Vec<MessageDict> = messages
+        .iter()
+        .map(|msg| {
+            MessageDict {
+                date: msg.date.clone(),
+                message: msg.message.clone(),
+                images: None, // exclude images from LLM analysis
+            }
+        })
+        .collect();
+
     let messages_json = serde_json::to_string_pretty(&messages_for_llm)?;
 
     Ok(format!(
