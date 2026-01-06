@@ -62,14 +62,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // validate sessions before initialization
     info!("Validating Telegram sessions...");
     let validation_result = SessionManager::validate_sessions().await?;
-    
+
     if !validation_result.is_success() {
         if let Some(error_msg) = validation_result.error_message() {
             error!("Session validation failed:\n{}", error_msg);
             return Err("Session validation failed - see above for details".into());
         }
     }
-    
+
     if let Some(success_msg) = validation_result.success_message() {
         info!("{}", success_msg);
     }
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // wrap pool in Arc for sharing
     let pool = Arc::new(pool);
-    
+
     // initialize user manager with shared pool
     let user_manager = Arc::new(UserManager::new(pool.clone()));
 
@@ -107,7 +107,10 @@ async fn recover_pending_analyses(
         return Ok(());
     }
 
-    info!("Found {} pending analyses to recover", pending_analyses.len());
+    info!(
+        "Found {} pending analyses to recover",
+        pending_analyses.len()
+    );
 
     // create analysis engine for recovery
     let pool = CacheManager::create_pool().await?;
@@ -142,11 +145,16 @@ async fn recover_pending_analyses(
                 analysis.user_id,
                 analysis.id,
                 channel_locks_clone,
-            ).await {
+            )
+            .await
+            {
                 error!("Failed to recover analysis {}: {}", analysis.id, e);
                 // mark as failed if recovery failed
                 if let Err(mark_err) = user_manager_clone.mark_analysis_failed(analysis.id).await {
-                    error!("Failed to mark recovered analysis {} as failed: {}", analysis.id, mark_err);
+                    error!(
+                        "Failed to mark recovered analysis {} as failed: {}",
+                        analysis.id, mark_err
+                    );
                 }
             }
         });

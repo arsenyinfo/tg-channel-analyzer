@@ -1,9 +1,9 @@
 use grammers_client::{Client, Config};
 use grammers_session::Session;
 use log::{error, info, warn};
+use std::env;
 use std::fs;
 use std::path::Path;
-use std::env;
 
 pub struct SessionManager;
 
@@ -36,9 +36,10 @@ impl SessionManager {
     }
 
     /// validates all sessions by attempting to connect and checking authorization
-    pub async fn validate_sessions() -> Result<ValidationResult, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn validate_sessions(
+    ) -> Result<ValidationResult, Box<dyn std::error::Error + Send + Sync>> {
         let session_files = Self::discover_sessions()?;
-        
+
         if session_files.is_empty() {
             return Ok(ValidationResult::NoSessions);
         }
@@ -68,15 +69,17 @@ impl SessionManager {
         if valid_sessions.is_empty() {
             Ok(ValidationResult::AllInvalid { invalid_sessions })
         } else {
-            Ok(ValidationResult::Success { 
-                valid_sessions, 
-                invalid_sessions 
+            Ok(ValidationResult::Success {
+                valid_sessions,
+                invalid_sessions,
             })
         }
     }
 
     /// validates a single session by attempting to connect and check authorization
-    async fn validate_single_session(session_file: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    async fn validate_single_session(
+        session_file: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         // load session
         let session = match Session::load_file(session_file) {
             Ok(session) => session,
@@ -91,8 +94,7 @@ impl SessionManager {
             .map_err(|_| "TG_API_ID not set in environment")?
             .parse::<i32>()
             .map_err(|_| "TG_API_ID must be a valid integer")?;
-        let api_hash = env::var("TG_API_HASH")
-            .map_err(|_| "TG_API_HASH not set in environment")?;
+        let api_hash = env::var("TG_API_HASH").map_err(|_| "TG_API_HASH not set in environment")?;
 
         // attempt to create client and connect
         let client = Client::connect(Config {
@@ -100,7 +102,8 @@ impl SessionManager {
             api_id,
             api_hash,
             params: Default::default(),
-        }).await;
+        })
+        .await;
 
         match client {
             Ok(client) => {
@@ -131,10 +134,12 @@ impl SessionManager {
 #[derive(Debug)]
 pub enum ValidationResult {
     NoSessions,
-    AllInvalid { invalid_sessions: Vec<String> },
-    Success { 
-        valid_sessions: Vec<String>, 
-        invalid_sessions: Vec<String> 
+    AllInvalid {
+        invalid_sessions: Vec<String>,
+    },
+    Success {
+        valid_sessions: Vec<String>,
+        invalid_sessions: Vec<String>,
     },
 }
 
@@ -143,7 +148,6 @@ impl ValidationResult {
     pub fn is_success(&self) -> bool {
         matches!(self, ValidationResult::Success { .. })
     }
-
 
     /// returns error message for display to user
     pub fn error_message(&self) -> Option<String> {
@@ -165,10 +169,19 @@ impl ValidationResult {
     /// returns success message for display to user
     pub fn success_message(&self) -> Option<String> {
         match self {
-            ValidationResult::Success { valid_sessions, invalid_sessions } => {
-                let mut msg = format!("✅ Session validation successful! {} valid session(s) found.", valid_sessions.len());
+            ValidationResult::Success {
+                valid_sessions,
+                invalid_sessions,
+            } => {
+                let mut msg = format!(
+                    "✅ Session validation successful! {} valid session(s) found.",
+                    valid_sessions.len()
+                );
                 if !invalid_sessions.is_empty() {
-                    msg.push_str(&format!("\n⚠️  {} invalid session(s) will be ignored.", invalid_sessions.len()));
+                    msg.push_str(&format!(
+                        "\n⚠️  {} invalid session(s) will be ignored.",
+                        invalid_sessions.len()
+                    ));
                 }
                 Some(msg)
             }

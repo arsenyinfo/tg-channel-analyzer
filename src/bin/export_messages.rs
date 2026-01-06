@@ -1,6 +1,6 @@
 use grammers_client::{Client, Config, InitParams};
 use grammers_session::Session;
-use log::{error, info};
+use log::info;
 use std::fs;
 
 const CHANNEL: &str = "partially_unsupervised";
@@ -65,7 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // build markdown output (messages are already newest-first from API)
     let mut output = String::new();
     output.push_str(&format!("# Messages from @{}\n\n", CHANNEL));
-    output.push_str(&format!("Showing {} messages (newest first)\n\n", messages.len()));
+    output.push_str(&format!(
+        "Showing {} messages (newest first)\n\n",
+        messages.len()
+    ));
     output.push_str("---\n\n");
 
     for (date, text) in &messages {

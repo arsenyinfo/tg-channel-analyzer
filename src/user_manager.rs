@@ -59,7 +59,7 @@ pub struct User {
 pub struct PendingAnalysis {
     pub id: i32,
     pub user_id: i32,
-    pub telegram_user_id: i64,  // kept for bot notification purposes
+    pub telegram_user_id: i64, // kept for bot notification purposes
     pub channel_name: String,
     pub analysis_type: String,
 }
@@ -99,7 +99,6 @@ impl UserManager {
         }
     }
 
-
     /// gets existing user or creates new user with default credits
     pub async fn get_or_create_user(
         &self,
@@ -134,7 +133,7 @@ impl UserManager {
                 paid_referrals_count: row.get(9),
                 language: row.get(10),
             };
-            
+
             // update language if provided and different from stored
             if let Some(lang) = language_code {
                 if user.language.as_deref() != Some(lang) {
@@ -152,7 +151,7 @@ impl UserManager {
                     }
                 }
             }
-            
+
             info!("Found existing user: {} (credits: {}, language: {:?})", telegram_user_id, user.analysis_credits, user.language);
             return Ok((user, None));
         }
@@ -188,7 +187,10 @@ impl UserManager {
 
         // if user was referred, increment referrer's count and check for rewards
         if let Some(referrer_id) = referrer_user_id {
-            info!("Processing new referral: user {} was referred by user {}", telegram_user_id, referrer_id);
+            info!(
+                "Processing new referral: user {} was referred by user {}",
+                telegram_user_id, referrer_id
+            );
             match self.process_new_referral(referrer_id).await {
                 Ok(Some(reward_info)) => {
                     info!("Referral processing successful for referrer {}: {} referrals, {} milestone credits, {} paid credits, celebration: {}", 
@@ -196,7 +198,10 @@ impl UserManager {
                     return Ok((user, Some(reward_info)));
                 }
                 Ok(None) => {
-                    info!("Referral processed for referrer {} but no rewards or milestones triggered", referrer_id);
+                    info!(
+                        "Referral processed for referrer {} but no rewards or milestones triggered",
+                        referrer_id
+                    );
                 }
                 Err(e) => {
                     error!("Failed to process referral for user {}: {}", referrer_id, e);
@@ -210,30 +215,45 @@ impl UserManager {
     }
 
     /// processes a new referral: increments count and checks for rewards/milestones
-    async fn process_new_referral(&self, referrer_user_id: i32) -> Result<Option<ReferralRewardInfo>, Box<dyn Error + Send + Sync>> {
+    async fn process_new_referral(
+        &self,
+        referrer_user_id: i32,
+    ) -> Result<Option<ReferralRewardInfo>, Box<dyn Error + Send + Sync>> {
         let client = self.pool.get().await?;
-        
+
         // increment referrals count and get new count
-        info!("Incrementing referral count for referrer user {}", referrer_user_id);
+        info!(
+            "Incrementing referral count for referrer user {}",
+            referrer_user_id
+        );
         let row = client
             .query_one(
                 "UPDATE users SET referrals_count = referrals_count + 1 WHERE id = $1 RETURNING referrals_count, telegram_user_id",
                 &[&referrer_user_id],
             )
             .await?;
-        
+
         let new_referral_count: i32 = row.get(0);
         let telegram_user_id: i64 = row.get(1);
-        
-        info!("Successfully incremented referrals count for user {} (telegram_id: {}) to {}", referrer_user_id, telegram_user_id, new_referral_count);
-        
+
+        info!(
+            "Successfully incremented referrals count for user {} (telegram_id: {}) to {}",
+            referrer_user_id, telegram_user_id, new_referral_count
+        );
+
         // check if this is a celebration milestone
         let is_celebration = Self::is_celebration_milestone(new_referral_count);
-        info!("Referral milestone check for user {}: count={}, is_celebration={}", referrer_user_id, new_referral_count, is_celebration);
-        
+        info!(
+            "Referral milestone check for user {}: count={}, is_celebration={}",
+            referrer_user_id, new_referral_count, is_celebration
+        );
+
         // check for credit rewards (every 5 referrals)
         let expected_milestone_rewards = Self::calculate_milestone_rewards(new_referral_count);
-        info!("Expected milestone rewards for {} referrals: {}", new_referral_count, expected_milestone_rewards);
+        info!(
+            "Expected milestone rewards for {} referrals: {}",
+            new_referral_count, expected_milestone_rewards
+        );
         let existing_unpaid_rewards = client
             .query_one(
                 "SELECT COUNT(*) FROM referral_rewards WHERE referrer_user_id = $1 AND reward_type = 'unpaid_milestone'",
@@ -246,10 +266,17 @@ impl UserManager {
         if expected_milestone_rewards > existing_unpaid_rewards {
             let new_rewards = expected_milestone_rewards - existing_unpaid_rewards;
             milestone_rewards = new_rewards;
-            info!("Awarding {} new milestone rewards to user {} (expected: {}, existing: {})", 
-                  new_rewards, referrer_user_id, expected_milestone_rewards, existing_unpaid_rewards);
+            info!(
+                "Awarding {} new milestone rewards to user {} (expected: {}, existing: {})",
+                new_rewards, referrer_user_id, expected_milestone_rewards, existing_unpaid_rewards
+            );
             for i in 0..new_rewards {
-                info!("Awarding milestone reward {} of {} to user {}", i+1, new_rewards, referrer_user_id);
+                info!(
+                    "Awarding milestone reward {} of {} to user {}",
+                    i + 1,
+                    new_rewards,
+                    referrer_user_id
+                );
                 // award 1 credit for milestone
                 client
                     .execute(
@@ -265,12 +292,21 @@ impl UserManager {
                         &[&referrer_user_id],
                     )
                     .await?;
-                info!("Successfully awarded milestone reward {} to user {}", i+1, referrer_user_id);
+                info!(
+                    "Successfully awarded milestone reward {} to user {}",
+                    i + 1,
+                    referrer_user_id
+                );
             }
-            info!("Completed awarding {} milestone rewards to user {}", new_rewards, referrer_user_id);
+            info!(
+                "Completed awarding {} milestone rewards to user {}",
+                new_rewards, referrer_user_id
+            );
         } else {
-            info!("No new milestone rewards for user {} (expected: {}, existing: {})", 
-                  referrer_user_id, expected_milestone_rewards, existing_unpaid_rewards);
+            info!(
+                "No new milestone rewards for user {} (expected: {}, existing: {})",
+                referrer_user_id, expected_milestone_rewards, existing_unpaid_rewards
+            );
         }
 
         // return info if there are rewards or if it's a celebration milestone
@@ -287,15 +323,19 @@ impl UserManager {
                 referral_count: new_referral_count,
             }))
         } else {
-            info!("No reward info to return for user {} (milestone_rewards={}, is_celebration={})", 
-                  referrer_user_id, milestone_rewards, is_celebration);
+            info!(
+                "No reward info to return for user {} (milestone_rewards={}, is_celebration={})",
+                referrer_user_id, milestone_rewards, is_celebration
+            );
             Ok(None)
         }
     }
 
-
     /// marks analysis as failed
-    pub async fn mark_analysis_failed(&self, analysis_id: i32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn mark_analysis_failed(
+        &self,
+        analysis_id: i32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.pool.get().await?;
         client
             .execute(
@@ -325,7 +365,10 @@ impl UserManager {
             .await?
             .get::<_, i32>(0);
 
-        info!("Created pending analysis {} for user {} (channel: {})", analysis_id, user_id, channel_name);
+        info!(
+            "Created pending analysis {} for user {} (channel: {})",
+            analysis_id, user_id, channel_name
+        );
         Ok(analysis_id)
     }
 
@@ -353,15 +396,12 @@ impl UserManager {
             None => {
                 // check if user exists to provide more specific error
                 let user_exists = transaction
-                    .query_opt(
-                        "SELECT 1 FROM users WHERE id = $1",
-                        &[&user_id],
-                    )
+                    .query_opt("SELECT 1 FROM users WHERE id = $1", &[&user_id])
                     .await?
                     .is_some();
-                
+
                 transaction.rollback().await?;
-                
+
                 return if user_exists {
                     Err(UserManagerError::InsufficientCredits(user_id))
                 } else {
@@ -380,12 +420,17 @@ impl UserManager {
 
         transaction.commit().await?;
 
-        info!("Atomically completed analysis {} for user {} (remaining credits: {})", analysis_id, user_id, remaining_credits);
+        info!(
+            "Atomically completed analysis {} for user {} (remaining credits: {})",
+            analysis_id, user_id, remaining_credits
+        );
         Ok(remaining_credits)
     }
 
     /// gets all pending analyses for recovery
-    pub async fn get_pending_analyses(&self) -> Result<Vec<PendingAnalysis>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_pending_analyses(
+        &self,
+    ) -> Result<Vec<PendingAnalysis>, Box<dyn std::error::Error + Send + Sync>> {
         let client = self.pool.get().await?;
         let rows = client
             .query(
@@ -409,7 +454,10 @@ impl UserManager {
             })
             .collect();
 
-        info!("Found {} pending analyses for recovery", pending_analyses.len());
+        info!(
+            "Found {} pending analyses for recovery",
+            pending_analyses.len()
+        );
         Ok(pending_analyses)
     }
 
@@ -447,7 +495,10 @@ impl UserManager {
     }
 
     /// validates that a user ID exists and can be used as a referrer
-    pub async fn validate_referrer(&self, user_id: i32) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    pub async fn validate_referrer(
+        &self,
+        user_id: i32,
+    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
         let client = self.pool.get().await?;
         let row = client
             .query_opt("SELECT 1 FROM users WHERE id = $1", &[&user_id])
@@ -456,9 +507,12 @@ impl UserManager {
     }
 
     /// checks if user qualifies for referral rewards and awards them
-    pub async fn check_and_award_referral_rewards(&self, user_id: i32) -> Result<ReferralRewardInfo, Box<dyn Error + Send + Sync>> {
+    pub async fn check_and_award_referral_rewards(
+        &self,
+        user_id: i32,
+    ) -> Result<ReferralRewardInfo, Box<dyn Error + Send + Sync>> {
         let client = self.pool.get().await?;
-        
+
         // get current referral counts and telegram_user_id
         let row = client
             .query_opt(
@@ -505,7 +559,10 @@ impl UserManager {
                         )
                         .await?;
                 }
-                info!("Awarded {} milestone rewards to user {}", new_rewards, user_id);
+                info!(
+                    "Awarded {} milestone rewards to user {}",
+                    new_rewards, user_id
+                );
             }
 
             // check for paid user rewards
@@ -537,15 +594,26 @@ impl UserManager {
                         )
                         .await?;
                 }
-                info!("Awarded {} paid referral rewards to user {}", new_paid_rewards, user_id);
+                info!(
+                    "Awarded {} paid referral rewards to user {}",
+                    new_paid_rewards, user_id
+                );
             }
 
             Ok(ReferralRewardInfo {
                 milestone_rewards,
                 paid_rewards,
                 total_credits_awarded: milestone_rewards + paid_rewards,
-                referrer_telegram_id: if milestone_rewards > 0 || paid_rewards > 0 { Some(telegram_user_id) } else { None },
-                referrer_user_id: if milestone_rewards > 0 || paid_rewards > 0 { Some(user_id) } else { None },
+                referrer_telegram_id: if milestone_rewards > 0 || paid_rewards > 0 {
+                    Some(telegram_user_id)
+                } else {
+                    None
+                },
+                referrer_user_id: if milestone_rewards > 0 || paid_rewards > 0 {
+                    Some(user_id)
+                } else {
+                    None
+                },
                 is_celebration_milestone: Self::is_celebration_milestone(referrals_count),
                 referral_count: referrals_count,
             })
@@ -563,10 +631,13 @@ impl UserManager {
     }
 
     /// increments paid referrals count when a referred user makes a payment
-    pub async fn record_paid_referral(&self, user_id: i32) -> Result<Option<ReferralRewardInfo>, Box<dyn Error + Send + Sync>> {
+    pub async fn record_paid_referral(
+        &self,
+        user_id: i32,
+    ) -> Result<Option<ReferralRewardInfo>, Box<dyn Error + Send + Sync>> {
         info!("Processing paid referral for user {}", user_id);
         let client = self.pool.get().await?;
-        
+
         // find if this user was referred and update referrer's paid count
         let row = client
             .query_opt(
@@ -577,7 +648,10 @@ impl UserManager {
 
         if let Some(row) = row {
             if let Some(referrer_id) = row.get::<_, Option<i32>>(0) {
-                info!("User {} was referred by user {}, incrementing paid referral count", user_id, referrer_id);
+                info!(
+                    "User {} was referred by user {}, incrementing paid referral count",
+                    user_id, referrer_id
+                );
                 // increment paid referrals count
                 client
                     .execute(
@@ -585,17 +659,26 @@ impl UserManager {
                         &[&referrer_id],
                     )
                     .await?;
-                info!("Successfully incremented paid referral count for referrer {}", referrer_id);
+                info!(
+                    "Successfully incremented paid referral count for referrer {}",
+                    referrer_id
+                );
 
                 // check and award rewards
-                info!("Checking and awarding referral rewards for referrer {}", referrer_id);
+                info!(
+                    "Checking and awarding referral rewards for referrer {}",
+                    referrer_id
+                );
                 let reward_info = self.check_and_award_referral_rewards(referrer_id).await?;
-                
+
                 info!("Recorded paid referral for user {}, referrer {} - rewards: milestone={}, paid={}, total={}", 
                       user_id, referrer_id, reward_info.milestone_rewards, reward_info.paid_rewards, reward_info.total_credits_awarded);
                 return Ok(Some(reward_info));
             } else {
-                info!("User {} was not referred by anyone (referred_by_user_id is NULL)", user_id);
+                info!(
+                    "User {} was not referred by anyone (referred_by_user_id is NULL)",
+                    user_id
+                );
             }
         } else {
             info!("User {} not found in database", user_id);

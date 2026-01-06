@@ -1,6 +1,6 @@
-use log::{error, info, warn};
 use crate::cache::AnalysisResult;
 use crate::llm::{extract_tag, query_llm};
+use log::{error, info, warn};
 
 pub async fn query_and_parse_analysis(
     prompt: &str,

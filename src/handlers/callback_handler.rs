@@ -1,9 +1,14 @@
 use log::{error, info};
 use teloxide::prelude::*;
-use teloxide::types::{CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MaybeInaccessibleMessage};
+use teloxide::types::{
+    CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, MaybeInaccessibleMessage,
+};
 
 use crate::bot::BotContext;
-use crate::handlers::payment_handler::{PaymentHandler, SINGLE_PACKAGE_PRICE, BULK_PACKAGE_PRICE, SINGLE_PACKAGE_AMOUNT, BULK_PACKAGE_AMOUNT};
+use crate::handlers::payment_handler::{
+    PaymentHandler, BULK_PACKAGE_AMOUNT, BULK_PACKAGE_PRICE, SINGLE_PACKAGE_AMOUNT,
+    SINGLE_PACKAGE_PRICE,
+};
 use crate::user_manager::UserManagerError;
 
 pub struct CallbackHandler;
@@ -110,8 +115,10 @@ impl CallbackHandler {
             BULK_PACKAGE_AMOUNT,
             BULK_PACKAGE_PRICE,
             "10 Channel Analyses",
-            &format!("Get 10 analysis credits to analyze any Telegram channels ({} stars discount!)",
-                (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE),
+            &format!(
+                "Get 10 analysis credits to analyze any Telegram channels ({} stars discount!)",
+                (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE
+            ),
         )
         .await?;
 
@@ -134,7 +141,8 @@ impl CallbackHandler {
             let telegram_user_id = query.from.id.0 as i64;
 
             // check if user has credits before starting analysis
-            let user = match ctx.user_manager
+            let user = match ctx
+                .user_manager
                 .get_or_create_user(
                     telegram_user_id,
                     query.from.username.as_deref(),
@@ -148,11 +156,12 @@ impl CallbackHandler {
                 Ok((user, _)) => user,
                 Err(e) => {
                     error!("Failed to get user: {}", e);
-                    ctx.bot.send_message(
-                        Self::get_chat_id(message),
-                        "❌ Failed to check credits. Please try again.",
-                    )
-                    .await?;
+                    ctx.bot
+                        .send_message(
+                            Self::get_chat_id(message),
+                            "❌ Failed to check credits. Please try again.",
+                        )
+                        .await?;
                     return Ok(());
                 }
             };
@@ -162,7 +171,8 @@ impl CallbackHandler {
                 let message_text = "❌ No analysis credits available.\n\n\
                     You need credits to analyze channels. Choose a package below:";
 
-                ctx.bot.send_message(Self::get_chat_id(message), message_text)
+                ctx.bot
+                    .send_message(Self::get_chat_id(message), message_text)
                     .reply_markup(Self::create_payment_keyboard())
                     .await?;
 
@@ -171,18 +181,21 @@ impl CallbackHandler {
             }
 
             // create pending analysis record first
-            let analysis_id = match ctx.user_manager.create_pending_analysis(
-                user.id,
-                &channel_name,
-                &analysis_type,
-            ).await {
+            let analysis_id = match ctx
+                .user_manager
+                .create_pending_analysis(user.id, &channel_name, &analysis_type)
+                .await
+            {
                 Ok(id) => id,
                 Err(e) => {
                     let error_msg = match e {
                         UserManagerError::UserNotFound(_) => "❌ User not found. Please try again.",
                         _ => "❌ Failed to start analysis. Please try again.",
                     };
-                    let _ = ctx.bot.send_message(Self::get_chat_id(message), error_msg).await;
+                    let _ = ctx
+                        .bot
+                        .send_message(Self::get_chat_id(message), error_msg)
+                        .await;
                     ctx.bot.answer_callback_query(&query.id).await?;
                     return Ok(());
                 }
@@ -196,7 +209,8 @@ impl CallbackHandler {
                 analysis_type.to_string(),
                 user,
                 analysis_id,
-            ).await;
+            )
+            .await;
         }
 
         ctx.bot.answer_callback_query(&query.id).await?;
@@ -234,12 +248,17 @@ impl CallbackHandler {
             .await
             {
                 // mark analysis as failed
-                if let Err(mark_err) = user_manager_error_clone.mark_analysis_failed(analysis_id).await {
-                    error!("Failed to mark analysis {} as failed: {}", analysis_id, mark_err);
+                if let Err(mark_err) = user_manager_error_clone
+                    .mark_analysis_failed(analysis_id)
+                    .await
+                {
+                    error!(
+                        "Failed to mark analysis {} as failed: {}",
+                        analysis_id, mark_err
+                    );
                 }
 
-                if let Some(user_error) =
-                    e.downcast_ref::<crate::user_manager::UserManagerError>()
+                if let Some(user_error) = e.downcast_ref::<crate::user_manager::UserManagerError>()
                 {
                     match user_error {
                         crate::user_manager::UserManagerError::InsufficientCredits(user_id) => {
@@ -252,7 +271,10 @@ impl CallbackHandler {
                                 .await;
                         }
                         _ => {
-                            error!("Analysis failed for channel {} (type: {}): {}", channel_name, analysis_type, e);
+                            error!(
+                                "Analysis failed for channel {} (type: {}): {}",
+                                channel_name, analysis_type, e
+                            );
                             error!("User manager error during analysis: {}", user_error);
                             let _ = bot_clone
                                 .send_message(
@@ -264,7 +286,10 @@ impl CallbackHandler {
                     }
                 } else {
                     // Log the full error details
-                    error!("Analysis failed for channel {} (type: {}): {}", channel_name, analysis_type, e);
+                    error!(
+                        "Analysis failed for channel {} (type: {}): {}",
+                        channel_name, analysis_type, e
+                    );
                     error!("Non-user error during analysis: {}", e);
                     // Don't send generic error - it's already handled in perform_single_analysis
                 }

@@ -27,7 +27,7 @@ impl MigrationManager {
             transaction.commit().await?;
             info!("Initial database setup completed");
         }
-        
+
         // check if we need to run any new migrations (always check, even after initial setup)
         let current_version = Self::get_current_version(&mut client).await?;
         if current_version < Self::latest_version() {

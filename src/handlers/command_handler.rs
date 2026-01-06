@@ -3,7 +3,12 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatId, ParseMode};
 
 use crate::bot::{BotContext, Command};
-use crate::handlers::{PaymentHandler, CallbackHandler, payment_handler::{SINGLE_PACKAGE_PRICE, BULK_PACKAGE_PRICE, SINGLE_PACKAGE_AMOUNT, BULK_PACKAGE_AMOUNT}};
+use crate::handlers::{
+    payment_handler::{
+        BULK_PACKAGE_AMOUNT, BULK_PACKAGE_PRICE, SINGLE_PACKAGE_AMOUNT, SINGLE_PACKAGE_PRICE,
+    },
+    CallbackHandler, PaymentHandler,
+};
 
 #[derive(Debug)]
 struct UserInfo<'a> {
@@ -17,25 +22,29 @@ struct UserInfo<'a> {
 pub struct CommandHandler;
 
 impl CommandHandler {
-    pub async fn handle_command(
-        ctx: BotContext,
-        msg: Message,
-        cmd: Command,
-    ) -> ResponseResult<()> {
+    pub async fn handle_command(ctx: BotContext, msg: Message, cmd: Command) -> ResponseResult<()> {
         match cmd {
             Command::Start => {
                 Self::handle_start_command(ctx, msg).await?;
             }
             Command::Buy1 => {
-                Self::handle_buy_command(ctx, msg, SINGLE_PACKAGE_AMOUNT, SINGLE_PACKAGE_PRICE, "1 Channel Analysis", "Get 1 analysis credit to analyze any Telegram channel").await?;
+                Self::handle_buy_command(
+                    ctx,
+                    msg,
+                    SINGLE_PACKAGE_AMOUNT,
+                    SINGLE_PACKAGE_PRICE,
+                    "1 Channel Analysis",
+                    "Get 1 analysis credit to analyze any Telegram channel",
+                )
+                .await?;
             }
             Command::Buy10 => {
                 Self::handle_buy_command(
-                    ctx, 
-                    msg, 
-                    BULK_PACKAGE_AMOUNT, 
-                    BULK_PACKAGE_PRICE, 
-                    "10 Channel Analyses", 
+                    ctx,
+                    msg,
+                    BULK_PACKAGE_AMOUNT,
+                    BULK_PACKAGE_PRICE,
+                    "10 Channel Analyses",
                     &format!("Get 10 analysis credits to analyze any Telegram channels ({} stars discount!)",
                         (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE)
                 ).await?;
@@ -52,14 +61,15 @@ impl CommandHandler {
         let user_info = Self::extract_user_info_from_message(&msg);
 
         // get or create user to check credit balance
-        let (user, maybe_reward_info) = match ctx.user_manager
+        let (user, maybe_reward_info) = match ctx
+            .user_manager
             .get_or_create_user(
-                user_info.telegram_user_id, 
-                user_info.username, 
-                user_info.first_name, 
-                user_info.last_name, 
-                referrer_user_id, 
-                user_info.language_code
+                user_info.telegram_user_id,
+                user_info.username,
+                user_info.first_name,
+                user_info.last_name,
+                referrer_user_id,
+                user_info.language_code,
             )
             .await
         {
@@ -127,29 +137,45 @@ impl CommandHandler {
             username: msg.from.as_ref().and_then(|user| user.username.as_deref()),
             first_name: msg.from.as_ref().map(|user| user.first_name.as_str()),
             last_name: msg.from.as_ref().and_then(|user| user.last_name.as_deref()),
-            language_code: msg.from.as_ref().and_then(|user| user.language_code.as_deref()),
+            language_code: msg
+                .from
+                .as_ref()
+                .and_then(|user| user.language_code.as_deref()),
         }
     }
 
-    async fn send_referral_notifications(ctx: &BotContext, maybe_reward_info: Option<crate::user_manager::ReferralRewardInfo>) {
+    async fn send_referral_notifications(
+        ctx: &BotContext,
+        maybe_reward_info: Option<crate::user_manager::ReferralRewardInfo>,
+    ) {
         if let Some(reward_info) = maybe_reward_info {
-            info!("Received reward info for referral: referral_count={}, milestone_rewards={}, paid_rewards={}, is_celebration={}, referrer_telegram_id={:?}", 
-                  reward_info.referral_count, reward_info.milestone_rewards, reward_info.paid_rewards, 
+            info!("Received reward info for referral: referral_count={}, milestone_rewards={}, paid_rewards={}, is_celebration={}, referrer_telegram_id={:?}",
+                  reward_info.referral_count, reward_info.milestone_rewards, reward_info.paid_rewards,
                   reward_info.is_celebration_milestone, reward_info.referrer_telegram_id);
-            
+
             if let Some(referrer_telegram_id) = reward_info.referrer_telegram_id {
                 let reward_msg = Self::build_referral_message(&reward_info);
 
                 if !reward_msg.is_empty() {
-                    info!("Sending referral notification to telegram user {}: {}", referrer_telegram_id, reward_msg.replace("\n", " "));
-                    match ctx.bot.send_message(
-                        ChatId(referrer_telegram_id), 
-                        reward_msg
-                    )
-                    .parse_mode(ParseMode::Html)
-                    .await {
-                        Ok(_) => info!("Successfully sent referral notification to telegram user {}", referrer_telegram_id),
-                        Err(e) => error!("Failed to send referral notification to telegram user {}: {}", referrer_telegram_id, e)
+                    info!(
+                        "Sending referral notification to telegram user {}: {}",
+                        referrer_telegram_id,
+                        reward_msg.replace("\n", " ")
+                    );
+                    match ctx
+                        .bot
+                        .send_message(ChatId(referrer_telegram_id), reward_msg)
+                        .parse_mode(ParseMode::Html)
+                        .await
+                    {
+                        Ok(_) => info!(
+                            "Successfully sent referral notification to telegram user {}",
+                            referrer_telegram_id
+                        ),
+                        Err(e) => error!(
+                            "Failed to send referral notification to telegram user {}: {}",
+                            referrer_telegram_id, e
+                        ),
                     }
                 } else {
                     info!("No reward message to send (empty message generated)");
@@ -194,7 +220,11 @@ impl CommandHandler {
         }
     }
 
-    async fn send_no_credits_welcome(ctx: &BotContext, msg: &Message, user: &crate::user_manager::User) -> ResponseResult<()> {
+    async fn send_no_credits_welcome(
+        ctx: &BotContext,
+        msg: &Message,
+        user: &crate::user_manager::User,
+    ) -> ResponseResult<()> {
         let referral_info = if user.referrals_count > 0 {
             format!("You have {} referrals! 🎉", user.referrals_count)
         } else {
@@ -229,7 +259,8 @@ impl CommandHandler {
             user.id  // for the share your link
         );
 
-        ctx.bot.send_message(msg.chat.id, intro_text)
+        ctx.bot
+            .send_message(msg.chat.id, intro_text)
             .parse_mode(ParseMode::Html)
             .reply_markup(CallbackHandler::create_payment_keyboard())
             .await?;
@@ -237,7 +268,11 @@ impl CommandHandler {
         Ok(())
     }
 
-    async fn send_credits_available_welcome(ctx: &BotContext, msg: &Message, user: &crate::user_manager::User) -> ResponseResult<()> {
+    async fn send_credits_available_welcome(
+        ctx: &BotContext,
+        msg: &Message,
+        user: &crate::user_manager::User,
+    ) -> ResponseResult<()> {
         let referral_section = Self::build_referral_section(user);
 
         let intro_text = format!(
@@ -258,7 +293,8 @@ impl CommandHandler {
             referral_section
         );
 
-        ctx.bot.send_message(msg.chat.id, intro_text)
+        ctx.bot
+            .send_message(msg.chat.id, intro_text)
             .parse_mode(ParseMode::Html)
             .await?;
 
@@ -288,7 +324,13 @@ impl CommandHandler {
                 • Get credits at milestones: 1, 5, 10, 20, 30...\n\
                 • Get 1 credit for each paid referral\n\n\
                 Great job on your {} referrals! 🎉",
-                user.analysis_credits, user.total_analyses_performed, user.referrals_count, user.paid_referrals_count, referrals_to_next, user.id, user.referrals_count
+                user.analysis_credits,
+                user.total_analyses_performed,
+                user.referrals_count,
+                user.paid_referrals_count,
+                referrals_to_next,
+                user.id,
+                user.referrals_count
             )
         } else {
             format!(

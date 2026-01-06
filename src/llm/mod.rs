@@ -167,7 +167,6 @@ pub fn calculate_delay(attempt: u32) -> Duration {
     Duration::from_millis(base_delay + jitter)
 }
 
-
 // image description functionality with rate limiting (2 req/sec)
 #[allow(dead_code)]
 pub struct ImageDescriptionRateLimiter {
@@ -192,7 +191,10 @@ impl ImageDescriptionRateLimiter {
             let elapsed = last_instant.elapsed();
             if elapsed < self.min_interval {
                 let wait_time = self.min_interval - elapsed;
-                info!("Image description rate limiter: waiting for {:?}", wait_time);
+                info!(
+                    "Image description rate limiter: waiting for {:?}",
+                    wait_time
+                );
                 sleep(wait_time).await;
             }
         }
@@ -237,14 +239,14 @@ impl std::error::Error for ImageProcessingError {}
 async fn resize_image_data(image_data: &[u8]) -> Result<Vec<u8>, ImageProcessingError> {
     let img = image::load_from_memory(image_data)
         .map_err(|e| ImageProcessingError::Resize(format!("Failed to load image: {}", e)))?;
-    
+
     let (width, height) = img.dimensions();
-    
+
     // check if resizing is needed
     if width <= 512 && height <= 512 {
         return Ok(image_data.to_vec());
     }
-    
+
     // calculate new dimensions maintaining aspect ratio
     let (new_width, new_height) = if width > height {
         let scale = 512.0 / width as f32;
@@ -253,17 +255,23 @@ async fn resize_image_data(image_data: &[u8]) -> Result<Vec<u8>, ImageProcessing
         let scale = 512.0 / height as f32;
         ((width as f32 * scale) as u32, 512)
     };
-    
-    info!("Resizing image from {}x{} to {}x{}", width, height, new_width, new_height);
-    
+
+    info!(
+        "Resizing image from {}x{} to {}x{}",
+        width, height, new_width, new_height
+    );
+
     let resized = img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
-    
+
     let mut output = Vec::new();
     let mut cursor = Cursor::new(&mut output);
-    
-    resized.write_to(&mut cursor, ImageFormat::Jpeg)
-        .map_err(|e| ImageProcessingError::Resize(format!("Failed to encode resized image: {}", e)))?;
-    
+
+    resized
+        .write_to(&mut cursor, ImageFormat::Jpeg)
+        .map_err(|e| {
+            ImageProcessingError::Resize(format!("Failed to encode resized image: {}", e))
+        })?;
+
     Ok(output)
 }
 
@@ -271,26 +279,28 @@ async fn resize_image_data(image_data: &[u8]) -> Result<Vec<u8>, ImageProcessing
 #[allow(dead_code)]
 async fn download_image(client: &Client, url: &str) -> Result<Vec<u8>, ImageProcessingError> {
     info!("Downloading image from: {}", url);
-    
+
     let response = client
         .get(url)
         .send()
         .await
         .map_err(|e| ImageProcessingError::Download(format!("Failed to fetch image: {}", e)))?;
-    
+
     if !response.status().is_success() {
         return Err(ImageProcessingError::Download(format!(
             "HTTP error {}: {}",
             response.status(),
-            response.status().canonical_reason().unwrap_or("Unknown error")
+            response
+                .status()
+                .canonical_reason()
+                .unwrap_or("Unknown error")
         )));
     }
-    
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| ImageProcessingError::Download(format!("Failed to read image bytes: {}", e)))?;
-    
+
+    let bytes = response.bytes().await.map_err(|e| {
+        ImageProcessingError::Download(format!("Failed to read image bytes: {}", e))
+    })?;
+
     Ok(bytes.to_vec())
 }
 
@@ -302,14 +312,14 @@ async fn describe_single_image(
 ) -> Result<String, ImageProcessingError> {
     // apply rate limiting
     get_image_rate_limiter().wait_for_next_request().await;
-    
+
     // download and resize image
     let image_data = download_image(client, image_url).await?;
     let resized_data = resize_image_data(&image_data).await?;
-    
+
     // encode to base64
     let base64_image = general_purpose::STANDARD.encode(&resized_data);
-    
+
     // prepare request payload for Gemini API
     let payload = json!({
         "contents": [{
@@ -330,17 +340,17 @@ async fn describe_single_image(
             "maxOutputTokens": 100
         }
     });
-    
+
     // get API key from environment
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|_| ImageProcessingError::ApiCall("GEMINI_API_KEY not set".to_string()))?;
-    
+
     // make API call to Gemini
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite-preview-06-17:generateContent?key={}",
         api_key
     );
-    
+
     let response = client
         .post(&url)
         .header("Content-Type", "application/json")
@@ -348,22 +358,20 @@ async fn describe_single_image(
         .send()
         .await
         .map_err(|e| ImageProcessingError::ApiCall(format!("API request failed: {}", e)))?;
-    
+
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
         return Err(ImageProcessingError::ApiCall(format!(
             "API error {}: {}",
-            status,
-            error_text
+            status, error_text
         )));
     }
-    
-    let response_json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| ImageProcessingError::ApiCall(format!("Failed to parse JSON response: {}", e)))?;
-    
+
+    let response_json: serde_json::Value = response.json().await.map_err(|e| {
+        ImageProcessingError::ApiCall(format!("Failed to parse JSON response: {}", e))
+    })?;
+
     // extract description from response
     let description = response_json
         .get("candidates")
@@ -376,7 +384,7 @@ async fn describe_single_image(
         .unwrap_or("No description available")
         .trim()
         .to_string();
-    
+
     info!("Generated description for image: {}", description);
     Ok(description)
 }
@@ -389,22 +397,26 @@ pub async fn describe_images_with_gemini(
     let Some(image_urls) = &message.images else {
         return Ok(vec![]);
     };
-    
+
     if image_urls.is_empty() {
         return Ok(vec![]);
     }
-    
+
     info!("Describing {} images from message", image_urls.len());
-    
+
     let client = Client::new();
     let mut descriptions = Vec::new();
     let mut errors = Vec::new();
-    
+
     for (i, url) in image_urls.iter().enumerate() {
         match describe_single_image(&client, url).await {
             Ok(description) => {
                 descriptions.push(description);
-                info!("Successfully described image {} of {}", i + 1, image_urls.len());
+                info!(
+                    "Successfully described image {} of {}",
+                    i + 1,
+                    image_urls.len()
+                );
             }
             Err(e) => {
                 let error_msg = format!("Failed to describe image {}: {}", i + 1, e);
@@ -414,7 +426,7 @@ pub async fn describe_images_with_gemini(
             }
         }
     }
-    
+
     // log summary
     if !errors.is_empty() {
         warn!(
@@ -425,6 +437,6 @@ pub async fn describe_images_with_gemini(
     } else {
         info!("Successfully described all {} images", descriptions.len());
     }
-    
+
     Ok(descriptions)
 }

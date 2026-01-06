@@ -1,19 +1,32 @@
 // Integration tests for referral system
 mod integration;
 
-use integration::{TestDatabase, mock_bot::MockTelegramBot, test_utils::{TestAssertions, TestScenario}};
+use integration::{
+    mock_bot::MockTelegramBot,
+    test_utils::{TestAssertions, TestScenario},
+    TestDatabase,
+};
 use tg_main::user_manager::UserManager;
 
 #[tokio::test]
 async fn test_basic_referral_chain() {
-    let db = TestDatabase::create_fresh().await.expect("Failed to create test database");
+    let db = TestDatabase::create_fresh()
+        .await
+        .expect("Failed to create test database");
     let user_manager = UserManager::new(db.pool.clone());
     let bot = MockTelegramBot::new();
 
     // create referrer user
     let referrer_telegram_id = 100;
     let (referrer, _) = bot
-        .simulate_user_start(&user_manager, referrer_telegram_id, Some("referrer"), Some("Referrer"), Some("User"), None)
+        .simulate_user_start(
+            &user_manager,
+            referrer_telegram_id,
+            Some("referrer"),
+            Some("Referrer"),
+            Some("User"),
+            None,
+        )
         .await
         .expect("Failed to create referrer");
 
@@ -59,7 +72,7 @@ async fn test_basic_referral_chain() {
     TestAssertions::assert_user_referral_count(&db, referrer.id, 5)
         .await
         .expect("Referral count assertion failed");
-    
+
     TestAssertions::assert_user_credit_count(&db, referrer.id, 2) // 1 initial + 1 from milestone
         .await
         .expect("Credit count assertion failed");
@@ -72,21 +85,30 @@ async fn test_basic_referral_chain() {
     assert!(bot.message_count_for_chat(referrer_telegram_id) >= 3); // welcome + celebration for 1st + reward for 5th
     assert!(bot.chat_received_message_containing(referrer_telegram_id, "🎊 Referral Milestone"));
     assert!(bot.chat_received_message_containing(referrer_telegram_id, "🎉 Referral Milestone"));
-    
+
     // cleanup test database
     db.cleanup().await.expect("Failed to cleanup test database");
 }
 
 #[tokio::test]
 async fn test_milestone_celebrations() {
-    let db = TestDatabase::create_fresh().await.expect("Failed to create test database");
+    let db = TestDatabase::create_fresh()
+        .await
+        .expect("Failed to create test database");
     let user_manager = UserManager::new(db.pool.clone());
     let bot = MockTelegramBot::new();
 
     // create referrer
     let referrer_telegram_id = 200;
     let (referrer, _) = bot
-        .simulate_user_start(&user_manager, referrer_telegram_id, Some("referrer"), Some("Referrer"), None, None)
+        .simulate_user_start(
+            &user_manager,
+            referrer_telegram_id,
+            Some("referrer"),
+            Some("Referrer"),
+            None,
+            None,
+        )
         .await
         .expect("Failed to create referrer");
 
@@ -97,7 +119,7 @@ async fn test_milestone_celebrations() {
     for i in 1..=30 {
         let referee_telegram_id = referrer_telegram_id + i;
         bot.clear_messages(); // clear previous messages to check only current referral notifications
-        
+
         let (_, reward_info) = bot
             .simulate_user_start(
                 &user_manager,
@@ -115,33 +137,60 @@ async fn test_milestone_celebrations() {
         let should_get_credits = credit_milestones.contains(&i);
 
         if should_celebrate || should_get_credits {
-            assert!(reward_info.is_some(), "Expected reward info for referral {}", i);
+            assert!(
+                reward_info.is_some(),
+                "Expected reward info for referral {}",
+                i
+            );
             let reward = reward_info.unwrap();
             assert_eq!(reward.referral_count, i as i32);
             assert_eq!(reward.is_celebration_milestone, should_celebrate);
-            
+
             if should_get_credits {
                 let _expected_credits = i as i32 / 5; // credits = referral_count / 5
-                assert_eq!(reward.milestone_rewards, 1, "Expected 1 new credit at referral {}", i);
+                assert_eq!(
+                    reward.milestone_rewards, 1,
+                    "Expected 1 new credit at referral {}",
+                    i
+                );
             } else {
-                assert_eq!(reward.milestone_rewards, 0, "Expected no credits at referral {}", i);
+                assert_eq!(
+                    reward.milestone_rewards, 0,
+                    "Expected no credits at referral {}",
+                    i
+                );
             }
 
             // verify notification was sent to referrer
             let referrer_messages = bot.get_messages_for_chat(referrer_telegram_id);
-            assert!(!referrer_messages.is_empty(), "Expected notification for referral {}", i);
-            
+            assert!(
+                !referrer_messages.is_empty(),
+                "Expected notification for referral {}",
+                i
+            );
+
             if should_celebrate && should_get_credits {
-                assert!(bot.chat_received_message_containing(referrer_telegram_id, "🎉 Referral Milestone"));
+                assert!(bot.chat_received_message_containing(
+                    referrer_telegram_id,
+                    "🎉 Referral Milestone"
+                ));
                 assert!(bot.chat_received_message_containing(referrer_telegram_id, "earned"));
             } else if should_get_credits {
-                assert!(bot.chat_received_message_containing(referrer_telegram_id, "🎉 Referral Reward"));
+                assert!(bot
+                    .chat_received_message_containing(referrer_telegram_id, "🎉 Referral Reward"));
             } else if should_celebrate {
-                assert!(bot.chat_received_message_containing(referrer_telegram_id, "🎊 Referral Milestone"));
+                assert!(bot.chat_received_message_containing(
+                    referrer_telegram_id,
+                    "🎊 Referral Milestone"
+                ));
             }
         } else {
             // no rewards or celebrations expected
-            assert!(reward_info.is_none() || (reward_info.as_ref().unwrap().total_credits_awarded == 0 && !reward_info.unwrap().is_celebration_milestone));
+            assert!(
+                reward_info.is_none()
+                    || (reward_info.as_ref().unwrap().total_credits_awarded == 0
+                        && !reward_info.unwrap().is_celebration_milestone)
+            );
         }
     }
 
@@ -149,7 +198,7 @@ async fn test_milestone_celebrations() {
     TestAssertions::assert_user_referral_count(&db, referrer.id, 30)
         .await
         .expect("Final referral count assertion failed");
-    
+
     TestAssertions::assert_user_credit_count(&db, referrer.id, 7) // 1 initial + 6 milestone credits (30/5)
         .await
         .expect("Final credit count assertion failed");
@@ -157,21 +206,30 @@ async fn test_milestone_celebrations() {
     TestAssertions::assert_referral_reward_count(&db, referrer.id, "unpaid_milestone", 6)
         .await
         .expect("Final milestone reward count assertion failed");
-    
+
     // cleanup test database
     db.cleanup().await.expect("Failed to cleanup test database");
 }
 
 #[tokio::test]
 async fn test_paid_referral_rewards() {
-    let db = TestDatabase::create_fresh().await.expect("Failed to create test database");
+    let db = TestDatabase::create_fresh()
+        .await
+        .expect("Failed to create test database");
     let user_manager = UserManager::new(db.pool.clone());
     let bot = MockTelegramBot::new();
 
     // create referrer
     let referrer_telegram_id = 300;
     let (referrer, _) = bot
-        .simulate_user_start(&user_manager, referrer_telegram_id, Some("referrer"), Some("Referrer"), None, None)
+        .simulate_user_start(
+            &user_manager,
+            referrer_telegram_id,
+            Some("referrer"),
+            Some("Referrer"),
+            None,
+            None,
+        )
         .await
         .expect("Failed to create referrer");
 
@@ -221,24 +279,29 @@ async fn test_paid_referral_rewards() {
     // verify notification was sent to referrer
     assert!(bot.chat_received_message_containing(referrer_telegram_id, "🎉 Referral Reward"));
     assert!(bot.chat_received_message_containing(referrer_telegram_id, "paid referral"));
-    
+
     // cleanup test database
     db.cleanup().await.expect("Failed to cleanup test database");
 }
 
 #[tokio::test]
 async fn test_mixed_paid_and_unpaid_referrals() {
-    let db = TestDatabase::create_fresh().await.expect("Failed to create test database");
+    let db = TestDatabase::create_fresh()
+        .await
+        .expect("Failed to create test database");
     let user_manager = UserManager::new(db.pool.clone());
     let _bot = MockTelegramBot::new();
 
     // create referrer with 4 unpaid referrals and 1 paid referral
-    let (referrer, unpaid_referrals, paid_referrals) = TestScenario::create_referrer_with_mixed_referrals(
-        &user_manager,
-        400,
-        4, // unpaid
-        1, // paid
-    ).await.expect("Failed to create mixed referral scenario");
+    let (referrer, unpaid_referrals, paid_referrals) =
+        TestScenario::create_referrer_with_mixed_referrals(
+            &user_manager,
+            400,
+            4, // unpaid
+            1, // paid
+        )
+        .await
+        .expect("Failed to create mixed referral scenario");
 
     // verify counts
     TestAssertions::assert_user_referral_count(&db, referrer.id, 5) // 4 unpaid + 1 paid
@@ -274,14 +337,16 @@ async fn test_mixed_paid_and_unpaid_referrals() {
             .await
             .expect("Paid referral attribution assertion failed");
     }
-    
+
     // cleanup test database
     db.cleanup().await.expect("Failed to cleanup test database");
 }
 
 #[tokio::test]
 async fn test_database_consistency() {
-    let db = TestDatabase::create_fresh().await.expect("Failed to create test database");
+    let db = TestDatabase::create_fresh()
+        .await
+        .expect("Failed to create test database");
     let user_manager = UserManager::new(db.pool.clone());
 
     // create a comprehensive scenario
@@ -290,7 +355,9 @@ async fn test_database_consistency() {
         700,
         15, // unpaid (should give 3 milestone credits: 5, 10, 15)
         2,  // paid (should give 2 paid credits)
-    ).await.expect("Failed to create comprehensive scenario");
+    )
+    .await
+    .expect("Failed to create comprehensive scenario");
 
     // verify all database tables are consistent
     let client = db.pool.get().await.expect("Failed to get database client");
@@ -300,11 +367,11 @@ async fn test_database_consistency() {
         .query_one("SELECT referrals_count, paid_referrals_count, analysis_credits FROM users WHERE id = $1", &[&referrer.id])
         .await
         .expect("Failed to query user");
-    
+
     let total_referrals: i32 = user_row.get(0);
     let paid_referrals: i32 = user_row.get(1);
     let credits: i32 = user_row.get(2);
-    
+
     assert_eq!(total_referrals, 17); // 15 unpaid + 2 paid
     assert_eq!(paid_referrals, 2);
     assert_eq!(credits, 6); // 1 initial + 3 milestone + 2 paid
@@ -317,7 +384,7 @@ async fn test_database_consistency() {
         )
         .await
         .expect("Failed to query milestone rewards");
-    
+
     let milestone_count: i64 = milestone_rewards.get(0);
     assert_eq!(milestone_count, 3); // rewards at 5, 10, 15
 
@@ -328,7 +395,7 @@ async fn test_database_consistency() {
         )
         .await
         .expect("Failed to query paid rewards");
-    
+
     let paid_count: i64 = paid_rewards.get(0);
     assert_eq!(paid_count, 2); // 2 paid referrals
 
@@ -336,14 +403,14 @@ async fn test_database_consistency() {
     let referred_users = client
         .query(
             "SELECT COUNT(*) FROM users WHERE referred_by_user_id = $1",
-            &[&referrer.id]
+            &[&referrer.id],
         )
         .await
         .expect("Failed to query referred users");
-    
+
     let referred_count: i64 = referred_users[0].get(0);
     assert_eq!(referred_count, 17); // all 17 referrals should be in database
-    
+
     // cleanup test database
     db.cleanup().await.expect("Failed to cleanup test database");
 }

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tg_main::user_manager::{UserManager, ReferralRewardInfo};
+use tg_main::user_manager::{ReferralRewardInfo, UserManager};
 
 /// represents a sent message for verification in tests
 #[derive(Debug, Clone)]
@@ -34,9 +34,9 @@ impl MockTelegramBot {
             text: text.clone(),
             parse_mode,
         };
-        
+
         self.sent_messages.lock().unwrap().push(message);
-        
+
         // track user interaction
         self.user_interactions
             .lock()
@@ -89,7 +89,10 @@ impl MockTelegramBot {
         first_name: Option<&str>,
         last_name: Option<&str>,
         referrer_user_id: Option<i32>,
-    ) -> Result<(tg_main::user_manager::User, Option<ReferralRewardInfo>), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        (tg_main::user_manager::User, Option<ReferralRewardInfo>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         // simulate /start command processing with referrer validation (like real bot)
         let validated_referrer = if let Some(referrer_id) = referrer_user_id {
             match user_manager.validate_referrer(referrer_id).await {
@@ -99,9 +102,15 @@ impl MockTelegramBot {
         } else {
             None
         };
-        
+
         let (user, reward_info) = user_manager
-            .get_or_create_user(telegram_user_id, username, first_name, last_name, validated_referrer)
+            .get_or_create_user(
+                telegram_user_id,
+                username,
+                first_name,
+                last_name,
+                validated_referrer,
+            )
             .await?;
 
         // simulate sending welcome message
@@ -110,13 +119,15 @@ impl MockTelegramBot {
         } else {
             "Welcome! You need to buy credits".to_string()
         };
-        
+
         self.send_message(telegram_user_id, welcome_msg, Some("Html".to_string()));
 
         // simulate referral notification if applicable
         if let Some(reward_info) = &reward_info {
             if let Some(referrer_telegram_id) = reward_info.referrer_telegram_id {
-                let reward_msg = if reward_info.total_credits_awarded > 0 && reward_info.is_celebration_milestone {
+                let reward_msg = if reward_info.total_credits_awarded > 0
+                    && reward_info.is_celebration_milestone
+                {
                     format!(
                         "🎉 Referral Milestone! You've reached {} referrals and earned {} credit(s)!",
                         reward_info.referral_count, reward_info.total_credits_awarded
@@ -153,7 +164,7 @@ impl MockTelegramBot {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // add credits to user
         let new_balance = user_manager.add_credits(telegram_user_id, credits).await?;
-        
+
         // simulate payment success message
         let success_msg = format!(
             "🎉 Payment Successful! Added {} credits. New balance: {}",
@@ -164,7 +175,9 @@ impl MockTelegramBot {
         // process referral rewards for paid user
         if let Some(reward_info) = user_manager.record_paid_referral(telegram_user_id).await? {
             if let Some(referrer_telegram_id) = reward_info.referrer_telegram_id {
-                let reward_msg = if reward_info.paid_rewards > 0 && reward_info.milestone_rewards > 0 {
+                let reward_msg = if reward_info.paid_rewards > 0
+                    && reward_info.milestone_rewards > 0
+                {
                     format!(
                         "🎉 Referral Rewards! You've earned {} credits: {} for paid referral + {} for milestone bonus",
                         reward_info.total_credits_awarded, reward_info.paid_rewards, reward_info.milestone_rewards
@@ -200,11 +213,11 @@ mod tests {
     #[tokio::test]
     async fn test_mock_bot_basic_functionality() {
         let bot = MockTelegramBot::new();
-        
+
         // test sending messages
         bot.send_message(123, "Hello".to_string(), None);
         bot.send_message(456, "World".to_string(), Some("Html".to_string()));
-        
+
         // verify messages were stored
         let messages = bot.get_sent_messages();
         assert_eq!(messages.len(), 2);
@@ -213,16 +226,16 @@ mod tests {
         assert_eq!(messages[1].chat_id, 456);
         assert_eq!(messages[1].text, "World");
         assert_eq!(messages[1].parse_mode, Some("Html".to_string()));
-        
+
         // test chat-specific filtering
         let chat_123_messages = bot.get_messages_for_chat(123);
         assert_eq!(chat_123_messages.len(), 1);
         assert_eq!(chat_123_messages[0].text, "Hello");
-        
+
         // test message search
         assert!(bot.chat_received_message_containing(123, "Hello"));
         assert!(!bot.chat_received_message_containing(123, "World"));
-        
+
         // test clearing
         bot.clear_messages();
         assert_eq!(bot.get_sent_messages().len(), 0);

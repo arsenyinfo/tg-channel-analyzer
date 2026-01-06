@@ -30,7 +30,6 @@ impl Default for BackendConfig {
     }
 }
 
-
 #[derive(Debug)]
 pub struct BackendRateLimiter {
     api_last_call: Option<Instant>,
@@ -84,9 +83,10 @@ impl BackendRateLimiter {
     pub async fn wait_for_backend(&mut self, backend: BackendType) {
         if let Some(wait_time) = self.time_until_available(backend) {
             // add jitter to avoid thundering herd
-            let jitter = Duration::from_millis(fastrand::u64(0..=wait_time.as_millis() as u64 / 10));
+            let jitter =
+                Duration::from_millis(fastrand::u64(0..=wait_time.as_millis() as u64 / 10));
             let total_wait = wait_time + jitter;
-            
+
             info!(
                 "Rate limiting {}: waiting {}ms (with {}ms jitter)",
                 backend.name(),

@@ -96,26 +96,32 @@ impl MessageFormatter {
 
         let mut chunks = Vec::new();
         let mut current_chunk = String::new();
-        
+
         // split by lines to avoid breaking in the middle of formatting
         for line in text.lines() {
             let line_with_newline = format!("{}\n", line);
-            
+
             // if adding this line would exceed the limit, finalize current chunk
-            if Self::count_utf16_code_units(&current_chunk) + Self::count_utf16_code_units(&line_with_newline) > max_length {
+            if Self::count_utf16_code_units(&current_chunk)
+                + Self::count_utf16_code_units(&line_with_newline)
+                > max_length
+            {
                 if !current_chunk.is_empty() {
                     chunks.push(current_chunk.trim_end().to_string());
                     current_chunk.clear();
                 }
-                
+
                 // if single line is too long, split it at word boundaries
                 if Self::count_utf16_code_units(&line_with_newline) > max_length {
                     let words: Vec<&str> = line.split_whitespace().collect();
                     let mut word_chunk = String::new();
-                    
+
                     for word in words {
                         let word_with_space = format!("{} ", word);
-                        if Self::count_utf16_code_units(&word_chunk) + Self::count_utf16_code_units(&word_with_space) > max_length {
+                        if Self::count_utf16_code_units(&word_chunk)
+                            + Self::count_utf16_code_units(&word_with_space)
+                            > max_length
+                        {
                             if !word_chunk.is_empty() {
                                 chunks.push(word_chunk.trim_end().to_string());
                                 word_chunk.clear();
@@ -123,7 +129,7 @@ impl MessageFormatter {
                         }
                         word_chunk.push_str(&word_with_space);
                     }
-                    
+
                     if !word_chunk.is_empty() {
                         current_chunk = word_chunk.trim_end().to_string();
                     }
@@ -134,11 +140,11 @@ impl MessageFormatter {
                 current_chunk.push_str(&line_with_newline);
             }
         }
-        
+
         if !current_chunk.is_empty() {
             chunks.push(current_chunk.trim_end().to_string());
         }
-        
+
         chunks
     }
 }

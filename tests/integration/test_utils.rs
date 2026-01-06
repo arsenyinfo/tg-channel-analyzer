@@ -1,5 +1,5 @@
-use tg_main::user_manager::{UserManager, User};
 use super::TestDatabase;
+use tg_main::user_manager::{User, UserManager};
 
 /// helper struct for creating test users with predictable IDs
 pub struct TestUserBuilder {
@@ -69,7 +69,7 @@ impl TestAssertions {
                 &[&user_id],
             )
             .await?;
-        
+
         let actual_count: i32 = row.get(0);
         assert_eq!(
             actual_count, expected_count,
@@ -92,7 +92,7 @@ impl TestAssertions {
                 &[&user_id],
             )
             .await?;
-        
+
         let actual_credits: i32 = row.get(0);
         assert_eq!(
             actual_credits, expected_credits,
@@ -116,7 +116,7 @@ impl TestAssertions {
                 &[&referrer_user_id, &reward_type],
             )
             .await?;
-        
+
         let actual_count: i64 = row.get(0);
         assert_eq!(
             actual_count as i32, expected_count,
@@ -139,7 +139,7 @@ impl TestAssertions {
                 &[&user_id],
             )
             .await?;
-        
+
         let actual_referrer_id: Option<i32> = row.get(0);
         assert_eq!(
             actual_referrer_id, expected_referrer_id,
@@ -162,7 +162,7 @@ impl TestAssertions {
                 &[&user_id],
             )
             .await?;
-        
+
         let actual_count: i32 = row.get(0);
         assert_eq!(
             actual_count, expected_count,
@@ -244,11 +244,15 @@ impl TestScenario {
                 .first_name(&format!("PaidReferral{}", i))
                 .create(user_manager, Some(referrer.id))
                 .await?;
-            
+
             // simulate payment by this referral
-            user_manager.add_credits(referral.telegram_user_id, 1).await?;
-            user_manager.record_paid_referral(referral.telegram_user_id).await?;
-            
+            user_manager
+                .add_credits(referral.telegram_user_id, 1)
+                .await?;
+            user_manager
+                .record_paid_referral(referral.telegram_user_id)
+                .await?;
+
             paid_referrals.push(referral);
         }
 
@@ -263,7 +267,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_user_builder() {
-        let db = TestDatabase::create_fresh().await.expect("Failed to create test database");
+        let db = TestDatabase::create_fresh()
+            .await
+            .expect("Failed to create test database");
         let user_manager = UserManager::new(db.pool.clone());
 
         let user = TestUserBuilder::new(12345)
@@ -278,14 +284,16 @@ mod tests {
         assert_eq!(user.username, Some("testuser".to_string()));
         assert_eq!(user.first_name, Some("Test".to_string()));
         assert_eq!(user.last_name, Some("User".to_string()));
-        
+
         // cleanup test database
         db.cleanup().await.expect("Failed to cleanup test database");
     }
 
     #[tokio::test]
     async fn test_assertions() {
-        let db = TestDatabase::create_fresh().await.expect("Failed to create test database");
+        let db = TestDatabase::create_fresh()
+            .await
+            .expect("Failed to create test database");
         let user_manager = UserManager::new(db.pool.clone());
 
         let user = TestUserBuilder::new(12345)
@@ -302,7 +310,7 @@ mod tests {
         TestAssertions::assert_user_referral_count(&db, user.id, 0)
             .await
             .expect("Referral count assertion failed");
-            
+
         // cleanup test database
         db.cleanup().await.expect("Failed to cleanup test database");
     }

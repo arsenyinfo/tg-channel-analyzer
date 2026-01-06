@@ -13,14 +13,14 @@ fn sanitize_phone_number(phone: &str) -> String {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // load .env file if it exists
     let _ = dotenvy::dotenv();
-    
+
     let api_id = env::var("TG_API_ID")
         .map_err(|_| "TG_API_ID environment variable is required")?
         .parse::<i32>()
         .map_err(|_| "TG_API_ID must be a valid integer")?;
 
-    let api_hash = env::var("TG_API_HASH")
-        .map_err(|_| "TG_API_HASH environment variable is required")?;
+    let api_hash =
+        env::var("TG_API_HASH").map_err(|_| "TG_API_HASH environment variable is required")?;
 
     println!("Connecting to Telegram...");
 
@@ -29,15 +29,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut phone = String::new();
     io::stdin().read_line(&mut phone)?;
     let phone = phone.trim();
-    
+
     // sanitize phone number for filename
     let phone_digits = sanitize_phone_number(phone);
-    
+
     // get current directory and create absolute paths
     let current_dir = env::current_dir()?;
     let sessions_dir = current_dir.join("sessions");
     let session_path = sessions_dir.join(format!("{}.session", phone_digits));
-    
+
     // ensure sessions directory exists
     if !sessions_dir.exists() {
         println!("Creating sessions directory...");
@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("You are not authorized. Let's do that now.");
 
         let token = client.request_login_code(phone).await?;
-        
+
         print!("Enter the code you received: ");
         io::stdout().flush()?;
         let mut code = String::new();
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut password = String::new();
                 io::stdin().read_line(&mut password)?;
                 let password = password.trim();
-                
+
                 client.check_password(password_token, password).await?;
                 println!("Authorization successful!");
             }
@@ -97,8 +97,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // save the session
-    match client.session().save_to_file(session_path.to_str().unwrap()) {
-        Ok(_) => println!("Session saved successfully to {} for phone number {}", session_path.display(), phone),
+    match client
+        .session()
+        .save_to_file(session_path.to_str().unwrap())
+    {
+        Ok(_) => println!(
+            "Session saved successfully to {} for phone number {}",
+            session_path.display(),
+            phone
+        ),
         Err(e) => {
             eprintln!("Failed to save session: {}", e);
             eprintln!("This might be a permissions issue or the grammers library version issue.");
