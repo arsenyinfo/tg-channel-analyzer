@@ -530,7 +530,7 @@ impl AnalysisEngine {
                         }
 
                         current_messages.push(MessageDict {
-                            date: Some(message.date().to_rfc2822()),
+                            date: Some(message.date().format("%Y-%m-%d").to_string()),
                             message: Some(message.text().to_string()),
                             images: None, // Telegram API messages don't include images in this context
                         });

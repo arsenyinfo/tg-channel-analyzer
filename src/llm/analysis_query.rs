@@ -115,12 +115,12 @@ pub async fn query_and_parse_analysis(
         }
     }
 
-    // try gemini-2.5-pro as fallback
-    info!("Falling back to gemini-2.5-pro");
-    match try_model_with_content_retries(prompt, "gemini-2.5-pro", 2, 2).await {
+    // try gemini-2.5-flash as fallback (much cheaper than pro)
+    info!("Falling back to gemini-2.5-flash");
+    match try_model_with_content_retries(prompt, "gemini-2.5-flash", 2, 2).await {
         Ok(result) => Ok(result),
         Err(e) => {
-            error!("Gemini Pro fallback also failed: {}", e);
+            error!("Gemini Flash fallback also failed: {}", e);
             Err(e)
         }
     }
