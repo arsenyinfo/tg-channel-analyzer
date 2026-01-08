@@ -13,7 +13,7 @@ use crate::handlers::{
     payment_handler::{BULK_PACKAGE_AMOUNT, BULK_PACKAGE_PRICE, SINGLE_PACKAGE_PRICE},
     CallbackHandler, CommandHandler, PaymentHandler,
 };
-use crate::user_manager::UserManager;
+use crate::user_manager::{UserManager, UserManagerError};
 use crate::utils::MessageFormatter;
 use deadpool_postgres::Pool;
 
@@ -513,10 +513,20 @@ impl TelegramBot {
         {
             Ok(credits) => credits,
             Err(e) => {
-                error!(
-                    "Failed to atomically complete analysis {}: {}",
-                    analysis_id, e
-                );
+                match &e {
+                    UserManagerError::InsufficientCredits(user_id) => {
+                        info!(
+                            "Analysis {} not completed: user {} has insufficient credits",
+                            analysis_id, user_id
+                        );
+                    }
+                    _ => {
+                        error!(
+                            "Failed to atomically complete analysis {}: {}",
+                            analysis_id, e
+                        );
+                    }
+                }
                 // mark as failed if atomic completion failed
                 if let Err(mark_err) = user_manager.mark_analysis_failed(analysis_id).await {
                     error!(
