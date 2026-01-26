@@ -4,6 +4,7 @@ pub mod bot;
 pub mod cache;
 pub mod handlers;
 pub mod llm;
+pub mod localization;
 pub mod migrations;
 pub mod prompts;
 pub mod rate_limiters;

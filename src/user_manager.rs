@@ -62,6 +62,7 @@ pub struct PendingAnalysis {
     pub telegram_user_id: i64, // kept for bot notification purposes
     pub channel_name: String,
     pub analysis_type: String,
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -353,21 +354,22 @@ impl UserManager {
         user_id: i32,
         channel_name: &str,
         analysis_type: &str,
+        language: Option<&str>,
     ) -> Result<i32, UserManagerError> {
         let client = self.pool.get().await?;
 
         // create pending analysis record
         let analysis_id = client
             .query_one(
-                "INSERT INTO user_analyses (user_id, channel_name, credits_used, analysis_type, status) VALUES ($1, $2, 0, $3, 'pending') RETURNING id",
-                &[&user_id, &channel_name, &analysis_type],
+                "INSERT INTO user_analyses (user_id, channel_name, credits_used, analysis_type, status, language) VALUES ($1, $2, 0, $3, 'pending', $4) RETURNING id",
+                &[&user_id, &channel_name, &analysis_type, &language],
             )
             .await?
             .get::<_, i32>(0);
 
         info!(
-            "Created pending analysis {} for user {} (channel: {})",
-            analysis_id, user_id, channel_name
+            "Created pending analysis {} for user {} (channel: {}, lang: {:?})",
+            analysis_id, user_id, channel_name, language
         );
         Ok(analysis_id)
     }
@@ -434,7 +436,7 @@ impl UserManager {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT ua.id, ua.user_id, u.telegram_user_id, ua.channel_name, ua.analysis_type 
+                "SELECT ua.id, ua.user_id, u.telegram_user_id, ua.channel_name, ua.analysis_type, ua.language 
                  FROM user_analyses ua 
                  JOIN users u ON ua.user_id = u.id 
                  WHERE ua.status = 'pending' 
@@ -451,6 +453,7 @@ impl UserManager {
                 telegram_user_id: row.get(2),
                 channel_name: row.get(3),
                 analysis_type: row.get(4),
+                language: row.get(5),
             })
             .collect();
 

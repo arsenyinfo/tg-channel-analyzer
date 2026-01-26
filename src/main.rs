@@ -4,6 +4,7 @@ mod bot;
 mod cache;
 mod handlers;
 mod llm;
+mod localization;
 mod migrations;
 mod prompts;
 mod rate_limiters;
@@ -16,6 +17,7 @@ use analysis::AnalysisEngine;
 use bot::{ChannelLocks, TelegramBot};
 use cache::CacheManager;
 use clap::Parser;
+use localization::Lang;
 use log::{error, info};
 use migrations::MigrationManager;
 use session_manager::SessionManager;
@@ -135,6 +137,9 @@ async fn recover_pending_analyses(
         );
 
         tokio::spawn(async move {
+            // use stored language from pending analysis, fallback to English
+            let lang = Lang::from_code(analysis.language.as_deref());
+            
             if let Err(e) = TelegramBot::perform_single_analysis(
                 bot_clone,
                 teloxide::types::ChatId(analysis.telegram_user_id),
@@ -145,6 +150,7 @@ async fn recover_pending_analyses(
                 analysis.user_id,
                 analysis.id,
                 channel_locks_clone,
+                lang,
             )
             .await
             {

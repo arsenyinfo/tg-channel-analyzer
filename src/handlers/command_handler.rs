@@ -9,6 +9,7 @@ use crate::handlers::{
     },
     CallbackHandler, PaymentHandler,
 };
+use crate::localization::Lang;
 
 #[derive(Debug)]
 struct UserInfo<'a> {
@@ -23,9 +24,15 @@ pub struct CommandHandler;
 
 impl CommandHandler {
     pub async fn handle_command(ctx: BotContext, msg: Message, cmd: Command) -> ResponseResult<()> {
+        let lang = Lang::from_code(
+            msg.from
+                .as_ref()
+                .and_then(|user| user.language_code.as_deref()),
+        );
+
         match cmd {
             Command::Start => {
-                Self::handle_start_command(ctx, msg).await?;
+                Self::handle_start_command(ctx, msg, lang).await?;
             }
             Command::Buy1 => {
                 Self::handle_buy_command(
@@ -33,27 +40,33 @@ impl CommandHandler {
                     msg,
                     SINGLE_PACKAGE_AMOUNT,
                     SINGLE_PACKAGE_PRICE,
-                    "1 Channel Analysis",
-                    "Get 1 analysis credit to analyze any Telegram channel",
+                    lang.invoice_single_title(),
+                    lang.invoice_single_description(),
                 )
                 .await?;
             }
             Command::Buy10 => {
+                let discount =
+                    (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE;
                 Self::handle_buy_command(
                     ctx,
                     msg,
                     BULK_PACKAGE_AMOUNT,
                     BULK_PACKAGE_PRICE,
-                    "10 Channel Analyses",
-                    &format!("Get 10 analysis credits to analyze any Telegram channels ({} stars discount!)",
-                        (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE)
-                ).await?;
+                    lang.invoice_bulk_title(),
+                    &lang.invoice_bulk_description(discount),
+                )
+                .await?;
             }
         }
         Ok(())
     }
 
-    async fn handle_start_command(ctx: BotContext, msg: Message) -> ResponseResult<()> {
+    async fn handle_start_command(
+        ctx: BotContext,
+        msg: Message,
+        lang: Lang,
+    ) -> ResponseResult<()> {
         // parse referral code from message text
         let referrer_user_id = Self::parse_referral_code(&ctx, &msg).await;
 
@@ -76,20 +89,21 @@ impl CommandHandler {
             Ok((user, reward_info)) => (user, reward_info),
             Err(e) => {
                 error!("Failed to get/create user: {}", e);
-                ctx.bot.send_message(msg.chat.id, "❌ Sorry, there was an error accessing your account. Please try again later.")
+                ctx.bot
+                    .send_message(msg.chat.id, lang.error_account_access())
                     .await?;
                 return Ok(());
             }
         };
 
         // send referral milestone notification if applicable
-        Self::send_referral_notifications(&ctx, maybe_reward_info).await;
+        Self::send_referral_notifications(&ctx, maybe_reward_info, lang).await;
 
         // send appropriate welcome message based on user's credit balance
         if user.analysis_credits <= 0 {
-            Self::send_no_credits_welcome(&ctx, &msg, &user).await?;
+            Self::send_no_credits_welcome(&ctx, &msg, &user, lang).await?;
         } else {
-            Self::send_credits_available_welcome(&ctx, &msg, &user).await?;
+            Self::send_credits_available_welcome(&ctx, &msg, &user, lang).await?;
         }
 
         Ok(())
@@ -147,6 +161,7 @@ impl CommandHandler {
     async fn send_referral_notifications(
         ctx: &BotContext,
         maybe_reward_info: Option<crate::user_manager::ReferralRewardInfo>,
+        lang: Lang,
     ) {
         if let Some(reward_info) = maybe_reward_info {
             info!("Received reward info for referral: referral_count={}, milestone_rewards={}, paid_rewards={}, is_celebration={}, referrer_telegram_id={:?}",
@@ -154,7 +169,7 @@ impl CommandHandler {
                   reward_info.is_celebration_milestone, reward_info.referrer_telegram_id);
 
             if let Some(referrer_telegram_id) = reward_info.referrer_telegram_id {
-                let reward_msg = Self::build_referral_message(&reward_info);
+                let reward_msg = Self::build_referral_message(&reward_info, lang);
 
                 if !reward_msg.is_empty() {
                     info!(
@@ -188,32 +203,25 @@ impl CommandHandler {
         }
     }
 
-    fn build_referral_message(reward_info: &crate::user_manager::ReferralRewardInfo) -> String {
+    fn build_referral_message(
+        reward_info: &crate::user_manager::ReferralRewardInfo,
+        lang: Lang,
+    ) -> String {
+        let referrer_user_id = reward_info.referrer_user_id.unwrap_or(0);
+
         if reward_info.is_celebration_milestone && reward_info.total_credits_awarded > 0 {
-            format!(
-                "🎉 <b>Referral Milestone!</b>\n\n\
-                Congratulations! You've reached <b>{}</b> referrals and earned <b>{}</b> credit(s)!\n\n\
-                Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
+            lang.referral_milestone_with_credits(
                 reward_info.referral_count,
                 reward_info.total_credits_awarded,
-                reward_info.referrer_user_id.unwrap_or(0)
+                referrer_user_id,
             )
         } else if reward_info.is_celebration_milestone {
-            format!(
-                "🎊 <b>Referral Milestone!</b>\n\n\
-                Congratulations! You've reached <b>{}</b> referrals!\n\n\
-                Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
-                reward_info.referral_count,
-                reward_info.referrer_user_id.unwrap_or(0)
-            )
+            lang.referral_milestone_no_credits(reward_info.referral_count, referrer_user_id)
         } else if reward_info.total_credits_awarded > 0 {
-            format!(
-                "🎉 <b>Referral Reward!</b>\n\n\
-                You've earned <b>{}</b> credit(s) for reaching <b>{}</b> referrals!\n\n\
-                Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
+            lang.referral_reward(
                 reward_info.total_credits_awarded,
                 reward_info.referral_count,
-                reward_info.referrer_user_id.unwrap_or(0)
+                referrer_user_id,
             )
         } else {
             String::new()
@@ -224,46 +232,29 @@ impl CommandHandler {
         ctx: &BotContext,
         msg: &Message,
         user: &crate::user_manager::User,
+        lang: Lang,
     ) -> ResponseResult<()> {
         let referral_info = if user.referrals_count > 0 {
-            format!("You have {} referrals! 🎉", user.referrals_count)
+            lang.referral_info_has_referrals(user.referrals_count)
         } else {
-            "Start earning free credits by referring friends!".to_string()
+            lang.referral_info_no_referrals().to_string()
         };
 
-        let intro_text = format!(
-            "🤖 <b><a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a> - Channel Analyzer</b>\n\n\
-            Welcome! I can analyze Telegram channels and provide insights.\n\n\
-            📋 <b>How to use:</b>\n\
-            • Send me a channel username (e.g., <code>@channelname</code>)\n\
-            • I'll validate the channel and show analysis options\n\
-            • Choose your preferred analysis type\n\
-            • Get detailed results in seconds!\n\n\
-            ⚠️ <b>Note:</b> Only text content is analyzed. Channels with mostly images or videos may not work well.\n\n\
-            ⚡ <b>Analysis Types:</b>\n\
-            • 💼 Professional: Expert assessment for hiring\n\
-            • 🧠 Personal: Psychological profile insights\n\
-            • 🔥 Roast: Fun, brutally honest critique\n\n\
-            💰 <b>Pricing:</b>\n\
-            • 1 analysis: {} ⭐ stars\n\
-            • 10 analyses: {} ⭐ stars (save {} stars!)\n\n\
-            🎁 <b>Referral Program:</b> {}\n\
-            Share your link: <code>https://t.me/ScratchAuthorEgoBot?start={}</code>\n\
-            • Get credits at milestones: 1, 5, 10, 20, 30...\n\
-            • Get 1 credit for each paid referral\n\n\
-            Choose a package below or just send me a channel name to get started!",
-            user.id,  // for the bot name referral link
+        let bulk_discount =
+            (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE;
+
+        let intro_text = lang.welcome_no_credits(
+            user.id,
             SINGLE_PACKAGE_PRICE,
             BULK_PACKAGE_PRICE,
-            (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE,
-            referral_info,
-            user.id  // for the share your link
+            bulk_discount,
+            &referral_info,
         );
 
         ctx.bot
             .send_message(msg.chat.id, intro_text)
             .parse_mode(ParseMode::Html)
-            .reply_markup(CallbackHandler::create_payment_keyboard())
+            .reply_markup(CallbackHandler::create_payment_keyboard(lang))
             .await?;
 
         Ok(())
@@ -273,27 +264,11 @@ impl CommandHandler {
         ctx: &BotContext,
         msg: &Message,
         user: &crate::user_manager::User,
+        lang: Lang,
     ) -> ResponseResult<()> {
-        let referral_section = Self::build_referral_section(user);
+        let referral_section = Self::build_referral_section(user, lang);
 
-        let intro_text = format!(
-            "🤖 <b><a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a> - Channel Analyzer</b>\n\n\
-            Welcome back! I can analyze Telegram channels and provide insights.\n\n\
-            📋 <b>How to use:</b>\n\
-            • Send me a channel username (e.g., <code>@channelname</code>)\n\
-            • I'll validate the channel and show analysis options\n\
-            • Choose your preferred analysis type\n\
-            • Get detailed results in seconds!\n\n\
-            ⚠️ <b>Note:</b> Only text content is analyzed. Channels with mostly images or videos may not work well.\n\n\
-            ⚡ <b>Analysis Types:</b>\n\
-            • 💼 Professional: Expert assessment for hiring\n\
-            • 🧠 Personal: Psychological profile insights\n\
-            • 🔥 Roast: Fun, brutally honest critique\n\n\
-            {}\n\n\
-            Just send me a channel name to get started!",
-            user.id,
-            referral_section
-        );
+        let intro_text = lang.welcome_with_credits(user.id, &referral_section);
 
         ctx.bot
             .send_message(msg.chat.id, intro_text)
@@ -303,7 +278,7 @@ impl CommandHandler {
         Ok(())
     }
 
-    fn build_referral_section(user: &crate::user_manager::User) -> String {
+    fn build_referral_section(user: &crate::user_manager::User, lang: Lang) -> String {
         if user.referrals_count > 0 {
             let next_milestone = if user.referrals_count < 1 {
                 1
@@ -315,35 +290,19 @@ impl CommandHandler {
                 ((user.referrals_count / 10) + 1) * 10
             };
             let referrals_to_next = next_milestone - user.referrals_count;
-            format!(
-                "💳 <b>Your Status:</b>\n\
-                • Credits remaining: <b>{}</b>\n\
-                • Total analyses performed: <b>{}</b>\n\
-                • Referrals: <b>{}</b> (Paid: <b>{}</b>)\n\
-                • Next milestone reward in <b>{}</b> referrals\n\n\
-                🎁 <b>Referral Program:</b>\n\
-                Share your link: <code>https://t.me/ScratchAuthorEgoBot?start={}</code>\n\
-                • Get credits at milestones: 1, 5, 10, 20, 30...\n\
-                • Get 1 credit for each paid referral\n\n\
-                Great job on your {} referrals! 🎉",
+            lang.referral_section_with_referrals(
                 user.analysis_credits,
                 user.total_analyses_performed,
                 user.referrals_count,
                 user.paid_referrals_count,
                 referrals_to_next,
                 user.id,
-                user.referrals_count
             )
         } else {
-            format!(
-                "💳 <b>Your Status:</b>\n\
-                • Credits remaining: <b>{}</b>\n\
-                • Total analyses performed: <b>{}</b>\n\n\
-                🎁 <b>Referral Program:</b>\n\
-                Share your link: <code>https://t.me/ScratchAuthorEgoBot?start={}</code>\n\
-                • Get credits at milestones: 1, 5, 10, 20, 30...\n\
-                • Get 1 credit for each paid referral",
-                user.analysis_credits, user.total_analyses_performed, user.id
+            lang.referral_section_no_referrals(
+                user.analysis_credits,
+                user.total_analyses_performed,
+                user.id,
             )
         }
     }

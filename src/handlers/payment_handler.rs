@@ -3,6 +3,7 @@ use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, LabeledPrice, ParseMode, PreCheckoutQuery, SuccessfulPayment};
 
+use crate::localization::Lang;
 use crate::user_manager::UserManager;
 
 // payment configuration constants
@@ -29,8 +30,10 @@ impl PaymentHandler {
         title: &str,
         description: &str,
     ) -> ResponseResult<()> {
+        // use Lang::En for the label since it's internal and not user-facing
+        let lang = Lang::En;
         let prices = vec![LabeledPrice {
-            label: format!("{} credits", credits),
+            label: lang.credits_label(credits),
             amount: stars,
         }];
 
@@ -53,7 +56,6 @@ impl PaymentHandler {
         query: PreCheckoutQuery,
     ) -> ResponseResult<()> {
         // approve all pre-checkout queries for digital goods
-        // in a real implementation, you might want to add additional validation
         bot.answer_pre_checkout_query(query.id, true).await?;
         info!(
             "Approved pre-checkout query for {} stars",
@@ -70,6 +72,7 @@ impl PaymentHandler {
     ) -> ResponseResult<()> {
         let telegram_user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
         let language_code = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
+        let lang = Lang::from_code(language_code);
 
         // get user info for referral link
         let (user, _) = match self
@@ -80,11 +83,8 @@ impl PaymentHandler {
             Ok(result) => result,
             Err(e) => {
                 error!("Failed to get user info during payment: {}", e);
-                bot.send_message(
-                    msg.chat.id,
-                    "❌ Error processing payment. Please contact support.",
-                )
-                .await?;
+                bot.send_message(msg.chat.id, lang.error_payment_processing())
+                    .await?;
                 return Ok(());
             }
         };
@@ -102,14 +102,7 @@ impl PaymentHandler {
         // add credits to user account
         match self.user_manager.add_credits(user.id, credits).await {
             Ok(new_balance) => {
-                let success_msg = format!(
-                    "🎉 <b>Payment Successful!</b> - <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">@ScratchAuthorEgoBot</a>\n\n\
-                    ✅ Added {} credits to your account\n\
-                    💳 New balance: {} credits\n\n\
-                    You can now analyze channels by sending me a channel username like <code>@channelname</code>",
-                    user.id,
-                    credits, new_balance
-                );
+                let success_msg = lang.payment_success(user.id, credits, new_balance);
 
                 bot.send_message(msg.chat.id, success_msg)
                     .parse_mode(ParseMode::Html)
@@ -121,7 +114,7 @@ impl PaymentHandler {
                 );
 
                 // process referral rewards if user was referred
-                if let Err(e) = self.process_referral_rewards(bot, user.id).await {
+                if let Err(e) = self.process_referral_rewards(bot, user.id, lang).await {
                     error!(
                         "Failed to process referral rewards for user {}: {}",
                         user.id, e
@@ -133,11 +126,8 @@ impl PaymentHandler {
                     "Failed to add credits after payment for user {}: {}",
                     telegram_user_id, e
                 );
-                bot.send_message(
-                    msg.chat.id,
-                    "⚠️ Payment received but failed to add credits. Please contact support with your payment ID."
-                )
-                .await?;
+                bot.send_message(msg.chat.id, lang.error_payment_credits())
+                    .await?;
             }
         }
 
@@ -148,43 +138,35 @@ impl PaymentHandler {
         &self,
         bot: Arc<Bot>,
         user_id: i32,
+        lang: Lang,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match self.user_manager.record_paid_referral(user_id).await {
             Ok(Some(reward_info)) => {
                 if let Some(referrer_telegram_id) = reward_info.referrer_telegram_id {
+                    let referrer_user_id = reward_info.referrer_user_id.unwrap_or(0);
+
                     // send notification to referrer
                     let reward_msg = if reward_info.paid_rewards > 0
                         && reward_info.milestone_rewards > 0
                     {
-                        format!(
-                            "🎉 <b>Referral Rewards!</b>\n\n\
-                            You've earned <b>{}</b> credits (Total referrals: <b>{}</b>):\n\
-                            • {} credit(s) for paid referral\n\
-                            • {} credit(s) for milestone bonus\n\n\
-                            Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
+                        lang.referral_paid_and_milestone(
                             reward_info.total_credits_awarded,
                             reward_info.referral_count,
                             reward_info.paid_rewards,
                             reward_info.milestone_rewards,
-                            reward_info.referrer_user_id.unwrap_or(0)
+                            referrer_user_id,
                         )
                     } else if reward_info.paid_rewards > 0 {
-                        format!(
-                            "🎉 <b>Referral Reward!</b>\n\n\
-                            You've earned <b>{}</b> credit(s) for a paid referral! (Total referrals: <b>{}</b>)\n\n\
-                            Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
+                        lang.referral_paid_only(
                             reward_info.paid_rewards,
                             reward_info.referral_count,
-                            reward_info.referrer_user_id.unwrap_or(0)
+                            referrer_user_id,
                         )
                     } else if reward_info.milestone_rewards > 0 {
-                        format!(
-                            "🎉 <b>Milestone Reward!</b>\n\n\
-                            You've earned <b>{}</b> credit(s) for reaching <b>{}</b> referrals!\n\n\
-                            Keep sharing: <a href=\"https://t.me/ScratchAuthorEgoBot?start={}\">your referral link</a>",
+                        lang.referral_milestone_only(
                             reward_info.milestone_rewards,
                             reward_info.referral_count,
-                            reward_info.referrer_user_id.unwrap_or(0)
+                            referrer_user_id,
                         )
                     } else {
                         String::new()

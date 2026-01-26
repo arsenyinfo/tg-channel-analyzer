@@ -9,6 +9,7 @@ use crate::handlers::payment_handler::{
     PaymentHandler, BULK_PACKAGE_AMOUNT, BULK_PACKAGE_PRICE, SINGLE_PACKAGE_AMOUNT,
     SINGLE_PACKAGE_PRICE,
 };
+use crate::localization::Lang;
 use crate::user_manager::UserManagerError;
 
 pub struct CallbackHandler;
@@ -20,36 +21,31 @@ impl CallbackHandler {
             MaybeInaccessibleMessage::Inaccessible(msg) => msg.chat.id,
         }
     }
-    pub fn create_payment_keyboard() -> InlineKeyboardMarkup {
+
+    pub fn create_payment_keyboard(lang: Lang) -> InlineKeyboardMarkup {
         let single_button = InlineKeyboardButton::callback(
-            format!(
-                "💎 Buy {} Credit ({} ⭐)",
-                SINGLE_PACKAGE_AMOUNT, SINGLE_PACKAGE_PRICE
-            ),
+            lang.btn_buy_single(SINGLE_PACKAGE_AMOUNT, SINGLE_PACKAGE_PRICE),
             "buy_single",
         );
         let bulk_button = InlineKeyboardButton::callback(
-            format!(
-                "💎 Buy {} Credits ({} ⭐)",
-                BULK_PACKAGE_AMOUNT, BULK_PACKAGE_PRICE
-            ),
+            lang.btn_buy_bulk(BULK_PACKAGE_AMOUNT, BULK_PACKAGE_PRICE),
             "buy_bulk",
         );
 
         InlineKeyboardMarkup::new(vec![vec![single_button], vec![bulk_button]])
     }
 
-    pub fn create_analysis_selection_keyboard(channel_name: &str) -> InlineKeyboardMarkup {
+    pub fn create_analysis_selection_keyboard(channel_name: &str, lang: Lang) -> InlineKeyboardMarkup {
         let professional_button = InlineKeyboardButton::callback(
-            "💼 Professional Analysis",
+            lang.btn_professional_analysis(),
             format!("analysis_professional_{}", channel_name),
         );
         let personal_button = InlineKeyboardButton::callback(
-            "🧠 Personal Analysis",
+            lang.btn_personal_analysis(),
             format!("analysis_personal_{}", channel_name),
         );
         let roast_button = InlineKeyboardButton::callback(
-            "🔥 Roast Analysis",
+            lang.btn_roast_analysis(),
             format!("analysis_roast_{}", channel_name),
         );
 
@@ -64,17 +60,20 @@ impl CallbackHandler {
         ctx: BotContext,
         query: CallbackQuery,
     ) -> ResponseResult<()> {
+        let lang = Lang::from_code(query.from.language_code.as_deref());
+
         if let Some(data) = &query.data {
             if let Some(message) = &query.message {
                 match data.as_str() {
                     "buy_single" => {
-                        Self::handle_buy_single_callback(ctx, message, &query).await?;
+                        Self::handle_buy_single_callback(ctx, message, &query, lang).await?;
                     }
                     "buy_bulk" => {
-                        Self::handle_buy_bulk_callback(ctx, message, &query).await?;
+                        Self::handle_buy_bulk_callback(ctx, message, &query, lang).await?;
                     }
                     callback_data if callback_data.starts_with("analysis_") => {
-                        Self::handle_analysis_callback(ctx, message, &query, callback_data).await?;
+                        Self::handle_analysis_callback(ctx, message, &query, callback_data, lang)
+                            .await?;
                     }
                     _ => {
                         ctx.bot.answer_callback_query(&query.id).await?;
@@ -89,14 +88,15 @@ impl CallbackHandler {
         ctx: BotContext,
         message: &MaybeInaccessibleMessage,
         query: &CallbackQuery,
+        lang: Lang,
     ) -> ResponseResult<()> {
         PaymentHandler::send_payment_invoice(
             ctx.bot.clone(),
             Self::get_chat_id(message),
             SINGLE_PACKAGE_AMOUNT,
             SINGLE_PACKAGE_PRICE,
-            "1 Channel Analysis",
-            "Get 1 analysis credit to analyze any Telegram channel",
+            lang.invoice_single_title(),
+            lang.invoice_single_description(),
         )
         .await?;
 
@@ -108,17 +108,16 @@ impl CallbackHandler {
         ctx: BotContext,
         message: &MaybeInaccessibleMessage,
         query: &CallbackQuery,
+        lang: Lang,
     ) -> ResponseResult<()> {
+        let discount = (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE;
         PaymentHandler::send_payment_invoice(
             ctx.bot.clone(),
             Self::get_chat_id(message),
             BULK_PACKAGE_AMOUNT,
             BULK_PACKAGE_PRICE,
-            "10 Channel Analyses",
-            &format!(
-                "Get 10 analysis credits to analyze any Telegram channels ({} stars discount!)",
-                (SINGLE_PACKAGE_PRICE * BULK_PACKAGE_AMOUNT as u32) - BULK_PACKAGE_PRICE
-            ),
+            lang.invoice_bulk_title(),
+            &lang.invoice_bulk_description(discount),
         )
         .await?;
 
@@ -131,6 +130,7 @@ impl CallbackHandler {
         message: &MaybeInaccessibleMessage,
         query: &CallbackQuery,
         callback_data: &str,
+        lang: Lang,
     ) -> ResponseResult<()> {
         // parse analysis type and channel from callback data
         let parts: Vec<&str> = callback_data.splitn(3, '_').collect();
@@ -157,10 +157,7 @@ impl CallbackHandler {
                 Err(e) => {
                     error!("Failed to get user: {}", e);
                     ctx.bot
-                        .send_message(
-                            Self::get_chat_id(message),
-                            "❌ Failed to check credits. Please try again.",
-                        )
+                        .send_message(Self::get_chat_id(message), lang.error_check_credits())
                         .await?;
                     return Ok(());
                 }
@@ -168,12 +165,9 @@ impl CallbackHandler {
 
             if user.analysis_credits <= 0 {
                 // no credits available, send payment options
-                let message_text = "❌ No analysis credits available.\n\n\
-                    You need credits to analyze channels. Choose a package below:";
-
                 ctx.bot
-                    .send_message(Self::get_chat_id(message), message_text)
-                    .reply_markup(Self::create_payment_keyboard())
+                    .send_message(Self::get_chat_id(message), lang.no_credits_short())
+                    .reply_markup(Self::create_payment_keyboard(lang))
                     .await?;
 
                 ctx.bot.answer_callback_query(&query.id).await?;
@@ -183,14 +177,19 @@ impl CallbackHandler {
             // create pending analysis record first
             let analysis_id = match ctx
                 .user_manager
-                .create_pending_analysis(user.id, &channel_name, &analysis_type)
+                .create_pending_analysis(
+                    user.id,
+                    channel_name,
+                    analysis_type,
+                    query.from.language_code.as_deref(),
+                )
                 .await
             {
                 Ok(id) => id,
                 Err(e) => {
                     let error_msg = match e {
-                        UserManagerError::UserNotFound(_) => "❌ User not found. Please try again.",
-                        _ => "❌ Failed to start analysis. Please try again.",
+                        UserManagerError::UserNotFound(_) => lang.error_user_not_found(),
+                        _ => lang.error_start_analysis(),
                     };
                     let _ = ctx
                         .bot
@@ -209,6 +208,7 @@ impl CallbackHandler {
                 analysis_type.to_string(),
                 user,
                 analysis_id,
+                lang,
             )
             .await;
         }
@@ -224,6 +224,7 @@ impl CallbackHandler {
         analysis_type: String,
         user: crate::user_manager::User,
         analysis_id: i32,
+        lang: Lang,
     ) {
         use crate::bot::TelegramBot;
 
@@ -244,6 +245,7 @@ impl CallbackHandler {
                 user.id,
                 analysis_id,
                 channel_locks_clone,
+                lang,
             )
             .await
             {
@@ -264,10 +266,7 @@ impl CallbackHandler {
                         crate::user_manager::UserManagerError::InsufficientCredits(user_id) => {
                             info!("Analysis failed: User {} has insufficient credits", user_id);
                             let _ = bot_clone
-                                .send_message(
-                                    user_chat_id,
-                                    "❌ Insufficient credits. Please purchase more credits to continue.",
-                                )
+                                .send_message(user_chat_id, lang.error_insufficient_credits())
                                 .await;
                         }
                         _ => {
@@ -277,21 +276,18 @@ impl CallbackHandler {
                             );
                             error!("User manager error during analysis: {}", user_error);
                             let _ = bot_clone
-                                .send_message(
-                                    user_chat_id,
-                                    "❌ Analysis failed due to a system error. Please try again later.",
-                                )
+                                .send_message(user_chat_id, lang.error_system())
                                 .await;
                         }
                     }
                 } else {
-                    // Log the full error details
+                    // log the full error details
                     error!(
                         "Analysis failed for channel {} (type: {}): {}",
                         channel_name, analysis_type, e
                     );
                     error!("Non-user error during analysis: {}", e);
-                    // Don't send generic error - it's already handled in perform_single_analysis
+                    // don't send generic error - it's already handled in perform_single_analysis
                 }
             }
         });

@@ -119,7 +119,7 @@ impl MigrationManager {
     }
 
     fn latest_version() -> i32 {
-        4 // increment this when adding new migrations
+        5 // increment this when adding new migrations
     }
 
     async fn run_pending_migrations(
@@ -196,6 +196,13 @@ impl MigrationManager {
                         -- Add status column to user_analyses for task resumption
                         ALTER TABLE user_analyses ADD COLUMN status VARCHAR(20) DEFAULT 'completed' CHECK (status IN ('pending', 'completed', 'failed'));
                         CREATE INDEX idx_user_analyses_status ON user_analyses(status, analysis_timestamp);
+                    "#;
+                    transaction.batch_execute(migration_sql).await?;
+                }
+                5 => {
+                    // add language column to user_analyses for localized recovery messages
+                    let migration_sql = r#"
+                        ALTER TABLE user_analyses ADD COLUMN language VARCHAR(2);
                     "#;
                     transaction.batch_execute(migration_sql).await?;
                 }
