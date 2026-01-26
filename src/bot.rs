@@ -333,7 +333,8 @@ impl TelegramBot {
                 // show analysis type selection directly (validation will happen during analysis)
                 let selection_msg = format!(
                     "🎯 <b>Channel:</b> <code>{}</code>\n\n\
-                    Please choose the type of analysis you'd like to perform:",
+                    Please choose the type of analysis you'd like to perform:\n\n\
+                    ⚠️ <b>Note:</b> Only text content is analyzed. Channels consisting mostly of images or videos may not yield accurate results.",
                     MessageFormatter::escape_html(&channel_name)
                 );
 

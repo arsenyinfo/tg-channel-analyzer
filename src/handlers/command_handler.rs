@@ -239,6 +239,7 @@ impl CommandHandler {
             • I'll validate the channel and show analysis options\n\
             • Choose your preferred analysis type\n\
             • Get detailed results in seconds!\n\n\
+            ⚠️ <b>Note:</b> Only text content is analyzed. Channels with mostly images or videos may not work well.\n\n\
             ⚡ <b>Analysis Types:</b>\n\
             • 💼 Professional: Expert assessment for hiring\n\
             • 🧠 Personal: Psychological profile insights\n\
@@ -283,6 +284,7 @@ impl CommandHandler {
             • I'll validate the channel and show analysis options\n\
             • Choose your preferred analysis type\n\
             • Get detailed results in seconds!\n\n\
+            ⚠️ <b>Note:</b> Only text content is analyzed. Channels with mostly images or videos may not work well.\n\n\
             ⚡ <b>Analysis Types:</b>\n\
             • 💼 Professional: Expert assessment for hiring\n\
             • 🧠 Personal: Psychological profile insights\n\
