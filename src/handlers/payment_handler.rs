@@ -6,8 +6,8 @@ use teloxide::types::{ChatId, LabeledPrice, ParseMode, PreCheckoutQuery, Success
 use crate::user_manager::UserManager;
 
 // payment configuration constants
-pub const SINGLE_PACKAGE_PRICE: u32 = 50;
-pub const BULK_PACKAGE_PRICE: u32 = 200;
+pub const SINGLE_PACKAGE_PRICE: u32 = 100;
+pub const BULK_PACKAGE_PRICE: u32 = 500;
 pub const SINGLE_PACKAGE_AMOUNT: i32 = 1;
 pub const BULK_PACKAGE_AMOUNT: i32 = 10;
 
