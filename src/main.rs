@@ -18,12 +18,14 @@ use bot::{ChannelLocks, TelegramBot};
 use cache::CacheManager;
 use clap::Parser;
 use localization::Lang;
-use log::{error, info};
+use log::{error, info, warn};
+use teloxide::requests::Requester;
 use migrations::MigrationManager;
 use session_manager::SessionManager;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use user_manager::UserManager;
 
@@ -76,6 +78,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("{}", success_msg);
     }
 
+    // wait for Telegram API connectivity before proceeding
+    wait_for_telegram_api(&bot_token).await?;
+
     // initialize database pool and run migrations
     info!("Initializing database...");
     let pool = CacheManager::create_pool().await?;
@@ -95,6 +100,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     bot.run().await;
 
     Ok(())
+}
+
+/// waits for Telegram API to become reachable, retrying with exponential backoff
+async fn wait_for_telegram_api(
+    bot_token: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bot = teloxide::Bot::new(bot_token);
+    let max_retries = 5;
+    let mut delay = Duration::from_secs(2);
+
+    for attempt in 1..=max_retries {
+        match bot.get_me().await {
+            Ok(me) => {
+                info!(
+                    "Telegram API is reachable (bot: @{})",
+                    me.username.as_deref().unwrap_or("unknown")
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                if attempt == max_retries {
+                    error!(
+                        "Telegram API unreachable after {} attempts: {}",
+                        max_retries, e
+                    );
+                    return Err(format!(
+                        "Telegram API unreachable after {} attempts: {}",
+                        max_retries, e
+                    )
+                    .into());
+                }
+                warn!(
+                    "Telegram API not ready (attempt {}/{}): {}, retrying in {}s...",
+                    attempt,
+                    max_retries,
+                    e,
+                    delay.as_secs()
+                );
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+
+    unreachable!()
 }
 
 /// recovers and resumes pending analyses from previous session
