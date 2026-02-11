@@ -26,7 +26,8 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinHandle;
 use user_manager::UserManager;
 
 #[derive(Parser)]
@@ -94,12 +95,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // recover pending analyses from previous session
     info!("Recovering pending analyses...");
-    recover_pending_analyses(user_manager.clone(), &bot_token).await?;
+    let recovery_handles = recover_pending_analyses(user_manager.clone(), &bot_token).await?;
 
     let bot = TelegramBot::new(&bot_token, user_manager, pool).await?;
-    bot.run().await;
 
-    Ok(())
+    // spawn dispatcher in a task so a panic doesn't crash the runtime
+    let dispatcher_result = tokio::spawn(async move {
+        bot.run().await;
+    })
+    .await;
+
+    // dispatcher exited — abort any still-running recovery tasks
+    info!("Dispatcher exited, aborting remaining recovery tasks");
+    for handle in recovery_handles {
+        handle.abort();
+    }
+
+    match dispatcher_result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            error!("Bot dispatcher failed: {}", e);
+            Err(format!("Bot dispatcher failed: {}", e).into())
+        }
+    }
 }
 
 /// waits for Telegram API to become reachable, retrying with exponential backoff
@@ -147,16 +165,17 @@ async fn wait_for_telegram_api(
     unreachable!()
 }
 
-/// recovers and resumes pending analyses from previous session
+/// recovers and resumes pending analyses from previous session.
+/// returns JoinHandles so the caller can abort them on shutdown.
 async fn recover_pending_analyses(
     user_manager: Arc<UserManager>,
     bot_token: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<JoinHandle<()>>, Box<dyn std::error::Error + Send + Sync>> {
     let pending_analyses = user_manager.get_pending_analyses().await?;
 
     if pending_analyses.is_empty() {
         info!("No pending analyses to recover");
-        return Ok(());
+        return Ok(vec![]);
     }
 
     info!(
@@ -175,21 +194,35 @@ async fn recover_pending_analyses(
     // create channel locks for recovery
     let channel_locks: ChannelLocks = Arc::new(Mutex::new(HashMap::new()));
 
+    // limit concurrent recovery tasks to avoid overwhelming APIs
+    let semaphore = Arc::new(Semaphore::new(3));
+
+    let mut handles = Vec::new();
     for analysis in pending_analyses {
         let bot_clone = bot.clone();
         let analysis_engine_clone = analysis_engine.clone();
         let user_manager_clone = user_manager.clone();
         let channel_locks_clone = channel_locks.clone();
+        let semaphore_clone = semaphore.clone();
 
         info!(
-            "Resuming analysis {} for user {} (channel: {}, type: {})",
-            analysis.id, analysis.telegram_user_id, analysis.channel_name, analysis.analysis_type
+            "Queuing recovery for analysis {} (channel: {}, type: {})",
+            analysis.id, analysis.channel_name, analysis.analysis_type
         );
 
-        tokio::spawn(async move {
-            // use stored language from pending analysis, fallback to English
+        let handle = tokio::spawn(async move {
+            let _permit = match semaphore_clone.acquire().await {
+                Ok(permit) => permit,
+                Err(_) => return, // semaphore closed, shutting down
+            };
+
+            info!(
+                "Starting recovery for analysis {} (channel: {}, type: {})",
+                analysis.id, analysis.channel_name, analysis.analysis_type
+            );
+
             let lang = Lang::from_code(analysis.language.as_deref());
-            
+
             if let Err(e) = TelegramBot::perform_single_analysis(
                 bot_clone,
                 teloxide::types::ChatId(analysis.telegram_user_id),
@@ -205,7 +238,6 @@ async fn recover_pending_analyses(
             .await
             {
                 error!("Failed to recover analysis {}: {}", analysis.id, e);
-                // mark as failed if recovery failed
                 if let Err(mark_err) = user_manager_clone.mark_analysis_failed(analysis.id).await {
                     error!(
                         "Failed to mark recovered analysis {} as failed: {}",
@@ -214,8 +246,12 @@ async fn recover_pending_analyses(
                 }
             }
         });
+        handles.push(handle);
     }
 
-    info!("Started recovery for all pending analyses");
-    Ok(())
+    info!(
+        "Queued {} recovery tasks (max 3 concurrent)",
+        handles.len()
+    );
+    Ok(handles)
 }
