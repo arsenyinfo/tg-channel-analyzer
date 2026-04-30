@@ -8,7 +8,8 @@ use teloxide::utils::command::BotCommands;
 use tokio::sync::Mutex;
 
 use crate::analysis::AnalysisEngine;
-use crate::cache::AnalysisResult;
+use crate::analysis::MessageDict;
+use crate::cache::{AnalysisResult, CacheManager};
 use crate::handlers::{
     payment_handler::{BULK_PACKAGE_AMOUNT, BULK_PACKAGE_PRICE, SINGLE_PACKAGE_PRICE},
     CallbackHandler, CommandHandler, PaymentHandler,
@@ -345,6 +346,48 @@ impl TelegramBot {
         Ok(())
     }
 
+    async fn check_fast_path_cache(
+        cache: &CacheManager,
+        channel_name: &str,
+        analysis_type: &str,
+    ) -> Option<(AnalysisResult, Vec<MessageDict>)> {
+        let messages = match cache.load_channel_messages(channel_name).await {
+            Some(msgs) if !msgs.is_empty() => msgs,
+            _ => return None,
+        };
+
+        let cache_key = cache.get_llm_cache_key(&messages, "analysis");
+
+        let cached_result = match cache.load_llm_result(&cache_key).await {
+            Some(result) => result,
+            None => return None,
+        };
+
+        let analysis_content = match analysis_type {
+            "professional" => &cached_result.professional,
+            "personal" => &cached_result.personal,
+            "roast" => &cached_result.roast,
+            _ => return None,
+        };
+
+        match analysis_content {
+            Some(content) if !content.is_empty() => {
+                info!(
+                    "Fast path hit: using cached {} analysis for channel {}",
+                    analysis_type, channel_name
+                );
+                Some((cached_result, messages))
+            }
+            _ => {
+                info!(
+                    "Fast path miss: {} analysis not found in cache for channel {}",
+                    analysis_type, channel_name
+                );
+                None
+            }
+        }
+    }
+
     pub async fn perform_single_analysis(
         bot: Arc<Bot>,
         user_chat_id: ChatId,
@@ -362,11 +405,55 @@ impl TelegramBot {
             analysis_type, channel_name
         );
 
-        // notify user that analysis is starting
+        let cache = {
+            let engine = analysis_engine.lock().await;
+            engine.cache.clone()
+        };
+
+        if let Some((cached_result, _cached_messages)) =
+            Self::check_fast_path_cache(&cache, &channel_name, &analysis_type).await
+        {
+            let remaining_credits = user_manager
+                .atomic_complete_analysis(analysis_id, user_id)
+                .await?;
+
+            bot.send_message(
+                user_chat_id,
+                lang.analysis_complete(&analysis_type, user_id, remaining_credits),
+            )
+            .parse_mode(ParseMode::Html)
+            .await?;
+
+            Self::send_single_analysis_to_user(
+                bot,
+                user_chat_id,
+                &channel_name,
+                &analysis_type,
+                cached_result,
+                user_id,
+                lang,
+            )
+            .await?;
+
+            return Ok(());
+        }
+
         bot.send_message(user_chat_id, lang.analysis_in_progress(&analysis_type))
             .await?;
 
-        // prepare analysis data (with lock)
+        let wait_needed = {
+            let engine = analysis_engine.lock().await;
+            engine.calculate_backend_wait_time()
+        };
+
+        if let Some(wait_duration) = wait_needed {
+            info!(
+                "Rate limit would block, waiting {}s before acquiring engine lock",
+                wait_duration.as_secs()
+            );
+            tokio::time::sleep(wait_duration).await;
+        }
+
         let analysis_data = {
             let mut engine = analysis_engine.lock().await;
             match engine.prepare_analysis_data(&channel_name).await {
@@ -384,7 +471,6 @@ impl TelegramBot {
             }
         };
 
-        // check if we received 0 messages and raise error
         if analysis_data.messages.is_empty() {
             bot.send_message(user_chat_id, lang.error_no_messages())
                 .parse_mode(ParseMode::Html)
@@ -392,7 +478,6 @@ impl TelegramBot {
             return Err("No messages found in channel".into());
         }
 
-        // get or create per-channel lock to prevent concurrent LLM calls
         let channel_lock = {
             let mut locks = channel_locks.lock().await;
             locks
@@ -401,10 +486,8 @@ impl TelegramBot {
                 .clone()
         };
 
-        // acquire channel lock before checking cache and calling LLM
         let _channel_guard = channel_lock.lock().await;
 
-        // check for cached result (re-check after acquiring channel lock)
         let cached_result = {
             let engine = analysis_engine.lock().await;
             engine
@@ -417,7 +500,6 @@ impl TelegramBot {
             info!("Using cached LLM result for channel {}", channel_name);
             cached_result
         } else {
-            // generate prompt without lock
             let prompt = match crate::prompts::analysis::generate_analysis_prompt(
                 &analysis_data.messages,
             ) {
@@ -438,7 +520,6 @@ impl TelegramBot {
                 "Querying LLM for {} analysis of channel {}...",
                 analysis_type, channel_name
             );
-            // perform LLM call (protected by channel lock)
             let mut result =
                 match crate::llm::analysis_query::query_and_parse_analysis(&prompt).await {
                     Ok(r) => r,
@@ -455,7 +536,6 @@ impl TelegramBot {
                 };
             result.messages_count = analysis_data.messages.len();
 
-            // cache the result
             {
                 let mut engine = analysis_engine.lock().await;
                 if let Err(e) = engine
@@ -466,7 +546,6 @@ impl TelegramBot {
                         "Failed to cache analysis result for channel {}: {}",
                         channel_name, e
                     );
-                    // continue execution - caching failure shouldn't stop the analysis
                 }
             }
 
