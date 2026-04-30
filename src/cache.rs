@@ -9,6 +9,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::analysis::MessageDict;
 
+#[derive(Clone)]
 pub struct CacheManager {
     pool: Arc<Pool>,
 }

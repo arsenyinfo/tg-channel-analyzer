@@ -412,13 +412,31 @@ impl UserManager {
             }
         };
 
-        // mark analysis as completed
-        transaction
+        // guard against double-completion; no-op if already completed
+        let updated = transaction
             .execute(
-                "UPDATE user_analyses SET status = 'completed', credits_used = 1 WHERE id = $1",
+                "UPDATE user_analyses SET status = 'completed', credits_used = 1 WHERE id = $1 AND status = 'pending'",
                 &[&analysis_id],
             )
             .await?;
+
+        if updated == 0 {
+            // analysis already completed (race condition); roll back the credit deduction
+            transaction.rollback().await?;
+            info!(
+                "Analysis {} already completed, skipping charge for user {}",
+                analysis_id, user_id
+            );
+            let client = self.pool.get().await?;
+            let row = client
+                .query_opt(
+                    "SELECT analysis_credits FROM users WHERE id = $1",
+                    &[&user_id],
+                )
+                .await?
+                .ok_or(UserManagerError::UserNotFound(user_id))?;
+            return Ok(row.get(0));
+        }
 
         transaction.commit().await?;
 

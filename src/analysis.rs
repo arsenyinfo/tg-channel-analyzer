@@ -189,7 +189,6 @@ impl AnalysisEngine {
         info!("Validating channel: {}", clean_username);
 
         for attempt in 0..=MAX_RETRIES {
-            // rate limit username resolution on every attempt
             self.rate_limiter.wait_for_username_resolution().await;
 
             let client = match self.ensure_client().await {
@@ -264,6 +263,20 @@ impl AnalysisEngine {
         unreachable!()
     }
 
+    pub fn calculate_backend_wait_time(&self) -> Option<std::time::Duration> {
+        let web_time = self
+            .backend_rate_limiter
+            .time_until_available(BackendType::WebScraping);
+        let api_time = self
+            .backend_rate_limiter
+            .time_until_available(BackendType::Api);
+
+        match (web_time, api_time) {
+            (None, _) | (_, None) => None,
+            (Some(web), Some(api)) => Some(web.min(api)),
+        }
+    }
+
     pub async fn prepare_analysis_data(
         &mut self,
         channel_username: &str,
@@ -312,7 +325,6 @@ impl AnalysisEngine {
                         "Failed to cache messages for channel {}: {}",
                         channel_username, e
                     );
-                    // Continue execution - caching failure shouldn't stop the analysis
                 }
                 messages
             }
@@ -337,19 +349,30 @@ impl AnalysisEngine {
         Ok(())
     }
 
+    pub(crate) async fn wait_for_backend_if_needed(&mut self, backend: BackendType) {
+        if let Some(wait_time) = self.backend_rate_limiter.time_until_available(backend) {
+            info!(
+                "Waiting {}s for {} backend",
+                wait_time.as_secs(),
+                backend.name()
+            );
+            self.backend_rate_limiter
+                .wait_for_backend(backend)
+                .await;
+        }
+    }
+
     async fn get_all_messages_with_rate_limit_info(
         &mut self,
         channel_username: &str,
     ) -> Result<(Vec<MessageDict>, bool), Box<dyn std::error::Error + Send + Sync>> {
         info!("Getting messages from {}", channel_username);
 
-        // select backend based on rate limits (web scraping preferred)
         let backend = self
             .backend_rate_limiter
             .select_available_backend(&self.backend_config.enabled_backends)
             .unwrap_or(BackendType::WebScraping);
 
-        // check if both backends are rate limited
         let web_time = self
             .backend_rate_limiter
             .time_until_available(BackendType::WebScraping);
@@ -358,7 +381,6 @@ impl AnalysisEngine {
             .time_until_available(BackendType::Api);
         let hit_rate_limits = web_time.is_some() && api_time.is_some();
 
-        // if chosen backend is not available, wait for the closest one
         if !self.backend_rate_limiter.is_available(backend) {
             let closest_backend = match (web_time, api_time) {
                 (None, _) => BackendType::WebScraping,
@@ -372,19 +394,7 @@ impl AnalysisEngine {
                 }
             };
 
-            if let Some(wait_time) = self
-                .backend_rate_limiter
-                .time_until_available(closest_backend)
-            {
-                info!(
-                    "Waiting {}s for {} backend",
-                    wait_time.as_secs(),
-                    closest_backend.name()
-                );
-                self.backend_rate_limiter
-                    .wait_for_backend(closest_backend)
-                    .await;
-            }
+            self.wait_for_backend_if_needed(closest_backend).await;
         }
 
         let messages = match backend {
@@ -586,3 +596,4 @@ impl AnalysisEngine {
         Ok(messages)
     }
 }
+
