@@ -1,10 +1,11 @@
 use grammers_client::{types::Chat, Client, Config, InitParams};
 use grammers_session::Session;
 use log::{error, info, warn};
+use lru::LruCache;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::env;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tokio::time::sleep;
 
@@ -37,7 +38,7 @@ pub struct AnalysisEngine {
     api_id: i32,
     api_hash: String,
     pub cache: CacheManager,
-    resolved_channels: HashMap<String, Arc<Chat>>,
+    resolved_channels: LruCache<String, Arc<Chat>>,
     rate_limiter: TelegramRateLimiter,
     session_files: Vec<String>,
     web_scraper: TelegramWebScraper,
@@ -71,7 +72,9 @@ impl AnalysisEngine {
             api_id,
             api_hash,
             cache,
-            resolved_channels: HashMap::new(),
+            // bounded cache of resolved channels; arbitrary user-supplied usernames would
+            // otherwise grow this map unbounded for the process lifetime
+            resolved_channels: LruCache::new(NonZeroUsize::new(1024).unwrap()),
             rate_limiter: TelegramRateLimiter::new(),
             session_files,
             web_scraper,
@@ -225,7 +228,7 @@ impl AnalysisEngine {
                     );
                     // cache the resolved channel
                     self.resolved_channels
-                        .insert(clean_username.to_string(), Arc::new(chat));
+                        .put(clean_username.to_string(), Arc::new(chat));
                     return Ok(true);
                 }
                 Ok(None) => {
@@ -255,7 +258,7 @@ impl AnalysisEngine {
                     sleep(delay).await;
                     // reset client and clear channel cache on connection errors
                     self.client = None;
-                    self.resolved_channels.remove(clean_username);
+                    self.resolved_channels.pop(clean_username);
                 }
             }
         }
@@ -342,9 +345,10 @@ impl AnalysisEngine {
         cache_key: &str,
         result: AnalysisResult,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // cache the full analysis result
+        // cache the full analysis result; a failure here is non-fatal (the analysis still
+        // succeeds) but must be visible, since it silently forces a costly LLM re-run next time
         if let Err(e) = self.cache.save_llm_result(cache_key, &result).await {
-            info!("Failed to cache LLM result: {}", e);
+            error!("Failed to cache LLM result: {}", e);
         }
         Ok(())
     }
@@ -368,7 +372,7 @@ impl AnalysisEngine {
     ) -> Result<(Vec<MessageDict>, bool), Box<dyn std::error::Error + Send + Sync>> {
         info!("Getting messages from {}", channel_username);
 
-        let backend = self
+        let mut backend = self
             .backend_rate_limiter
             .select_available_backend(&self.backend_config.enabled_backends)
             .unwrap_or(BackendType::WebScraping);
@@ -382,7 +386,10 @@ impl AnalysisEngine {
         let hit_rate_limits = web_time.is_some() && api_time.is_some();
 
         if !self.backend_rate_limiter.is_available(backend) {
-            let closest_backend = match (web_time, api_time) {
+            // none available: switch to the backend that frees up soonest, and wait for THAT
+            // same backend we will actually request against (previously it waited on one
+            // backend but then used another, silently violating the rate limit)
+            backend = match (web_time, api_time) {
                 (None, _) => BackendType::WebScraping,
                 (_, None) => BackendType::Api,
                 (Some(web), Some(api)) => {
@@ -394,7 +401,7 @@ impl AnalysisEngine {
                 }
             };
 
-            self.wait_for_backend_if_needed(closest_backend).await;
+            self.wait_for_backend_if_needed(backend).await;
         }
 
         let messages = match backend {
@@ -470,9 +477,10 @@ impl AnalysisEngine {
         };
 
         // check for cached channel first, fallback to resolution if needed
-        let channel = if let Some(cached_channel) = self.resolved_channels.get(clean_username) {
+        let cached_channel = self.resolved_channels.get(clean_username).cloned();
+        let channel = if let Some(cached_channel) = cached_channel {
             info!("Using cached channel for {}", clean_username);
-            Some(cached_channel.clone())
+            Some(cached_channel)
         } else {
             info!("No cached channel found, resolving {}", clean_username);
             // get client reference
@@ -486,7 +494,7 @@ impl AnalysisEngine {
                         if let Some(ref ch) = channel {
                             // cache the newly resolved channel
                             self.resolved_channels
-                                .insert(clean_username.to_string(), Arc::new(ch.clone()));
+                                .put(clean_username.to_string(), Arc::new(ch.clone()));
                         }
                         break channel.map(Arc::new);
                     }
@@ -586,7 +594,7 @@ impl AnalysisEngine {
                         );
                         sleep(delay).await;
                         // clear channel cache on message fetching errors
-                        self.resolved_channels.remove(clean_username);
+                        self.resolved_channels.pop(clean_username);
                     }
                 }
             }

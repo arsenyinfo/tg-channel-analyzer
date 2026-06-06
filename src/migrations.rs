@@ -119,7 +119,7 @@ impl MigrationManager {
     }
 
     fn latest_version() -> i32 {
-        5 // increment this when adding new migrations
+        6 // increment this when adding new migrations
     }
 
     async fn run_pending_migrations(
@@ -203,6 +203,58 @@ impl MigrationManager {
                     // add language column to user_analyses for localized recovery messages
                     let migration_sql = r#"
                         ALTER TABLE user_analyses ADD COLUMN language VARCHAR(2);
+                    "#;
+                    transaction.batch_execute(migration_sql).await?;
+                }
+                6 => {
+                    // payment idempotency, referral reward idempotency, delivery tracking
+                    let migration_sql = r#"
+                        -- idempotent payment ledger keyed on the Telegram charge id
+                        CREATE TABLE payments (
+                            id SERIAL PRIMARY KEY,
+                            telegram_payment_charge_id VARCHAR(255) NOT NULL UNIQUE,
+                            user_id INTEGER NOT NULL REFERENCES users(id),
+                            credits INTEGER NOT NULL,
+                            stars_amount INTEGER NOT NULL,
+                            invoice_payload VARCHAR(64) NOT NULL,
+                            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                        );
+                        CREATE INDEX idx_payments_user_id ON payments(user_id);
+
+                        -- once-per-referee guard for the paid-referral bonus.
+                        -- backfill existing users to TRUE: pre-migration paid history is not
+                        -- recoverable per-referee (old paid_user rows stored referee=referrer),
+                        -- so mark all existing users as already-rewarded to avoid duplicate
+                        -- bonuses; only users created after this migration earn the bonus.
+                        ALTER TABLE users ADD COLUMN first_payment_rewarded BOOLEAN NOT NULL DEFAULT FALSE;
+                        UPDATE users SET first_payment_rewarded = TRUE;
+
+                        -- ordinal milestone index for idempotent unpaid-milestone rewards
+                        ALTER TABLE referral_rewards ADD COLUMN milestone INTEGER;
+
+                        -- backfill existing milestone rows with a per-referrer ordinal so the
+                        -- unique index below is satisfiable and future grants continue past them
+                        WITH numbered AS (
+                            SELECT id, ROW_NUMBER() OVER (
+                                PARTITION BY referrer_user_id ORDER BY id
+                            ) AS ord
+                            FROM referral_rewards
+                            WHERE reward_type = 'unpaid_milestone'
+                        )
+                        UPDATE referral_rewards r
+                        SET milestone = numbered.ord
+                        FROM numbered
+                        WHERE r.id = numbered.id;
+
+                        CREATE UNIQUE INDEX idx_referral_rewards_milestone
+                        ON referral_rewards (referrer_user_id, milestone)
+                        WHERE reward_type = 'unpaid_milestone';
+
+                        -- delivery tracking so a charged-but-undelivered analysis can be reconciled.
+                        -- backfill existing completed analyses as delivered, otherwise the startup
+                        -- reconciliation would refund every historical completed analysis.
+                        ALTER TABLE user_analyses ADD COLUMN delivered_at TIMESTAMP WITH TIME ZONE;
+                        UPDATE user_analyses SET delivered_at = analysis_timestamp WHERE status = 'completed';
                     "#;
                     transaction.batch_execute(migration_sql).await?;
                 }

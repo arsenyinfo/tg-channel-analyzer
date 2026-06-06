@@ -110,6 +110,7 @@ impl MockTelegramBot {
                 first_name,
                 last_name,
                 validated_referrer,
+                None,
             )
             .await?;
 
@@ -162,8 +163,17 @@ impl MockTelegramBot {
         telegram_user_id: i64,
         credits: i32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // add credits to user
-        let new_balance = user_manager.add_credits(telegram_user_id, credits).await?;
+        // resolve the internal user id (process_payment / record_paid_referral key on it)
+        let (user, _) = user_manager
+            .get_or_create_user(telegram_user_id, None, None, None, None, None)
+            .await?;
+
+        // idempotently record the payment with a unique synthetic charge id
+        let charge_id = format!("test_charge_{}_{}", telegram_user_id, fastrand::u64(..));
+        let new_balance = user_manager
+            .process_payment(user.id, &charge_id, credits, credits * 50, "credits_test")
+            .await?
+            .unwrap_or(user.analysis_credits);
 
         // simulate payment success message
         let success_msg = format!(
@@ -173,7 +183,7 @@ impl MockTelegramBot {
         self.send_message(telegram_user_id, success_msg, Some("Html".to_string()));
 
         // process referral rewards for paid user
-        if let Some(reward_info) = user_manager.record_paid_referral(telegram_user_id).await? {
+        if let Some(reward_info) = user_manager.record_paid_referral(user.id).await? {
             if let Some(referrer_telegram_id) = reward_info.referrer_telegram_id {
                 let reward_msg = if reward_info.paid_rewards > 0
                     && reward_info.milestone_rewards > 0

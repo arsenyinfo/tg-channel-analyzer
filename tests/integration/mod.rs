@@ -1,5 +1,6 @@
-use deadpool_postgres::{Config, Pool, Runtime};
+use deadpool_postgres::{Config, Runtime};
 use std::env;
+use std::sync::Arc;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub mod mock_bot;
@@ -8,7 +9,7 @@ pub mod test_utils;
 
 /// test database configuration and setup
 pub struct TestDatabase {
-    pub pool: Pool,
+    pub pool: Arc<deadpool_postgres::Pool>,
     pub db_name: String,
 }
 
@@ -67,7 +68,10 @@ impl TestDatabase {
         // test connection
         let _client = pool.get().await?;
 
-        Ok(Self { pool, db_name })
+        Ok(Self {
+            pool: Arc::new(pool),
+            db_name,
+        })
     }
 
     /// runs migrations on the test database

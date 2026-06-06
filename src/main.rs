@@ -93,11 +93,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // initialize user manager with shared pool
     let user_manager = Arc::new(UserManager::new(pool.clone()));
 
+    // refund any analyses that were charged but never delivered (e.g. crash mid-delivery)
+    match user_manager.reconcile_undelivered_analyses().await {
+        Ok(0) => {}
+        Ok(n) => info!("Reconciled {} charged-but-undelivered analyses", n),
+        Err(e) => error!("Failed to reconcile undelivered analyses: {}", e),
+    }
+
+    // shared analysis engine + channel locks, used by both recovery and the live dispatcher,
+    // so per-channel serialization and the global rate limiters apply across both paths
+    let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new(pool.clone())?));
+    let channel_locks: ChannelLocks = Arc::new(Mutex::new(HashMap::new()));
+
     // recover pending analyses from previous session
     info!("Recovering pending analyses...");
-    let recovery_handles = recover_pending_analyses(user_manager.clone(), &bot_token).await?;
+    let recovery_handles = recover_pending_analyses(
+        user_manager.clone(),
+        &bot_token,
+        analysis_engine.clone(),
+        channel_locks.clone(),
+    )
+    .await?;
 
-    let bot = TelegramBot::new(&bot_token, user_manager, pool).await?;
+    let bot = TelegramBot::new(
+        &bot_token,
+        user_manager,
+        pool,
+        analysis_engine,
+        channel_locks,
+    )
+    .await?;
 
     // spawn dispatcher in a task so a panic doesn't crash the runtime
     let dispatcher_result = tokio::spawn(async move {
@@ -170,6 +195,8 @@ async fn wait_for_telegram_api(
 async fn recover_pending_analyses(
     user_manager: Arc<UserManager>,
     bot_token: &str,
+    analysis_engine: Arc<Mutex<AnalysisEngine>>,
+    channel_locks: ChannelLocks,
 ) -> Result<Vec<JoinHandle<()>>, Box<dyn std::error::Error + Send + Sync>> {
     let pending_analyses = user_manager.get_pending_analyses().await?;
 
@@ -183,16 +210,8 @@ async fn recover_pending_analyses(
         pending_analyses.len()
     );
 
-    // create analysis engine for recovery
-    let pool = CacheManager::create_pool().await?;
-    let pool = Arc::new(pool);
-    let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new(pool)?));
-
     // create bot instance for recovery
     let bot = Arc::new(teloxide::Bot::new(bot_token));
-
-    // create channel locks for recovery
-    let channel_locks: ChannelLocks = Arc::new(Mutex::new(HashMap::new()));
 
     // limit concurrent recovery tasks to avoid overwhelming APIs
     let semaphore = Arc::new(Semaphore::new(3));

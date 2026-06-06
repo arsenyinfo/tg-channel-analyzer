@@ -138,6 +138,14 @@ impl CallbackHandler {
             let analysis_type = parts[1]; // professional, personal, or roast
             let channel_name = parts[2];
 
+            // reject anything but the known analysis types; callback data is user-controlled,
+            // and an unknown/empty type would otherwise fail the DB CHECK or panic downstream
+            if !matches!(analysis_type, "professional" | "personal" | "roast") {
+                error!("Invalid analysis type in callback data: {:?}", analysis_type);
+                ctx.bot.answer_callback_query(&query.id).await?;
+                return Ok(());
+            }
+
             let telegram_user_id = query.from.id.0 as i64;
 
             // check if user has credits before starting analysis

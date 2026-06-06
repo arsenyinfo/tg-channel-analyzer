@@ -46,6 +46,7 @@ impl TestUserBuilder {
                 self.first_name.as_deref(),
                 self.last_name.as_deref(),
                 referrer_user_id,
+                None,
             )
             .await?;
         Ok(user)
@@ -245,13 +246,12 @@ impl TestScenario {
                 .create(user_manager, Some(referrer.id))
                 .await?;
 
-            // simulate payment by this referral
+            // simulate payment by this referral (keyed on the internal user id)
+            let charge_id = format!("test_charge_{}", referral.id);
             user_manager
-                .add_credits(referral.telegram_user_id, 1)
+                .process_payment(referral.id, &charge_id, 1, 50, "credits_test")
                 .await?;
-            user_manager
-                .record_paid_referral(referral.telegram_user_id)
-                .await?;
+            user_manager.record_paid_referral(referral.id).await?;
 
             paid_referrals.push(referral);
         }
@@ -263,7 +263,7 @@ impl TestScenario {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integration::TestDatabase;
+    use crate::TestDatabase;
 
     #[tokio::test]
     async fn test_user_builder() {
