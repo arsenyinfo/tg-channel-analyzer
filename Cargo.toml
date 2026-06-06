@@ -60,6 +60,7 @@ cookie_store = "0.21"
 url = "2.4"
 base64 = "0.22"
 image = "0.25"
+lru = "0.12"
 
 [dev-dependencies]
 tempfile = "3.0"

@@ -85,13 +85,28 @@ impl UserManager {
         Self { pool }
     }
 
-    /// calculates how many milestone rewards should be earned for given referral count
-    /// rewards are given every 5 referrals: 5, 10, 15, 20, 25, etc.
-    fn calculate_milestone_rewards(referral_count: i32) -> i32 {
-        referral_count / 5
+    /// number of milestone rewards earned at a given referral count.
+    /// canonical schedule (one credit each): 1, 5, 10, 20, 30, 40, ...
+    pub fn milestones_reached(referral_count: i32) -> i32 {
+        match referral_count {
+            n if n < 1 => 0,
+            n if n < 5 => 1,
+            n if n < 10 => 2,
+            n => 2 + n / 10, // 10->3, 20->4, 30->5, ...
+        }
     }
 
-    /// checks if referral count hits a celebration milestone: 1, 5, 10, 20, 30, 40, 50, etc.
+    /// referral count that triggers the next milestone after `referral_count`
+    pub fn next_milestone(referral_count: i32) -> i32 {
+        match referral_count {
+            n if n < 1 => 1,
+            n if n < 5 => 5,
+            n if n < 10 => 10,
+            n => ((n / 10) + 1) * 10,
+        }
+    }
+
+    /// true when `referral_count` lands exactly on a celebration milestone: 1, 5, 10, 20, 30, ...
     fn is_celebration_milestone(referral_count: i32) -> bool {
         match referral_count {
             1 | 5 => true,
@@ -110,7 +125,7 @@ impl UserManager {
         referrer_user_id: Option<i32>,
         language_code: Option<&str>,
     ) -> Result<(User, Option<ReferralRewardInfo>), Box<dyn Error + Send + Sync>> {
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
 
         // try to get existing user first
         if let Some(row) = client
@@ -157,11 +172,15 @@ impl UserManager {
             return Ok((user, None));
         }
 
-        // create new user with default credits
-        let row = client
+        // create new user and process any referral atomically in one transaction,
+        // so a referral-processing failure rolls back the user insert rather than
+        // leaving referred_by_user_id set with no referrer increment
+        let transaction = client.transaction().await?;
+
+        let row = transaction
             .query_one(
-                "INSERT INTO users (telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language) 
-                 VALUES ($1, $2, $3, $4, 1, 0, $5, 0, 0, $6) 
+                "INSERT INTO users (telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language)
+                 VALUES ($1, $2, $3, $4, 1, 0, $5, 0, 0, $6)
                  RETURNING id, telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language",
                 &[&telegram_user_id, &username, &first_name, &last_name, &referrer_user_id, &language_code],
             )
@@ -186,48 +205,32 @@ impl UserManager {
             telegram_user_id, user.analysis_credits
         );
 
-        // if user was referred, increment referrer's count and check for rewards
-        if let Some(referrer_id) = referrer_user_id {
-            info!(
-                "Processing new referral: user {} was referred by user {}",
-                telegram_user_id, referrer_id
-            );
-            match self.process_new_referral(referrer_id).await {
-                Ok(Some(reward_info)) => {
-                    info!("Referral processing successful for referrer {}: {} referrals, {} milestone credits, {} paid credits, celebration: {}", 
-                          referrer_id, reward_info.referral_count, reward_info.milestone_rewards, reward_info.paid_rewards, reward_info.is_celebration_milestone);
-                    return Ok((user, Some(reward_info)));
-                }
-                Ok(None) => {
-                    info!(
-                        "Referral processed for referrer {} but no rewards or milestones triggered",
-                        referrer_id
-                    );
-                }
-                Err(e) => {
-                    error!("Failed to process referral for user {}: {}", referrer_id, e);
-                }
+        let reward_info = match referrer_user_id {
+            Some(referrer_id) => {
+                info!(
+                    "Processing new referral: user {} was referred by user {}",
+                    telegram_user_id, referrer_id
+                );
+                Self::process_new_referral_tx(&transaction, referrer_id).await?
             }
-        } else {
-            info!("New user {} created without referrer", telegram_user_id);
-        }
+            None => {
+                info!("New user {} created without referrer", telegram_user_id);
+                None
+            }
+        };
 
-        Ok((user, None))
+        transaction.commit().await?;
+        Ok((user, reward_info))
     }
 
-    /// processes a new referral: increments count and checks for rewards/milestones
-    async fn process_new_referral(
-        &self,
+    /// processes a new referral within an open transaction: increments the referrer's
+    /// count (locking the row) and awards any newly-reached milestone rewards idempotently
+    async fn process_new_referral_tx(
+        transaction: &tokio_postgres::Transaction<'_>,
         referrer_user_id: i32,
     ) -> Result<Option<ReferralRewardInfo>, Box<dyn Error + Send + Sync>> {
-        let client = self.pool.get().await?;
-
-        // increment referrals count and get new count
-        info!(
-            "Incrementing referral count for referrer user {}",
-            referrer_user_id
-        );
-        let row = client
+        // increment referrals count (row lock held for the transaction) and get new count
+        let row = transaction
             .query_one(
                 "UPDATE users SET referrals_count = referrals_count + 1 WHERE id = $1 RETURNING referrals_count, telegram_user_id",
                 &[&referrer_user_id],
@@ -237,83 +240,16 @@ impl UserManager {
         let new_referral_count: i32 = row.get(0);
         let telegram_user_id: i64 = row.get(1);
 
-        info!(
-            "Successfully incremented referrals count for user {} (telegram_id: {}) to {}",
-            referrer_user_id, telegram_user_id, new_referral_count
-        );
+        let milestone_rewards =
+            Self::award_milestone_rewards(transaction, referrer_user_id, new_referral_count).await?;
 
-        // check if this is a celebration milestone
         let is_celebration = Self::is_celebration_milestone(new_referral_count);
         info!(
-            "Referral milestone check for user {}: count={}, is_celebration={}",
-            referrer_user_id, new_referral_count, is_celebration
+            "Referral processed for referrer {} (telegram_id: {}): count={}, milestone_credits={}, celebration={}",
+            referrer_user_id, telegram_user_id, new_referral_count, milestone_rewards, is_celebration
         );
 
-        // check for credit rewards (every 5 referrals)
-        let expected_milestone_rewards = Self::calculate_milestone_rewards(new_referral_count);
-        info!(
-            "Expected milestone rewards for {} referrals: {}",
-            new_referral_count, expected_milestone_rewards
-        );
-        let existing_unpaid_rewards = client
-            .query_one(
-                "SELECT COUNT(*) FROM referral_rewards WHERE referrer_user_id = $1 AND reward_type = 'unpaid_milestone'",
-                &[&referrer_user_id],
-            )
-            .await?
-            .get::<_, i64>(0) as i32;
-
-        let mut milestone_rewards = 0;
-        if expected_milestone_rewards > existing_unpaid_rewards {
-            let new_rewards = expected_milestone_rewards - existing_unpaid_rewards;
-            milestone_rewards = new_rewards;
-            info!(
-                "Awarding {} new milestone rewards to user {} (expected: {}, existing: {})",
-                new_rewards, referrer_user_id, expected_milestone_rewards, existing_unpaid_rewards
-            );
-            for i in 0..new_rewards {
-                info!(
-                    "Awarding milestone reward {} of {} to user {}",
-                    i + 1,
-                    new_rewards,
-                    referrer_user_id
-                );
-                // award 1 credit for milestone
-                client
-                    .execute(
-                        "UPDATE users SET analysis_credits = analysis_credits + 1 WHERE id = $1",
-                        &[&referrer_user_id],
-                    )
-                    .await?;
-
-                // record the reward
-                client
-                    .execute(
-                        "INSERT INTO referral_rewards (referrer_user_id, referee_user_id, reward_type, credits_awarded) VALUES ($1, $1, 'unpaid_milestone', 1)",
-                        &[&referrer_user_id],
-                    )
-                    .await?;
-                info!(
-                    "Successfully awarded milestone reward {} to user {}",
-                    i + 1,
-                    referrer_user_id
-                );
-            }
-            info!(
-                "Completed awarding {} milestone rewards to user {}",
-                new_rewards, referrer_user_id
-            );
-        } else {
-            info!(
-                "No new milestone rewards for user {} (expected: {}, existing: {})",
-                referrer_user_id, expected_milestone_rewards, existing_unpaid_rewards
-            );
-        }
-
-        // return info if there are rewards or if it's a celebration milestone
         if milestone_rewards > 0 || is_celebration {
-            info!("Returning reward info for user {}: milestone_rewards={}, is_celebration={}, referral_count={}", 
-                  referrer_user_id, milestone_rewards, is_celebration, new_referral_count);
             Ok(Some(ReferralRewardInfo {
                 milestone_rewards,
                 paid_rewards: 0,
@@ -324,12 +260,54 @@ impl UserManager {
                 referral_count: new_referral_count,
             }))
         } else {
-            info!(
-                "No reward info to return for user {} (milestone_rewards={}, is_celebration={})",
-                referrer_user_id, milestone_rewards, is_celebration
-            );
             Ok(None)
         }
+    }
+
+    /// awards credits for every milestone ordinal newly reached at `referral_count`.
+    /// idempotent: the partial unique index on (referrer_user_id, milestone) makes a
+    /// concurrent or repeated grant of the same ordinal a no-op. returns credits granted.
+    async fn award_milestone_rewards(
+        transaction: &tokio_postgres::Transaction<'_>,
+        referrer_user_id: i32,
+        referral_count: i32,
+    ) -> Result<i32, Box<dyn Error + Send + Sync>> {
+        let target = Self::milestones_reached(referral_count);
+        let existing = transaction
+            .query_one(
+                "SELECT COUNT(*) FROM referral_rewards WHERE referrer_user_id = $1 AND reward_type = 'unpaid_milestone'",
+                &[&referrer_user_id],
+            )
+            .await?
+            .get::<_, i64>(0) as i32;
+
+        let mut granted = 0;
+        for ordinal in (existing + 1)..=target {
+            let inserted = transaction
+                .execute(
+                    "INSERT INTO referral_rewards (referrer_user_id, referee_user_id, reward_type, credits_awarded, milestone)
+                     VALUES ($1, $1, 'unpaid_milestone', 1, $2)
+                     ON CONFLICT (referrer_user_id, milestone) WHERE reward_type = 'unpaid_milestone' DO NOTHING",
+                    &[&referrer_user_id, &ordinal],
+                )
+                .await?;
+            if inserted == 1 {
+                transaction
+                    .execute(
+                        "UPDATE users SET analysis_credits = analysis_credits + 1 WHERE id = $1",
+                        &[&referrer_user_id],
+                    )
+                    .await?;
+                granted += 1;
+            }
+        }
+        if granted > 0 {
+            info!(
+                "Awarded {} milestone credits to user {} (target ordinal {})",
+                granted, referrer_user_id, target
+            );
+        }
+        Ok(granted)
     }
 
     /// marks analysis as failed
@@ -338,13 +316,65 @@ impl UserManager {
         analysis_id: i32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.pool.get().await?;
-        client
+        // only a still-pending analysis may be failed; never clobber a completed
+        // (charged) row. a completed-but-undelivered analysis is handled by refund_analysis.
+        let updated = client
             .execute(
-                "UPDATE user_analyses SET status = 'failed' WHERE id = $1",
+                "UPDATE user_analyses SET status = 'failed' WHERE id = $1 AND status = 'pending'",
                 &[&analysis_id],
             )
             .await?;
-        info!("Marked analysis {} as failed", analysis_id);
+        if updated == 1 {
+            info!("Marked analysis {} as failed", analysis_id);
+        }
+        Ok(())
+    }
+
+    /// refunds a completed (charged) analysis whose result could not be delivered.
+    /// no-op unless the analysis is in 'completed' state, so it is safe to call redundantly.
+    pub async fn refund_analysis(
+        &self,
+        analysis_id: i32,
+        user_id: i32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+        let updated = transaction
+            .execute(
+                "UPDATE user_analyses SET status = 'failed' WHERE id = $1 AND status = 'completed'",
+                &[&analysis_id],
+            )
+            .await?;
+        if updated == 1 {
+            transaction
+                .execute(
+                    "UPDATE users SET analysis_credits = analysis_credits + 1, updated_at = NOW() WHERE id = $1",
+                    &[&user_id],
+                )
+                .await?;
+            transaction.commit().await?;
+            info!(
+                "Refunded analysis {} for user {} (delivery failed)",
+                analysis_id, user_id
+            );
+        } else {
+            transaction.rollback().await?;
+        }
+        Ok(())
+    }
+
+    /// marks a completed analysis as delivered
+    pub async fn mark_analysis_delivered(
+        &self,
+        analysis_id: i32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE user_analyses SET delivered_at = NOW() WHERE id = $1 AND status = 'completed'",
+                &[&analysis_id],
+            )
+            .await?;
         Ok(())
     }
 
@@ -482,37 +512,94 @@ impl UserManager {
         Ok(pending_analyses)
     }
 
-    /// adds credits to user (for future payment integration)
-    pub async fn add_credits(
+    /// refunds and fails any analysis that was charged but never delivered (e.g. the bot
+    /// crashed between the credit deduction and result delivery). returns the count reconciled.
+    /// run once at startup before recovery.
+    pub async fn reconcile_undelivered_analyses(
         &self,
-        user_id: i32,
-        credits_to_add: i32,
-    ) -> Result<i32, Box<dyn Error + Send + Sync>> {
-        let client = self.pool.get().await?;
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
 
-        let row = client
-            .query_opt(
-                "UPDATE users SET analysis_credits = analysis_credits + $2, updated_at = NOW() 
-                 WHERE id = $1 
-                 RETURNING analysis_credits",
-                &[&user_id, &credits_to_add],
+        let rows = transaction
+            .query(
+                "SELECT id, user_id FROM user_analyses WHERE status = 'completed' AND delivered_at IS NULL FOR UPDATE",
+                &[],
             )
             .await?;
 
-        match row {
-            Some(row) => {
-                let new_balance: i32 = row.get(0);
-                info!(
-                    "Added {} credits to user {}, new balance: {}",
-                    credits_to_add, user_id, new_balance
-                );
-                Ok(new_balance)
-            }
-            None => {
-                error!("User {} not found when adding credits", user_id);
-                Err("User not found".into())
-            }
+        if rows.is_empty() {
+            transaction.rollback().await?;
+            return Ok(0);
         }
+
+        let ids: Vec<i32> = rows.iter().map(|r| r.get(0)).collect();
+        for row in &rows {
+            let user_id: i32 = row.get(1);
+            transaction
+                .execute(
+                    "UPDATE users SET analysis_credits = analysis_credits + 1, updated_at = NOW() WHERE id = $1",
+                    &[&user_id],
+                )
+                .await?;
+        }
+        transaction
+            .execute(
+                "UPDATE user_analyses SET status = 'failed' WHERE id = ANY($1)",
+                &[&ids],
+            )
+            .await?;
+        transaction.commit().await?;
+
+        info!(
+            "Reconciled {} charged-but-undelivered analyses (refunded)",
+            ids.len()
+        );
+        Ok(ids.len())
+    }
+
+    /// idempotently records a successful Telegram payment and credits the user.
+    /// returns Ok(Some(new_balance)) on first processing, Ok(None) if this charge id
+    /// was already processed (duplicate redelivery), so the caller skips re-crediting.
+    pub async fn process_payment(
+        &self,
+        user_id: i32,
+        telegram_payment_charge_id: &str,
+        credits: i32,
+        stars_amount: i32,
+        invoice_payload: &str,
+    ) -> Result<Option<i32>, Box<dyn Error + Send + Sync>> {
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+
+        let inserted = transaction
+            .execute(
+                "INSERT INTO payments (telegram_payment_charge_id, user_id, credits, stars_amount, invoice_payload)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (telegram_payment_charge_id) DO NOTHING",
+                &[&telegram_payment_charge_id, &user_id, &credits, &stars_amount, &invoice_payload],
+            )
+            .await?;
+
+        if inserted == 0 {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+
+        let new_balance: i32 = transaction
+            .query_one(
+                "UPDATE users SET analysis_credits = analysis_credits + $2, updated_at = NOW() WHERE id = $1 RETURNING analysis_credits",
+                &[&user_id, &credits],
+            )
+            .await?
+            .get(0);
+
+        transaction.commit().await?;
+        info!(
+            "Processed payment {} for user {}: +{} credits, new balance {}",
+            telegram_payment_charge_id, user_id, credits, new_balance
+        );
+        Ok(Some(new_balance))
     }
 
     /// validates that a user ID exists and can be used as a referrer
@@ -527,185 +614,77 @@ impl UserManager {
         Ok(row.is_some())
     }
 
-    /// checks if user qualifies for referral rewards and awards them
-    pub async fn check_and_award_referral_rewards(
-        &self,
-        user_id: i32,
-    ) -> Result<ReferralRewardInfo, Box<dyn Error + Send + Sync>> {
-        let client = self.pool.get().await?;
-
-        // get current referral counts and telegram_user_id
-        let row = client
-            .query_opt(
-                "SELECT referrals_count, paid_referrals_count, telegram_user_id FROM users WHERE id = $1",
-                &[&user_id],
-            )
-            .await?;
-
-        if let Some(row) = row {
-            let referrals_count: i32 = row.get(0);
-            let paid_referrals_count: i32 = row.get(1);
-            let telegram_user_id: i64 = row.get(2);
-
-            let mut milestone_rewards = 0;
-            let mut paid_rewards = 0;
-
-            // check for milestone rewards using new pattern (1, 5, 10, 20, 30, etc.)
-            let expected_milestone_rewards = Self::calculate_milestone_rewards(referrals_count);
-            let existing_unpaid_rewards = client
-                .query_one(
-                    "SELECT COUNT(*) FROM referral_rewards WHERE referrer_user_id = $1 AND reward_type = 'unpaid_milestone'",
-                    &[&user_id],
-                )
-                .await?
-                .get::<_, i64>(0) as i32;
-
-            if expected_milestone_rewards > existing_unpaid_rewards {
-                let new_rewards = expected_milestone_rewards - existing_unpaid_rewards;
-                milestone_rewards = new_rewards;
-                for _ in 0..new_rewards {
-                    // award 1 credit for milestone
-                    client
-                        .execute(
-                            "UPDATE users SET analysis_credits = analysis_credits + 1 WHERE id = $1",
-                            &[&user_id],
-                        )
-                        .await?;
-
-                    // record the reward
-                    client
-                        .execute(
-                            "INSERT INTO referral_rewards (referrer_user_id, referee_user_id, reward_type, credits_awarded) VALUES ($1, $1, 'unpaid_milestone', 1)",
-                            &[&user_id],
-                        )
-                        .await?;
-                }
-                info!(
-                    "Awarded {} milestone rewards to user {}",
-                    new_rewards, user_id
-                );
-            }
-
-            // check for paid user rewards
-            let existing_paid_rewards = client
-                .query_one(
-                    "SELECT COUNT(*) FROM referral_rewards WHERE referrer_user_id = $1 AND reward_type = 'paid_user'",
-                    &[&user_id],
-                )
-                .await?
-                .get::<_, i64>(0) as i32;
-
-            if paid_referrals_count > existing_paid_rewards {
-                let new_paid_rewards = paid_referrals_count - existing_paid_rewards;
-                paid_rewards = new_paid_rewards;
-                for _ in 0..new_paid_rewards {
-                    // award 1 credit for paid referral
-                    client
-                        .execute(
-                            "UPDATE users SET analysis_credits = analysis_credits + 1 WHERE id = $1",
-                            &[&user_id],
-                        )
-                        .await?;
-
-                    // record the reward
-                    client
-                        .execute(
-                            "INSERT INTO referral_rewards (referrer_user_id, referee_user_id, reward_type, credits_awarded) VALUES ($1, $1, 'paid_user', 1)",
-                            &[&user_id],
-                        )
-                        .await?;
-                }
-                info!(
-                    "Awarded {} paid referral rewards to user {}",
-                    new_paid_rewards, user_id
-                );
-            }
-
-            Ok(ReferralRewardInfo {
-                milestone_rewards,
-                paid_rewards,
-                total_credits_awarded: milestone_rewards + paid_rewards,
-                referrer_telegram_id: if milestone_rewards > 0 || paid_rewards > 0 {
-                    Some(telegram_user_id)
-                } else {
-                    None
-                },
-                referrer_user_id: if milestone_rewards > 0 || paid_rewards > 0 {
-                    Some(user_id)
-                } else {
-                    None
-                },
-                is_celebration_milestone: Self::is_celebration_milestone(referrals_count),
-                referral_count: referrals_count,
-            })
-        } else {
-            Ok(ReferralRewardInfo {
-                milestone_rewards: 0,
-                paid_rewards: 0,
-                total_credits_awarded: 0,
-                referrer_telegram_id: None,
-                referrer_user_id: None,
-                is_celebration_milestone: false,
-                referral_count: 0,
-            })
-        }
-    }
-
-    /// increments paid referrals count when a referred user makes a payment
+    /// awards the one-time paid-referral bonus when a referred user makes their FIRST payment.
+    /// idempotent per-referee via users.first_payment_rewarded, so repeat payments grant nothing.
+    /// `referee_id` is the paying user.
     pub async fn record_paid_referral(
         &self,
-        user_id: i32,
+        referee_id: i32,
     ) -> Result<Option<ReferralRewardInfo>, Box<dyn Error + Send + Sync>> {
-        info!("Processing paid referral for user {}", user_id);
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
 
-        // find if this user was referred and update referrer's paid count
-        let row = client
-            .query_opt(
-                "SELECT referred_by_user_id FROM users WHERE id = $1",
-                &[&user_id],
+        // claim the first-payment bonus for this referee (row-locks via the conditional update)
+        let claimed = transaction
+            .execute(
+                "UPDATE users SET first_payment_rewarded = TRUE WHERE id = $1 AND first_payment_rewarded = FALSE",
+                &[&referee_id],
             )
             .await?;
 
-        if let Some(row) = row {
-            if let Some(referrer_id) = row.get::<_, Option<i32>>(0) {
-                info!(
-                    "User {} was referred by user {}, incrementing paid referral count",
-                    user_id, referrer_id
-                );
-                // increment paid referrals count
-                client
-                    .execute(
-                        "UPDATE users SET paid_referrals_count = paid_referrals_count + 1 WHERE id = $1",
-                        &[&referrer_id],
-                    )
-                    .await?;
-                info!(
-                    "Successfully incremented paid referral count for referrer {}",
-                    referrer_id
-                );
-
-                // check and award rewards
-                info!(
-                    "Checking and awarding referral rewards for referrer {}",
-                    referrer_id
-                );
-                let reward_info = self.check_and_award_referral_rewards(referrer_id).await?;
-
-                info!("Recorded paid referral for user {}, referrer {} - rewards: milestone={}, paid={}, total={}", 
-                      user_id, referrer_id, reward_info.milestone_rewards, reward_info.paid_rewards, reward_info.total_credits_awarded);
-                return Ok(Some(reward_info));
-            } else {
-                info!(
-                    "User {} was not referred by anyone (referred_by_user_id is NULL)",
-                    user_id
-                );
-            }
-        } else {
-            info!("User {} not found in database", user_id);
+        if claimed == 0 {
+            // already rewarded for a prior payment, or user does not exist
+            transaction.rollback().await?;
+            return Ok(None);
         }
 
-        info!("No paid referral to record for user {}", user_id);
-        Ok(None)
+        let referred_by: Option<i32> = transaction
+            .query_one(
+                "SELECT referred_by_user_id FROM users WHERE id = $1",
+                &[&referee_id],
+            )
+            .await?
+            .get(0);
+
+        let Some(referrer_id) = referred_by else {
+            // first payment, but this user was not referred by anyone
+            transaction.commit().await?;
+            return Ok(None);
+        };
+
+        // award the referrer one credit and increment their paid count (row-locked by the update)
+        let row = transaction
+            .query_one(
+                "UPDATE users SET paid_referrals_count = paid_referrals_count + 1, analysis_credits = analysis_credits + 1, updated_at = NOW()
+                 WHERE id = $1 RETURNING telegram_user_id, referrals_count",
+                &[&referrer_id],
+            )
+            .await?;
+        let referrer_telegram_id: i64 = row.get(0);
+        let referrals_count: i32 = row.get(1);
+
+        transaction
+            .execute(
+                "INSERT INTO referral_rewards (referrer_user_id, referee_user_id, reward_type, credits_awarded, milestone) VALUES ($1, $2, 'paid_user', 1, NULL)",
+                &[&referrer_id, &referee_id],
+            )
+            .await?;
+
+        transaction.commit().await?;
+
+        info!(
+            "Awarded paid-referral bonus: referee {} first payment -> referrer {} +1 credit",
+            referee_id, referrer_id
+        );
+
+        Ok(Some(ReferralRewardInfo {
+            milestone_rewards: 0,
+            paid_rewards: 1,
+            total_credits_awarded: 1,
+            referrer_telegram_id: Some(referrer_telegram_id),
+            referrer_user_id: Some(referrer_id),
+            is_celebration_milestone: false,
+            referral_count: referrals_count,
+        }))
     }
 }

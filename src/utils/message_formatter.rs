@@ -1,5 +1,6 @@
 use comrak::{markdown_to_html, ComrakOptions};
 use html_escape;
+use regex::Regex;
 
 pub struct MessageFormatter;
 
@@ -10,14 +11,28 @@ impl MessageFormatter {
     }
 
     pub fn markdown_to_html_safe(text: &str) -> String {
-        // convert markdown to HTML with Telegram-compatible options
+        // convert markdown to HTML with Telegram-compatible options.
+        // autolink is disabled and anchors are stripped below so attacker-controlled channel
+        // content (via the LLM analysis output) cannot surface clickable phishing links.
         let mut options = ComrakOptions::default();
         options.extension.strikethrough = true;
-        options.extension.autolink = true;
+        options.extension.autolink = false;
         options.render.hardbreaks = true;
         options.render.unsafe_ = false;
 
         let html = markdown_to_html(text, &options);
+
+        // strip anchor tags from markdown links, keeping only their visible text
+        // (comrak escapes attribute contents, so a literal '>' never appears inside the tag)
+        let anchor_open = Regex::new(r"<a\b[^>]*>").unwrap();
+        let html = anchor_open.replace_all(&html, "").into_owned();
+        let html = html.replace("</a>", "");
+
+        // defang URL schemes and www so Telegram clients do not auto-linkify bare URLs the
+        // model may still emit. covers scheme:// and www. forms (the clickable phishing vectors);
+        // a bare domain with no scheme/www is a documented residual.
+        let html = html.replace("://", "[://]");
+        let html = html.replace("www.", "www[.]");
 
         // telegram HTML mode only supports: b, i, u, s, code, pre, a
         // replace unsupported tags with supported ones or remove them
@@ -88,6 +103,27 @@ impl MessageFormatter {
         text.encode_utf16().count()
     }
 
+    /// hard-splits a single token into pieces each within `max_length` UTF-16 code units,
+    /// breaking only at char boundaries
+    fn hard_split_word(word: &str, max_length: usize) -> Vec<String> {
+        let mut pieces = Vec::new();
+        let mut current = String::new();
+        let mut current_len = 0;
+        for ch in word.chars() {
+            let ch_len = ch.len_utf16();
+            if current_len + ch_len > max_length && !current.is_empty() {
+                pieces.push(std::mem::take(&mut current));
+                current_len = 0;
+            }
+            current.push(ch);
+            current_len += ch_len;
+        }
+        if !current.is_empty() {
+            pieces.push(current);
+        }
+        pieces
+    }
+
     /// splits a message into chunks that fit within Telegram's 4096 UTF-16 code unit limit
     pub fn split_message_into_chunks(text: &str, max_length: usize) -> Vec<String> {
         if Self::count_utf16_code_units(text) <= max_length {
@@ -117,15 +153,34 @@ impl MessageFormatter {
                     let mut word_chunk = String::new();
 
                     for word in words {
-                        let word_with_space = format!("{} ", word);
-                        if Self::count_utf16_code_units(&word_chunk)
-                            + Self::count_utf16_code_units(&word_with_space)
-                            > max_length
-                        {
+                        // a single word longer than the limit must be hard-split, otherwise
+                        // it would produce an over-limit chunk that Telegram rejects
+                        if Self::count_utf16_code_units(word) > max_length {
                             if !word_chunk.is_empty() {
                                 chunks.push(word_chunk.trim_end().to_string());
                                 word_chunk.clear();
                             }
+                            let pieces = Self::hard_split_word(word, max_length);
+                            let last = pieces.len() - 1;
+                            for (i, piece) in pieces.into_iter().enumerate() {
+                                if i == last {
+                                    word_chunk.push_str(&piece);
+                                    word_chunk.push(' ');
+                                } else {
+                                    chunks.push(piece);
+                                }
+                            }
+                            continue;
+                        }
+
+                        let word_with_space = format!("{} ", word);
+                        if Self::count_utf16_code_units(&word_chunk)
+                            + Self::count_utf16_code_units(&word_with_space)
+                            > max_length
+                            && !word_chunk.is_empty()
+                        {
+                            chunks.push(word_chunk.trim_end().to_string());
+                            word_chunk.clear();
                         }
                         word_chunk.push_str(&word_with_space);
                     }

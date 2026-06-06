@@ -738,13 +738,11 @@ impl Lang {
     fn analysis_type_capitalized(&self, analysis_type: &str) -> String {
         match self {
             Lang::En => {
-                analysis_type
-                    .chars()
-                    .next()
-                    .unwrap()
-                    .to_uppercase()
-                    .collect::<String>()
-                    + &analysis_type[1..]
+                let mut chars = analysis_type.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
             }
             Lang::Ru => match analysis_type {
                 "professional" => "Профессиональный".to_string(),

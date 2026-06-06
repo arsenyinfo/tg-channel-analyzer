@@ -45,12 +45,12 @@ async fn test_basic_referral_chain() {
 
         // check if it's a milestone
         if i == 1 {
-            // first referral should trigger celebration milestone
+            // first referral is milestone #1: celebration + 1 credit (schedule 1,5,10,20,30)
             assert!(reward_info.is_some());
             let reward = reward_info.unwrap();
             assert_eq!(reward.referral_count, 1);
-            assert_eq!(reward.milestone_rewards, 0); // no credit rewards yet
-            assert_eq!(reward.total_credits_awarded, 0);
+            assert_eq!(reward.milestone_rewards, 1);
+            assert_eq!(reward.total_credits_awarded, 1);
             assert!(reward.is_celebration_milestone);
         } else if i == 5 {
             // fifth referral should trigger both celebration and credit reward
@@ -71,18 +71,18 @@ async fn test_basic_referral_chain() {
         .await
         .expect("Referral count assertion failed");
 
-    TestAssertions::assert_user_credit_count(&db, referrer.id, 2) // 1 initial + 1 from milestone
+    TestAssertions::assert_user_credit_count(&db, referrer.id, 3) // 1 initial + milestones at 1 and 5
         .await
         .expect("Credit count assertion failed");
 
-    TestAssertions::assert_referral_reward_count(&db, referrer.id, "unpaid_milestone", 1)
+    TestAssertions::assert_referral_reward_count(&db, referrer.id, "unpaid_milestone", 2)
         .await
         .expect("Milestone reward count assertion failed");
 
-    // verify notification messages were sent
-    assert!(bot.message_count_for_chat(referrer_telegram_id) >= 3); // welcome + celebration for 1st + reward for 5th
-    assert!(bot.chat_received_message_containing(referrer_telegram_id, "🎊 Referral Milestone"));
+    // verify notification messages were sent (both milestones 1 and 5 award credits)
+    assert!(bot.message_count_for_chat(referrer_telegram_id) >= 3); // welcome + reward for 1st + reward for 5th
     assert!(bot.chat_received_message_containing(referrer_telegram_id, "🎉 Referral Milestone"));
+    assert!(bot.chat_received_message_containing(referrer_telegram_id, "earned"));
 
     // cleanup test database
     db.cleanup().await.expect("Failed to cleanup test database");
@@ -111,7 +111,7 @@ async fn test_milestone_celebrations() {
         .expect("Failed to create referrer");
 
     let celebration_milestones = [1, 5, 10, 20, 30];
-    let credit_milestones = [5, 10, 15, 20, 25, 30]; // every 5
+    let credit_milestones = [1, 5, 10, 20, 30]; // credits granted on the same schedule
 
     // create referrals up to 30
     for i in 1..=30 {
@@ -145,7 +145,6 @@ async fn test_milestone_celebrations() {
             assert_eq!(reward.is_celebration_milestone, should_celebrate);
 
             if should_get_credits {
-                let _expected_credits = i as i32 / 5; // credits = referral_count / 5
                 assert_eq!(
                     reward.milestone_rewards, 1,
                     "Expected 1 new credit at referral {}",
@@ -197,11 +196,11 @@ async fn test_milestone_celebrations() {
         .await
         .expect("Final referral count assertion failed");
 
-    TestAssertions::assert_user_credit_count(&db, referrer.id, 7) // 1 initial + 6 milestone credits (30/5)
+    TestAssertions::assert_user_credit_count(&db, referrer.id, 6) // 1 initial + 5 milestones (1,5,10,20,30)
         .await
         .expect("Final credit count assertion failed");
 
-    TestAssertions::assert_referral_reward_count(&db, referrer.id, "unpaid_milestone", 6)
+    TestAssertions::assert_referral_reward_count(&db, referrer.id, "unpaid_milestone", 5)
         .await
         .expect("Final milestone reward count assertion failed");
 
@@ -310,12 +309,12 @@ async fn test_mixed_paid_and_unpaid_referrals() {
         .await
         .expect("Paid referral count assertion failed");
 
-    // should have 1 initial + 1 milestone (5 referrals) + 1 paid = 3 credits
-    TestAssertions::assert_user_credit_count(&db, referrer.id, 3)
+    // should have 1 initial + 2 milestones (at 1 and 5) + 1 paid = 4 credits
+    TestAssertions::assert_user_credit_count(&db, referrer.id, 4)
         .await
         .expect("Mixed scenario credit count assertion failed");
 
-    TestAssertions::assert_referral_reward_count(&db, referrer.id, "unpaid_milestone", 1)
+    TestAssertions::assert_referral_reward_count(&db, referrer.id, "unpaid_milestone", 2)
         .await
         .expect("Unpaid milestone reward count assertion failed");
 
@@ -358,12 +357,12 @@ async fn test_progressive_milestone_rewards() {
         .await
         .expect("Final referral count assertion failed");
 
-    // should have 1 initial + 5 milestone credits (25/5 = 5)
-    TestAssertions::assert_user_credit_count(&db, referrer.id, 6)
+    // should have 1 initial + 4 milestone credits (milestones 1,5,10,20 reached by 25)
+    TestAssertions::assert_user_credit_count(&db, referrer.id, 5)
         .await
         .expect("Progressive milestone credit assertion failed");
 
-    TestAssertions::assert_referral_reward_count(&db, referrer.id, "unpaid_milestone", 5)
+    TestAssertions::assert_referral_reward_count(&db, referrer.id, "unpaid_milestone", 4)
         .await
         .expect("Progressive milestone reward count assertion failed");
 
@@ -402,7 +401,7 @@ async fn test_progressive_milestone_rewards() {
         .await
         .expect("Final 30 referral count assertion failed");
 
-    TestAssertions::assert_user_credit_count(&db, referrer.id, 7) // 1 initial + 6 milestone credits
+    TestAssertions::assert_user_credit_count(&db, referrer.id, 6) // 1 initial + 5 milestones (1,5,10,20,30)
         .await
         .expect("Final 30 credit count assertion failed");
 
@@ -487,7 +486,7 @@ async fn test_database_consistency() {
     let (referrer, _, _) = TestScenario::create_referrer_with_mixed_referrals(
         &user_manager,
         700,
-        15, // unpaid (should give 3 milestone credits: 5, 10, 15)
+        15, // unpaid (should give 3 milestone credits: at 1, 5, 10)
         2,  // paid (should give 2 paid credits)
     )
     .await
@@ -520,7 +519,7 @@ async fn test_database_consistency() {
         .expect("Failed to query milestone rewards");
 
     let milestone_count: i64 = milestone_rewards.get(0);
-    assert_eq!(milestone_count, 3); // rewards at 5, 10, 15
+    assert_eq!(milestone_count, 3); // rewards at 1, 5, 10
 
     let paid_rewards = client
         .query_one(

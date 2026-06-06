@@ -39,6 +39,7 @@ pub struct TelegramBot {
     user_manager: Arc<UserManager>,
     pool: Arc<Pool>,
     payment_handler: PaymentHandler,
+    channel_locks: ChannelLocks,
 }
 
 #[derive(Clone)]
@@ -78,7 +79,7 @@ impl TelegramBot {
         loop {
             interval.tick().await;
 
-            let client = match pool.get().await {
+            let mut client = match pool.get().await {
                 Ok(client) => client,
                 Err(e) => {
                     error!(
@@ -89,14 +90,24 @@ impl TelegramBot {
                 }
             };
 
-            // get next pending message
-            let row = match client
+            // hold a transaction across the claim, send, and status update so the row lock
+            // spans the whole critical section (FOR UPDATE SKIP LOCKED in autocommit would
+            // release the lock immediately, allowing a second processor to double-send)
+            let transaction = match client.transaction().await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    error!("Failed to open queue transaction: {}", e);
+                    continue;
+                }
+            };
+
+            let row = match transaction
                 .query_opt(
-                    "SELECT id, telegram_user_id, message, parse_mode 
-                 FROM message_queue 
-                 WHERE status = 'pending' 
-                 ORDER BY created_at 
-                 LIMIT 1 
+                    "SELECT id, telegram_user_id, message, parse_mode
+                 FROM message_queue
+                 WHERE status = 'pending'
+                 ORDER BY created_at
+                 LIMIT 1
                  FOR UPDATE SKIP LOCKED",
                     &[],
                 )
@@ -109,41 +120,56 @@ impl TelegramBot {
                 }
             };
 
-            if let Some(row) = row {
-                let id: i32 = row.get(0);
-                let user_id: i64 = row.get(1);
-                let message: String = row.get(2);
-                let parse_mode: String = row.get(3);
+            let Some(row) = row else {
+                let _ = transaction.rollback().await;
+                continue;
+            };
 
-                // send message
-                let send_result = if parse_mode.to_uppercase() == "HTML" {
-                    bot.send_message(ChatId(user_id), &message)
-                        .parse_mode(ParseMode::Html)
-                        .await
-                } else {
-                    bot.send_message(ChatId(user_id), &message)
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await
-                };
+            let id: i32 = row.get(0);
+            let user_id: i64 = row.get(1);
+            let message: String = row.get(2);
+            let parse_mode: String = row.get(3);
 
-                match send_result {
-                    Ok(_) => {
-                        if let Err(e) = client.execute(
+            // send message
+            let send_result = if parse_mode.to_uppercase() == "HTML" {
+                bot.send_message(ChatId(user_id), &message)
+                    .parse_mode(ParseMode::Html)
+                    .await
+            } else {
+                bot.send_message(ChatId(user_id), &message)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await
+            };
+
+            let update_result = match &send_result {
+                Ok(_) => {
+                    transaction
+                        .execute(
                             "UPDATE message_queue SET status = 'sent', sent_at = NOW() WHERE id = $1",
                             &[&id],
-                        ).await {
-                            error!("Failed to update message status to sent: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = e.to_string();
-                        if let Err(e) = client.execute(
+                        )
+                        .await
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    transaction
+                        .execute(
                             "UPDATE message_queue SET status = 'failed', error_message = $2 WHERE id = $1",
                             &[&id, &error_msg],
-                        ).await {
-                            error!("Failed to update message status to failed: {}", e);
-                        }
+                        )
+                        .await
+                }
+            };
+
+            match update_result {
+                Ok(_) => {
+                    if let Err(e) = transaction.commit().await {
+                        error!("Failed to commit queue status update for {}: {}", id, e);
                     }
+                }
+                Err(e) => {
+                    error!("Failed to update message status for {}: {}", id, e);
+                    let _ = transaction.rollback().await;
                 }
             }
         }
@@ -153,9 +179,10 @@ impl TelegramBot {
         bot_token: &str,
         user_manager: Arc<UserManager>,
         pool: Arc<Pool>,
+        analysis_engine: Arc<Mutex<AnalysisEngine>>,
+        channel_locks: ChannelLocks,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let bot = Arc::new(Bot::new(bot_token));
-        let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new(pool.clone())?));
         let payment_handler = PaymentHandler::new(user_manager.clone());
 
         Ok(Self {
@@ -164,6 +191,7 @@ impl TelegramBot {
             user_manager,
             pool,
             payment_handler,
+            channel_locks,
         })
     }
 
@@ -177,13 +205,13 @@ impl TelegramBot {
             Self::run_message_queue_processor(bot_clone, pool_clone).await;
         });
 
-        // create context for all handlers
+        // create context for all handlers (shares the engine + channel locks with recovery)
         let ctx = BotContext {
             bot: self.bot.clone(),
             analysis_engine: self.analysis_engine.clone(),
             user_manager: self.user_manager.clone(),
             payment_handler: self.payment_handler.clone(),
-            channel_locks: Arc::new(Mutex::new(HashMap::new())),
+            channel_locks: self.channel_locks.clone(),
         };
 
         let handler = dptree::entry()
@@ -417,20 +445,16 @@ impl TelegramBot {
                 .atomic_complete_analysis(analysis_id, user_id)
                 .await?;
 
-            bot.send_message(
-                user_chat_id,
-                lang.analysis_complete(&analysis_type, user_id, remaining_credits),
-            )
-            .parse_mode(ParseMode::Html)
-            .await?;
-
-            Self::send_single_analysis_to_user(
+            Self::deliver_or_refund(
                 bot,
+                &user_manager,
                 user_chat_id,
                 &channel_name,
                 &analysis_type,
                 cached_result,
                 user_id,
+                analysis_id,
+                remaining_credits,
                 lang,
             )
             .await?;
@@ -480,6 +504,11 @@ impl TelegramBot {
 
         let channel_lock = {
             let mut locks = channel_locks.lock().await;
+            // sweep out idle locks (strong_count == 1 means only the map holds it) so this
+            // map does not grow unbounded with one entry per channel ever analyzed
+            if locks.len() > 256 {
+                locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            }
             locks
                 .entry(channel_name.clone())
                 .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -552,7 +581,7 @@ impl TelegramBot {
             result
         };
 
-        // ATOMIC OPERATION: consume credit + mark completed + send result (protected from shutdown)
+        // consume credit + mark completed atomically; delivery (and refund-on-failure) follows
         let remaining_credits = match user_manager
             .atomic_complete_analysis(analysis_id, user_id)
             .await
@@ -584,25 +613,82 @@ impl TelegramBot {
             }
         };
 
-        // notify user that analysis is complete and send results with credit info
-        let completion_msg = lang.analysis_complete(&analysis_type, user_id, remaining_credits);
-        bot.send_message(user_chat_id, completion_msg)
-            .parse_mode(ParseMode::Html)
-            .await?;
-
-        // send single analysis result to user
-        Self::send_single_analysis_to_user(
+        // deliver the result, refunding the just-charged credit if delivery fails
+        Self::deliver_or_refund(
             bot,
+            &user_manager,
             user_chat_id,
             &channel_name,
             &analysis_type,
             result,
             user_id,
+            analysis_id,
+            remaining_credits,
             lang,
         )
-        .await?;
+        .await
+    }
 
-        Ok(())
+    /// delivers the completion message and analysis result. on success marks the analysis
+    /// delivered; on any send failure refunds the credit (the user was charged but not served)
+    /// and propagates the error. keeps money correct on routine Telegram send failures.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_or_refund(
+        bot: Arc<Bot>,
+        user_manager: &Arc<UserManager>,
+        user_chat_id: ChatId,
+        channel_name: &str,
+        analysis_type: &str,
+        result: AnalysisResult,
+        user_id: i32,
+        analysis_id: i32,
+        remaining_credits: i32,
+        lang: Lang,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let delivery = async {
+            bot.send_message(
+                user_chat_id,
+                lang.analysis_complete(analysis_type, user_id, remaining_credits),
+            )
+            .parse_mode(ParseMode::Html)
+            .await?;
+
+            Self::send_single_analysis_to_user(
+                bot.clone(),
+                user_chat_id,
+                channel_name,
+                analysis_type,
+                result,
+                user_id,
+                lang,
+            )
+            .await?;
+
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        }
+        .await;
+
+        match delivery {
+            Ok(()) => {
+                // if this write fails the row stays delivered_at=NULL and the next startup
+                // reconciliation will refund an already-delivered analysis (a rare, user-favoring
+                // double-benefit requiring a DB failure in this exact window); log it loudly
+                if let Err(e) = user_manager.mark_analysis_delivered(analysis_id).await {
+                    error!("Failed to mark analysis {} delivered: {}", analysis_id, e);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    "Delivery failed for analysis {}, refunding credit: {}",
+                    analysis_id, e
+                );
+                if let Err(re) = user_manager.refund_analysis(analysis_id, user_id).await {
+                    error!("Failed to refund analysis {}: {}", analysis_id, re);
+                }
+                Err(e)
+            }
+        }
     }
 
     async fn send_single_analysis_to_user(

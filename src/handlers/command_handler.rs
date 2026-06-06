@@ -145,7 +145,7 @@ impl CommandHandler {
         }
     }
 
-    fn extract_user_info_from_message(msg: &Message) -> UserInfo {
+    fn extract_user_info_from_message(msg: &Message) -> UserInfo<'_> {
         UserInfo {
             telegram_user_id: msg.from.as_ref().map(|user| user.id.0 as i64).unwrap_or(0),
             username: msg.from.as_ref().and_then(|user| user.username.as_deref()),
@@ -280,15 +280,9 @@ impl CommandHandler {
 
     fn build_referral_section(user: &crate::user_manager::User, lang: Lang) -> String {
         if user.referrals_count > 0 {
-            let next_milestone = if user.referrals_count < 1 {
-                1
-            } else if user.referrals_count < 5 {
-                5
-            } else if user.referrals_count < 10 {
-                10
-            } else {
-                ((user.referrals_count / 10) + 1) * 10
-            };
+            // single source of truth for the milestone schedule (1, 5, 10, 20, 30, ...)
+            let next_milestone =
+                crate::user_manager::UserManager::next_milestone(user.referrals_count);
             let referrals_to_next = next_milestone - user.referrals_count;
             lang.referral_section_with_referrals(
                 user.analysis_credits,

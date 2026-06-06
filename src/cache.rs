@@ -1,5 +1,6 @@
-use deadpool_postgres::{Config, Pool, Runtime};
+use deadpool_postgres::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use log::{error, info, warn};
+use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::env;
@@ -25,6 +26,17 @@ impl CacheManager {
 
         let mut config = Config::new();
         config.url = Some(database_url);
+        // bound the pool and fail fast on exhaustion instead of blocking forever (the default
+        // has no acquire timeout, so a leak/slow DB would silently wedge the bot)
+        config.pool = Some(PoolConfig {
+            max_size: 16,
+            timeouts: Timeouts {
+                wait: Some(Duration::from_secs(30)),
+                create: Some(Duration::from_secs(30)),
+                recycle: Some(Duration::from_secs(30)),
+            },
+            ..Default::default()
+        });
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let tls = MakeRustlsConnect::new(

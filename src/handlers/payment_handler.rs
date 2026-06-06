@@ -99,9 +99,22 @@ impl PaymentHandler {
             return Ok(());
         };
 
-        // add credits to user account
-        match self.user_manager.add_credits(user.id, credits).await {
-            Ok(new_balance) => {
+        // idempotently record the payment and credit the user, keyed on the Telegram charge id
+        // so a redelivered SuccessfulPayment (e.g. after a restart) cannot double-credit
+        let stars_amount = payment.total_amount as i32;
+        let result = self
+            .user_manager
+            .process_payment(
+                user.id,
+                &payment.telegram_payment_charge_id,
+                credits,
+                stars_amount,
+                &payment.invoice_payload,
+            )
+            .await;
+
+        let process_referral = match result {
+            Ok(Some(new_balance)) => {
                 let success_msg = lang.payment_success(user.id, credits, new_balance);
 
                 bot.send_message(msg.chat.id, success_msg)
@@ -112,22 +125,35 @@ impl PaymentHandler {
                     "Successfully processed payment: {} credits for user {}",
                     credits, telegram_user_id
                 );
-
-                // process referral rewards if user was referred
-                if let Err(e) = self.process_referral_rewards(bot, user.id, lang).await {
-                    error!(
-                        "Failed to process referral rewards for user {}: {}",
-                        user.id, e
-                    );
-                }
+                true
+            }
+            Ok(None) => {
+                info!(
+                    "Duplicate payment {} ignored for user {}",
+                    payment.telegram_payment_charge_id, telegram_user_id
+                );
+                true
             }
             Err(e) => {
                 error!(
-                    "Failed to add credits after payment for user {}: {}",
+                    "Failed to process payment for user {}: {}",
                     telegram_user_id, e
                 );
                 bot.send_message(msg.chat.id, lang.error_payment_credits())
                     .await?;
+                false
+            }
+        };
+
+        // process referral rewards if user was referred. run on the duplicate path too: the
+        // reward is idempotent (record_paid_referral), and this recovers a bonus that would
+        // otherwise be lost if a prior delivery committed the payment but crashed before this step
+        if process_referral {
+            if let Err(e) = self.process_referral_rewards(bot, user.id, lang).await {
+                error!(
+                    "Failed to process referral rewards for user {}: {}",
+                    user.id, e
+                );
             }
         }
 
