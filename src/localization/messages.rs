@@ -7,6 +7,13 @@ pub enum Lang {
 }
 
 impl Lang {
+    pub fn campaign_opt_out(&self) -> &'static str {
+        match self {
+            Lang::En => "Campaign notifications are now off. You can still use the bot normally.",
+            Lang::Ru => "Рассылки отключены. Вы по-прежнему можете пользоваться ботом как обычно.",
+        }
+    }
+
     /// creates Lang from Telegram's language_code (e.g., "ru", "en", "uk")
     pub fn from_code(code: Option<&str>) -> Self {
         match code {

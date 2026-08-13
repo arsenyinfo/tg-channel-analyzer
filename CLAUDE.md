@@ -36,14 +36,12 @@ cargo check
 # create telegram user sessions for channel access
 cargo run --bin authorize
 
-# send bulk messages
-cargo run --bin bulk_messenger
+# preview a re-engagement campaign (dry-run by default)
+cargo run --bin bulk_messenger -- launch --campaign gemini-3.7-launch
 
 # fill user language data
 cargo run --bin fill_user_languages
 
-# notify inactive users
-cargo run --bin inactive_user_notifier
 ```
 
 ## Environment Setup
@@ -101,7 +99,7 @@ DATABASE_URL=postgresql://username:password@host/database
 
 ### Referral System
 
-- Users can generate referral links: `https://t.me/BotName?start=ref_{user_id}`
+- Users can generate referral links: `https://t.me/BotName?start={user_id}`
 - Automatic referral tracking when new users join via referral link
 - Milestone rewards: 1 credit awarded at 1, 5, 10, 20, 30+ referrals
 - Additional 1 credit bonus when referred user makes their first payment
@@ -120,9 +118,11 @@ DATABASE_URL=postgresql://username:password@host/database
 
 - **`message_queue`** table ensures reliable message delivery even during bot downtime
 - Supports bulk notifications and user engagement campaigns
-- Automatic retry mechanism with exponential backoff for failed messages
+- Bounded retry with exponential backoff for safe transient failures
+- Campaign-wide daytime windows, gradual scheduling, pause/resume, and per-user idempotency
+- Ambiguous post-send failures are quarantined as `delivery_unknown`, never blindly resent
 - Message processing runs continuously in background
-- Use `cargo run --bin inactive_user_notifier` for re-engagement campaigns (example of bulk messaging)
+- Use `cargo run --bin bulk_messenger -- launch --campaign <stable-key>` for a dry run
 - Messages marked as sent/failed with detailed error tracking
 
 ### Testing

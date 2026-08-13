@@ -81,6 +81,40 @@ pub struct UserManager {
 }
 
 impl UserManager {
+    pub fn pool(&self) -> Arc<Pool> {
+        self.pool.clone()
+    }
+
+    pub async fn suppress_campaigns(
+        &self,
+        telegram_user_id: i64,
+        reason: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+        transaction
+            .execute(
+                "INSERT INTO campaign_suppressions (telegram_user_id, reason)
+                 VALUES ($1, $2)
+                 ON CONFLICT (telegram_user_id) DO UPDATE
+                 SET reason = EXCLUDED.reason, created_at = NOW()",
+                &[&telegram_user_id, &reason],
+            )
+            .await?;
+        transaction
+            .execute(
+                "UPDATE message_queue
+                 SET status = 'failed', last_error_code = 'user_opt_out',
+                     error_message = 'User opted out before delivery'
+                 WHERE telegram_user_id = $1 AND campaign_id IS NOT NULL
+                   AND status = 'pending'",
+                &[&telegram_user_id],
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub fn new(pool: Arc<Pool>) -> Self {
         Self { pool }
     }
@@ -394,8 +428,19 @@ impl UserManager {
         let analysis_id = client
             .query_opt(
                 "INSERT INTO user_analyses
-                    (user_id, channel_name, credits_used, analysis_type, status, language, telegram_callback_query_id)
-                 VALUES ($1, $2, 0, $3, 'pending', $4, $5)
+                    (user_id, channel_name, credits_used, analysis_type, status, language,
+                     telegram_callback_query_id, experiment_campaign_id)
+                 VALUES ($1, $2, 0, $3, 'pending', $4, $5, (
+                     SELECT cr.campaign_id
+                     FROM campaign_recipients cr
+                     LEFT JOIN message_queue mq
+                       ON mq.campaign_id = cr.campaign_id AND mq.user_id = cr.user_id
+                     WHERE cr.user_id = $1
+                       AND cr.enrolled_at >= NOW() - INTERVAL '30 days'
+                       AND (cr.variant IN ('holdout', 'message_credit') OR mq.sent_at IS NOT NULL)
+                     ORDER BY COALESCE(mq.sent_at, cr.enrolled_at) DESC
+                     LIMIT 1
+                 ))
                  ON CONFLICT (telegram_callback_query_id) DO NOTHING
                  RETURNING id",
                 &[
@@ -425,6 +470,8 @@ impl UserManager {
         &self,
         analysis_id: i32,
         user_id: i32,
+        result_source: &str,
+        llm_cache_key: Option<&str>,
     ) -> Result<i32, UserManagerError> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
@@ -461,8 +508,11 @@ impl UserManager {
         // guard against double-completion; no-op if already completed
         let updated = transaction
             .execute(
-                "UPDATE user_analyses SET status = 'completed', credits_used = 1 WHERE id = $1 AND status = 'pending'",
-                &[&analysis_id],
+                "UPDATE user_analyses
+                 SET status = 'completed', credits_used = 1,
+                     result_source = $3, llm_cache_key = $4
+                 WHERE id = $1 AND user_id = $2 AND status = 'pending'",
+                &[&analysis_id, &user_id, &result_source, &llm_cache_key],
             )
             .await?;
 

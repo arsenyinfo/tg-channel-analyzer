@@ -53,7 +53,7 @@ async fn duplicate_callback_query_creates_only_one_analysis() {
         .expect("One callback delivery must own the analysis");
 
     let remaining_credits = user_manager
-        .atomic_complete_analysis(analysis_id, user.id)
+        .atomic_complete_analysis(analysis_id, user.id, "generated", Some("test-cache-key"))
         .await
         .expect("Failed to complete claimed analysis");
     assert_eq!(remaining_credits, 0);

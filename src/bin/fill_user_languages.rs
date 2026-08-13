@@ -1,11 +1,12 @@
-use deadpool_postgres::{Config, Runtime};
+use deadpool_postgres::Pool;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::env;
-use tg_main::llm::{query_llm, GEMINI_FLASH_LITE_MODEL};
+use std::sync::Arc;
+use tg_main::cache::CacheManager;
+use tg_main::llm::{query_llm_with_context, LlmRunContext, GEMINI_FLASH_LITE_MODEL};
+use tg_main::migrations::MigrationManager;
 use tokio_postgres::Row;
-use tokio_postgres_rustls::MakeRustlsConnect;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LanguageInference {
@@ -74,7 +75,8 @@ fn prepare_user_data_for_inference(user: &UserWithoutLanguage) -> String {
 
 async fn infer_language_batch(
     users: &[UserWithoutLanguage],
-) -> Result<Vec<(i32, Option<String>)>, Box<dyn std::error::Error>> {
+    pool: Arc<Pool>,
+) -> Result<Vec<(i32, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
     if users.is_empty() {
         return Ok(Vec::new());
     }
@@ -87,8 +89,18 @@ async fn infer_language_batch(
     }
 
     // use the stable Flash-Lite model for efficiency
-    match query_llm(&prompt, GEMINI_FLASH_LITE_MODEL).await {
+    let context = LlmRunContext::new(pool, "language_inference", None);
+    match query_llm_with_context(
+        &prompt,
+        GEMINI_FLASH_LITE_MODEL,
+        Some(&context),
+        "direct",
+        0,
+    )
+    .await
+    {
         Ok(response) => {
+            let attempt_key = response.attempt_key.clone();
             let text = response.content;
 
             // parse JSON response
@@ -108,6 +120,9 @@ async fn infer_language_batch(
 
             match serde_json::from_str::<Vec<LanguageInference>>(cleaned_text.trim()) {
                 Ok(results) => {
+                    context
+                        .mark_consumer_outcome(attempt_key.as_deref(), "accepted")
+                        .await;
                     let mut language_map = HashMap::new();
                     let valid_languages = ["en", "ru", "es"];
 
@@ -136,6 +151,9 @@ async fn infer_language_batch(
                         .collect())
                 }
                 Err(e) => {
+                    context
+                        .mark_consumer_outcome(attempt_key.as_deref(), "incomplete")
+                        .await;
                     error!("Failed to parse JSON response: {}", e);
                     error!("Response text: {}", cleaned_text);
                     Ok(users.iter().map(|user| (user.id, None)).collect())
@@ -150,7 +168,7 @@ async fn infer_language_batch(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // initialize rustls crypto provider
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -160,22 +178,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // load environment variables
     dotenvy::dotenv().ok();
 
-    // get database URL
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-
-    // create database pool with TLS
-    let mut config = Config::new();
-    config.url = Some(database_url);
-
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls = MakeRustlsConnect::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    );
-
-    let pool = config.create_pool(Some(Runtime::Tokio1), tls)?;
+    let pool = Arc::new(CacheManager::create_pool().await?);
+    MigrationManager::run_migrations(&pool).await?;
 
     // get users without language
     let query = r#"
@@ -208,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         // infer languages
-        let results = infer_language_batch(chunk).await?;
+        let results = infer_language_batch(chunk, pool.clone()).await?;
 
         // prepare updates
         let updates: Vec<(i32, String)> = results

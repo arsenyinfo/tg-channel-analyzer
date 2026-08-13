@@ -5,7 +5,10 @@ use image::{GenericImageView, ImageFormat};
 use log::{error, info, warn};
 use regex::Regex;
 use reqwest::Client;
-use serde_json::{json, Value};
+use rig_core::client::CompletionClient;
+use rig_core::completion::{AssistantContent, CompletionError, CompletionModel};
+use rig_core::providers::gemini;
+use serde_json::json;
 use std::io::Cursor;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -59,30 +62,164 @@ pub const GEMINI_FLASH_LITE_MODEL: &str = "gemini-2.5-flash-lite";
 #[derive(Debug)]
 pub struct LLMResponse {
     pub content: String,
+    pub attempt_key: Option<String>,
 }
 
-#[derive(Debug)]
-enum GeminiRequestError {
-    Retryable(String),
-    Permanent(String),
+#[derive(Clone)]
+pub struct LlmRunContext {
+    pool: Arc<deadpool_postgres::Pool>,
+    pub generation_key: String,
+    pub operation: &'static str,
+    pub user_analysis_id: Option<i32>,
 }
 
-impl GeminiRequestError {
-    fn is_retryable(&self) -> bool {
-        matches!(self, Self::Retryable(_))
+impl LlmRunContext {
+    pub fn new(
+        pool: Arc<deadpool_postgres::Pool>,
+        operation: &'static str,
+        user_analysis_id: Option<i32>,
+    ) -> Self {
+        Self {
+            pool,
+            generation_key: format!("{:032x}", rand::random::<u128>()),
+            operation,
+            user_analysis_id,
+        }
     }
-}
 
-impl std::fmt::Display for GeminiRequestError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self {
-            Self::Retryable(message) | Self::Permanent(message) => message,
+    async fn start_attempt(
+        &self,
+        attempt_key: &str,
+        model: &str,
+        model_stage: &str,
+        response_round: u32,
+        transport_round: u32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO llm_attempts
+                    (attempt_key, generation_key, user_analysis_id, operation, provider,
+                     model, model_stage, response_round, transport_round, status,
+                     billing_certainty)
+                 VALUES ($1, $2, $3, $4, 'gemini', $5, $6, $7, $8, 'started', 'unknown')
+                 ON CONFLICT (attempt_key) DO NOTHING",
+                &[
+                    &attempt_key,
+                    &self.generation_key,
+                    &self.user_analysis_id,
+                    &self.operation,
+                    &model,
+                    &model_stage,
+                    &i32::try_from(response_round).unwrap_or(i32::MAX),
+                    &i32::try_from(transport_round).unwrap_or(i32::MAX),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn finish_attempt(
+        &self,
+        attempt_key: &str,
+        status: &str,
+        certainty: &str,
+        http_status: Option<i32>,
+        error_class: Option<&str>,
+        response: Option<&RigGeminiResponse>,
+    ) {
+        let Ok(client) = self.pool.get().await else {
+            error!("Could not acquire DB connection to finish LLM usage attempt");
+            return;
         };
-        formatter.write_str(message)
+        let usage = response.and_then(|item| item.raw_response.usage_metadata.as_ref());
+        let usage_json = usage.and_then(|item| serde_json::to_value(item).ok());
+        let provider_response_id = response.map(|item| item.raw_response.response_id.as_str());
+        let model_version = response.and_then(|item| item.raw_response.model_version.as_deref());
+        let (
+            prompt_tokens,
+            cached_tokens,
+            candidate_tokens,
+            thought_tokens,
+            tool_tokens,
+            total_tokens,
+        ) = usage_columns(usage);
+        if let Err(error) = client
+            .execute(
+                "UPDATE llm_attempts SET status = $2, billing_certainty = $3,
+                    http_status = $4, error_class = $5, provider_response_id = $6,
+                    model_version = $7, prompt_tokens = $8, cached_content_tokens = $9,
+                    candidate_tokens = $10, thought_tokens = $11, tool_prompt_tokens = $12,
+                    total_tokens = $13, usage_metadata = $14, finished_at = NOW()
+                 WHERE attempt_key = $1",
+                &[
+                    &attempt_key,
+                    &status,
+                    &certainty,
+                    &http_status,
+                    &error_class,
+                    &provider_response_id,
+                    &model_version,
+                    &prompt_tokens,
+                    &cached_tokens,
+                    &candidate_tokens,
+                    &thought_tokens,
+                    &tool_tokens,
+                    &total_tokens,
+                    &usage_json,
+                ],
+            )
+            .await
+        {
+            error!("Could not persist LLM attempt result: {error}");
+        }
+    }
+
+    pub async fn mark_consumer_outcome(&self, attempt_key: Option<&str>, outcome: &str) {
+        let Some(attempt_key) = attempt_key else {
+            return;
+        };
+        let Ok(client) = self.pool.get().await else {
+            return;
+        };
+        if let Err(error) = client
+            .execute(
+                "UPDATE llm_attempts SET consumer_outcome = $2 WHERE attempt_key = $1",
+                &[&attempt_key, &outcome],
+            )
+            .await
+        {
+            error!("Could not persist LLM consumer outcome: {error}");
+        }
     }
 }
 
-impl std::error::Error for GeminiRequestError {}
+type RigGeminiResponse = rig_core::completion::CompletionResponse<
+    rig_core::providers::gemini::completion::gemini_api_types::GenerateContentResponse,
+>;
+
+type UsageColumns = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn usage_columns(
+    usage: Option<&rig_core::providers::gemini::completion::gemini_api_types::UsageMetadata>,
+) -> UsageColumns {
+    let value = |value: Option<i32>| value.map(i64::from);
+    (
+        usage.map(|item| i64::from(item.prompt_token_count)),
+        value(usage.and_then(|item| item.cached_content_token_count)),
+        value(usage.and_then(|item| item.candidates_token_count)),
+        value(usage.and_then(|item| item.thoughts_token_count)),
+        value(usage.and_then(|item| item.tool_use_prompt_token_count)),
+        usage.map(|item| i64::from(item.total_token_count)),
+    )
+}
 
 pub fn extract_tag(text: &str, tag: &str) -> Option<String> {
     let pattern = format!(r"(?s)<{}>(.*?)</{}>", tag, tag);
@@ -92,27 +229,74 @@ pub fn extract_tag(text: &str, tag: &str) -> Option<String> {
         .map(|m| m.as_str().trim().to_string())
 }
 
-pub async fn query_llm(
+pub async fn query_llm_with_context(
     prompt: &str,
     model: &str,
+    context: Option<&LlmRunContext>,
+    model_stage: &str,
+    response_round: u32,
 ) -> Result<LLMResponse, Box<dyn std::error::Error + Send + Sync>> {
     info!("Querying LLM with model: {}", model);
 
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|_| "GEMINI_API_KEY environment variable not set")?;
-    let client = Client::new();
+    let client = gemini::Client::new(&api_key)?;
+    let completion_model = client.completion_model(model);
 
     for attempt in 0..=MAX_RETRIES {
         get_gemini_rate_limiter().wait_for_api_call().await;
+        let attempt_key = format!("{:032x}", rand::random::<u128>());
+        if let Some(context) = context {
+            context
+                .start_attempt(&attempt_key, model, model_stage, response_round, attempt)
+                .await?;
+        }
         let response = match timeout(
             Duration::from_secs(GEMINI_TIMEOUT_SECS),
-            send_gemini_message(&client, &api_key, model, prompt),
+            completion_model.completion_request(prompt).send(),
         )
         .await
         {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
-                if !e.is_retryable() {
+                let status = e
+                    .provider_response_status()
+                    .map(|status| i32::from(status.as_u16()));
+                let retryable = match status {
+                    Some(429) => true,
+                    Some(value) => value >= 500,
+                    None => matches!(
+                        e,
+                        CompletionError::HttpError(_) | CompletionError::ProviderError(_)
+                    ),
+                };
+                let attempt_status = if status.is_some() {
+                    "http_error"
+                } else if matches!(
+                    e,
+                    CompletionError::JsonError(_) | CompletionError::ResponseError(_)
+                ) {
+                    "response_invalid"
+                } else {
+                    "transport_error"
+                };
+                if let Some(context) = context {
+                    context
+                        .finish_attempt(
+                            &attempt_key,
+                            attempt_status,
+                            if status.is_some() {
+                                "not_billed"
+                            } else {
+                                "unknown"
+                            },
+                            status,
+                            Some(completion_error_class(&e)),
+                            None,
+                        )
+                        .await;
+                }
+                if !retryable {
                     error!("Gemini API request failed permanently: {}", e);
                     return Err(e.into());
                 }
@@ -137,6 +321,18 @@ pub async fn query_llm(
                 continue;
             }
             Err(_timeout) => {
+                if let Some(context) = context {
+                    context
+                        .finish_attempt(
+                            &attempt_key,
+                            "timeout_unknown",
+                            "unknown",
+                            None,
+                            Some("timeout"),
+                            None,
+                        )
+                        .await;
+                }
                 if attempt == MAX_RETRIES {
                     error!(
                         "Gemini API call timed out after {} attempts ({}s timeout)",
@@ -159,107 +355,78 @@ pub async fn query_llm(
             }
         };
 
-        let content = response;
+        let content: String = response
+            .choice
+            .iter()
+            .filter_map(|part| match part {
+                AssistantContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if let Some(context) = context {
+            context
+                .finish_attempt(
+                    &attempt_key,
+                    "succeeded",
+                    "known",
+                    Some(200),
+                    None,
+                    Some(&response),
+                )
+                .await;
+        }
+        if content.is_empty() {
+            return Err("Gemini response did not contain visible text".into());
+        }
 
         info!(
             "Received LLM response of length: {} (attempt {})",
             content.len(),
             attempt + 1
         );
-        return Ok(LLMResponse { content });
+        return Ok(LLMResponse {
+            content,
+            attempt_key: context.map(|_| attempt_key),
+        });
     }
 
     unreachable!()
 }
 
-async fn send_gemini_message(
-    client: &Client,
-    api_key: &str,
-    model: &str,
-    prompt: &str,
-) -> Result<String, GeminiRequestError> {
-    let response = client
-        .post(format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        ))
-        .header("x-goog-api-key", api_key)
-        .json(&json!({
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}]
-        }))
-        .send()
-        .await
-        .map_err(|error| GeminiRequestError::Retryable(error.to_string()))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| GeminiRequestError::Retryable(error.to_string()))?;
-    if !status.is_success() {
-        return Err(classify_gemini_status(status, &body));
+fn completion_error_class(error: &CompletionError) -> &'static str {
+    match error {
+        CompletionError::HttpError(_) => "http",
+        CompletionError::JsonError(_) => "json",
+        CompletionError::UrlError(_) => "url",
+        CompletionError::RequestError(_) => "request",
+        CompletionError::ResponseError(_) => "response",
+        CompletionError::ProviderError(_) => "provider",
+        CompletionError::ProviderResponse(_) => "provider_response",
+        _ => "unknown",
     }
-
-    let response_json: Value = serde_json::from_str(&body)
-        .map_err(|error| GeminiRequestError::Permanent(error.to_string()))?;
-    let content = visible_gemini_text(&response_json);
-    if content.is_empty() {
-        Err(GeminiRequestError::Permanent(
-            "Gemini response did not contain visible text".to_string(),
-        ))
-    } else {
-        Ok(content)
-    }
-}
-
-fn classify_gemini_status(status: reqwest::StatusCode, body: &str) -> GeminiRequestError {
-    let message = format!("Gemini API error {status}: {body}");
-    if status.as_u16() == 429 || status.is_server_error() {
-        GeminiRequestError::Retryable(message)
-    } else {
-        GeminiRequestError::Permanent(message)
-    }
-}
-
-fn visible_gemini_text(response: &Value) -> String {
-    response["candidates"][0]["content"]["parts"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|part| part["thought"] != true)
-        .filter_map(|part| part["text"].as_str())
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::usage_columns;
+    use rig_core::providers::gemini::completion::gemini_api_types::UsageMetadata;
 
     #[test]
-    fn extracts_visible_text_without_deserializing_new_response_fields() {
-        let response = json!({
-            "candidates": [{
-                "content": {
-                    "parts": [
-                        {"thought": true, "text": "internal"},
-                        {"text": "migration-ok", "thoughtSignature": "opaque"}
-                    ]
-                },
-                "finishReason": "A_FUTURE_FINISH_REASON"
-            }]
-        });
+    fn preserves_all_gemini_usage_counters() {
+        let usage: UsageMetadata = serde_json::from_value(serde_json::json!({
+            "promptTokenCount": 100,
+            "cachedContentTokenCount": 40,
+            "candidatesTokenCount": 20,
+            "thoughtsTokenCount": 30,
+            "toolUsePromptTokenCount": 5,
+            "totalTokenCount": 150,
+            "trafficType": "ON_DEMAND"
+        }))
+        .expect("Gemini usage fixture must deserialize through Rig");
 
-        assert_eq!(visible_gemini_text(&response), "migration-ok");
-    }
-
-    #[test]
-    fn retries_only_rate_limits_and_server_errors() {
-        assert!(!classify_gemini_status(reqwest::StatusCode::BAD_REQUEST, "bad").is_retryable());
-        assert!(
-            classify_gemini_status(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down")
-                .is_retryable()
-        );
-        assert!(
-            classify_gemini_status(reqwest::StatusCode::SERVICE_UNAVAILABLE, "later")
-                .is_retryable()
+        assert_eq!(
+            usage_columns(Some(&usage)),
+            (Some(100), Some(40), Some(20), Some(30), Some(5), Some(150))
         );
     }
 }

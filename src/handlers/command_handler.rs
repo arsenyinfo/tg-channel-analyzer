@@ -34,6 +34,30 @@ impl CommandHandler {
             Command::Start => {
                 Self::handle_start_command(ctx, msg, lang).await?;
             }
+            Command::Stop => {
+                let telegram_user_id = msg
+                    .from
+                    .as_ref()
+                    .map(|user| user.id.0 as i64)
+                    .unwrap_or(msg.chat.id.0);
+                match ctx
+                    .user_manager
+                    .suppress_campaigns(telegram_user_id, "user_opt_out")
+                    .await
+                {
+                    Ok(()) => {
+                        ctx.bot
+                            .send_message(msg.chat.id, lang.campaign_opt_out())
+                            .await?;
+                    }
+                    Err(e) => {
+                        error!("Failed to save campaign opt-out: {}", e);
+                        ctx.bot
+                            .send_message(msg.chat.id, lang.error_processing_request())
+                            .await?;
+                    }
+                }
+            }
             Command::Buy1 => {
                 Self::handle_buy_command(
                     ctx,

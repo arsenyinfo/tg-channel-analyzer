@@ -68,6 +68,65 @@ This bot requires Telegram user sessions to fetch channels. Sessions allow the b
 cargo run
 ```
 
+### Re-engagement campaigns
+
+`bulk_messenger` is a campaign runner rather than an arbitrary SQL mailer. It is dry-run by
+default, selects users inactive after a delivered analysis, localizes English/Russian copy,
+and runs a versioned experiment among known-paid and known-free users with zero balance.
+Legacy-unknown users and users who already hold credits are excluded from this experiment.
+
+Preview the next batch:
+
+```bash
+cargo run --locked --bin bulk_messenger -- launch \
+  --campaign gemini-3.7-launch \
+  --batch-size 100
+```
+
+Enroll it after reviewing the cohort counts and rendered samples:
+
+```bash
+cargo run --locked --bin bulk_messenger -- launch \
+  --campaign gemini-3.7-launch \
+  --batch-size 100 \
+  --execute \
+  --confirm-campaign gemini-3.7-launch
+```
+
+The default allocation is 10% holdout, 45% message only, and 45% identical message plus one
+credit. The split runs independently within paid and free cohorts, so `message - holdout`
+measures contact lift and `message_credit - message` measures the incremental economics of the
+credit. Assignment uses one stable 0-9,999 bucket and persists its version, bucket, baseline
+balance, arm, and grant. Override allocations with `--holdout-bps`, `--message-bps`, and
+`--message-credit-bps`; they must sum to 10,000.
+
+Every Rig/Gemini text-generation attempt is recorded in `llm_attempts`, including retries, incomplete
+responses, fallbacks, cached-input tokens, output tokens, thought tokens, tool-prompt tokens,
+and timeouts whose billing is unknown. Campaign status reports aggregate known token use and
+unknown attempts by cohort and arm. Cache-served analyses are marked separately and have zero
+marginal provider calls.
+
+Messages are scheduled gradually, every 10 seconds by default, and only between 09:00 and
+20:00 in `Europe/Warsaw`. Override these with `--cadence-seconds`, `--timezone`,
+`--window-start`, and `--window-end`. The timezone is campaign-wide because the bot does not
+know each recipient's timezone.
+
+Reusing a campaign key with the same configuration enrolls only users not already assigned;
+reusing it with different settings fails. Useful operational commands are:
+
+```bash
+cargo run --locked --bin bulk_messenger -- status --campaign gemini-3.7-launch
+cargo run --locked --bin bulk_messenger -- pause --campaign gemini-3.7-launch
+cargo run --locked --bin bulk_messenger -- resume --campaign gemini-3.7-launch
+cargo run --locked --bin bulk_messenger -- complete --campaign gemini-3.7-launch
+```
+
+Start with a small canary batch, inspect permanent failures and `delivery_unknown` rows, then
+enroll subsequent batches. A `delivery_unknown` result is deliberately not retried: Telegram
+does not accept an idempotency key for `sendMessage`, so a lost response could otherwise
+produce a duplicate. Users can send `/stop` to suppress future campaign messages without
+disabling normal bot use.
+
 ### Testing
 
 Run the PostgreSQL-backed integration suite with one command:

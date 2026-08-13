@@ -3,7 +3,8 @@ use log::{error, info};
 use std::sync::Arc;
 use tg_main::analysis::AnalysisEngine;
 use tg_main::cache::CacheManager;
-use tg_main::llm::{query_llm, ANALYSIS_MODEL};
+use tg_main::llm::{query_llm_with_context, LlmRunContext, ANALYSIS_MODEL};
+use tg_main::migrations::MigrationManager;
 
 #[derive(Parser, Debug)]
 #[command(name = "custom_prompt")]
@@ -19,7 +20,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // initialize rustls crypto provider
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -39,6 +40,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     });
+    if let Err(error) = MigrationManager::run_migrations(&pool).await {
+        error!("Failed to run database migrations: {error}");
+        std::process::exit(1);
+    }
 
     // create analysis engine
     let mut engine = match AnalysisEngine::new(pool.clone()) {
@@ -99,8 +104,20 @@ Please provide your analysis based on the above messages."#,
 
     // query LLM
     info!("Sending prompt to LLM...");
-    match query_llm(&full_prompt, ANALYSIS_MODEL).await {
+    let llm_context = LlmRunContext::new(pool, "custom_prompt", None);
+    match query_llm_with_context(
+        &full_prompt,
+        ANALYSIS_MODEL,
+        Some(&llm_context),
+        "direct",
+        0,
+    )
+    .await
+    {
         Ok(response) => {
+            llm_context
+                .mark_consumer_outcome(response.attempt_key.as_deref(), "accepted")
+                .await;
             // print response directly to stdout
             println!("{}", response.content);
         }

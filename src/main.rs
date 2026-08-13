@@ -2,6 +2,7 @@ mod analysis;
 mod backend_config;
 mod bot;
 mod cache;
+mod campaign_schedule;
 mod handlers;
 mod llm;
 mod localization;

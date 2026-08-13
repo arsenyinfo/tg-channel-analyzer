@@ -10,9 +10,13 @@ impl MigrationManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Running database migrations...");
         let mut client = pool.get().await?;
+        let transaction = client.transaction().await?;
+        transaction
+            .query_one("SELECT pg_advisory_xact_lock(7623417990)", &[])
+            .await?;
 
         // check if migrations table exists and create if not
-        let needs_init = client
+        let needs_init = transaction
             .query_opt(
                 "SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'schema_migrations'",
                 &[],
@@ -21,23 +25,23 @@ impl MigrationManager {
             .is_none();
 
         if needs_init {
-            // first time setup - create everything in a single transaction
-            let transaction = client.transaction().await?;
             Self::initial_setup(&transaction).await?;
-            transaction.commit().await?;
             info!("Initial database setup completed");
         }
 
         // check if we need to run any new migrations (always check, even after initial setup)
-        let current_version = Self::get_current_version(&client).await?;
+        let current_version: i32 = transaction
+            .query_one("SELECT MAX(version) FROM schema_migrations", &[])
+            .await?
+            .get::<_, Option<i32>>(0)
+            .unwrap_or(0);
         if current_version < Self::latest_version() {
-            let transaction = client.transaction().await?;
             Self::run_pending_migrations(&transaction, current_version).await?;
-            transaction.commit().await?;
             info!("Database migrations completed");
         } else {
             info!("Database schema is up to date");
         }
+        transaction.commit().await?;
 
         Ok(())
     }
@@ -109,17 +113,8 @@ impl MigrationManager {
         Ok(())
     }
 
-    async fn get_current_version(
-        client: &deadpool_postgres::Object,
-    ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-        let row = client
-            .query_one("SELECT MAX(version) FROM schema_migrations", &[])
-            .await?;
-        Ok(row.get::<_, Option<i32>>(0).unwrap_or(0))
-    }
-
     fn latest_version() -> i32 {
-        7 // increment this when adding new migrations
+        9 // increment this when adding new migrations
     }
 
     async fn run_pending_migrations(
@@ -267,6 +262,180 @@ impl MigrationManager {
 
                         CREATE UNIQUE INDEX idx_user_analyses_callback_query_id
                         ON user_analyses (telegram_callback_query_id);
+                    "#;
+                    transaction.batch_execute(migration_sql).await?;
+                }
+                8 => {
+                    // Idempotent, scheduled campaigns and a restart-safe delivery queue.
+                    let migration_sql = r#"
+                        CREATE TABLE campaigns (
+                            id BIGSERIAL PRIMARY KEY,
+                            campaign_key VARCHAR(128) NOT NULL UNIQUE,
+                            configuration JSONB NOT NULL,
+                            timezone VARCHAR(64) NOT NULL,
+                            send_window_start TIME NOT NULL,
+                            send_window_end TIME NOT NULL,
+                            cadence_seconds INTEGER NOT NULL CHECK (cadence_seconds > 0),
+                            next_send_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                            status VARCHAR(20) NOT NULL DEFAULT 'active'
+                                CHECK (status IN ('active', 'paused', 'completed')),
+                            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                        );
+
+                        CREATE TABLE campaign_recipients (
+                            campaign_id BIGINT NOT NULL REFERENCES campaigns(id),
+                            user_id INTEGER NOT NULL REFERENCES users(id),
+                            cohort VARCHAR(20) NOT NULL
+                                CHECK (cohort IN ('paid', 'free', 'legacy_unknown')),
+                            variant VARCHAR(20) NOT NULL
+                                CHECK (variant IN ('holdout', 'message', 'message_credit')),
+                            credits_granted INTEGER NOT NULL DEFAULT 0 CHECK (credits_granted >= 0),
+                            enrolled_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                            PRIMARY KEY (campaign_id, user_id)
+                        );
+                        CREATE INDEX idx_campaign_recipients_user
+                            ON campaign_recipients(user_id, campaign_id);
+
+                        CREATE TABLE campaign_credit_grants (
+                            campaign_id BIGINT NOT NULL REFERENCES campaigns(id),
+                            user_id INTEGER NOT NULL REFERENCES users(id),
+                            credits INTEGER NOT NULL CHECK (credits > 0),
+                            granted_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                            PRIMARY KEY (campaign_id, user_id)
+                        );
+
+                        CREATE TABLE campaign_suppressions (
+                            telegram_user_id BIGINT PRIMARY KEY,
+                            reason VARCHAR(64) NOT NULL,
+                            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                        );
+
+                        ALTER TABLE payments
+                            ADD CONSTRAINT payments_credits_positive CHECK (credits > 0) NOT VALID,
+                            ADD CONSTRAINT payments_stars_positive CHECK (stars_amount > 0) NOT VALID;
+
+                        ALTER TABLE message_queue
+                            ADD COLUMN campaign_id BIGINT REFERENCES campaigns(id),
+                            ADD COLUMN user_id INTEGER REFERENCES users(id),
+                            ADD COLUMN scheduled_at TIMESTAMP WITH TIME ZONE,
+                            ADD COLUMN next_attempt_at TIMESTAMP WITH TIME ZONE,
+                            ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0,
+                            ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 6,
+                            ADD COLUMN lease_token VARCHAR(64),
+                            ADD COLUMN leased_until TIMESTAMP WITH TIME ZONE,
+                            ADD COLUMN last_error_code VARCHAR(64);
+
+                        UPDATE message_queue
+                        SET status = COALESCE(status, 'pending'),
+                            parse_mode = CASE
+                                WHEN UPPER(COALESCE(parse_mode, 'HTML')) = 'HTML' THEN 'HTML'
+                                WHEN LOWER(COALESCE(parse_mode, '')) IN ('markdownv2', 'markdown')
+                                    THEN 'MarkdownV2'
+                                ELSE 'HTML'
+                            END,
+                            scheduled_at = COALESCE(created_at, NOW()),
+                            next_attempt_at = COALESCE(created_at, NOW());
+
+                        ALTER TABLE message_queue DROP CONSTRAINT message_queue_status_check;
+                        ALTER TABLE message_queue
+                            ALTER COLUMN status SET NOT NULL,
+                            ALTER COLUMN parse_mode SET NOT NULL,
+                            ALTER COLUMN scheduled_at SET DEFAULT NOW(),
+                            ALTER COLUMN scheduled_at SET NOT NULL,
+                            ALTER COLUMN next_attempt_at SET DEFAULT NOW(),
+                            ALTER COLUMN next_attempt_at SET NOT NULL,
+                            ADD CONSTRAINT message_queue_status_check
+                                CHECK (status IN ('pending', 'processing', 'sent', 'failed', 'delivery_unknown')),
+                            ADD CONSTRAINT message_queue_parse_mode_check
+                                CHECK (parse_mode IN ('HTML', 'MarkdownV2')),
+                            ADD CONSTRAINT message_queue_attempts_check
+                                CHECK (attempt_count >= 0 AND max_attempts > 0),
+                            ADD CONSTRAINT message_queue_lease_state_check CHECK (
+                                (status = 'processing' AND lease_token IS NOT NULL AND leased_until IS NOT NULL)
+                                OR
+                                (status <> 'processing' AND lease_token IS NULL AND leased_until IS NULL)
+                            );
+
+                        CREATE UNIQUE INDEX idx_message_queue_campaign_user
+                            ON message_queue(campaign_id, user_id)
+                            WHERE campaign_id IS NOT NULL;
+                        CREATE INDEX idx_message_queue_due
+                            ON message_queue(next_attempt_at, scheduled_at, id)
+                            WHERE status = 'pending';
+                        CREATE INDEX idx_message_queue_lease
+                            ON message_queue(leased_until)
+                            WHERE status = 'processing';
+                        CREATE INDEX idx_message_queue_campaign_status
+                            ON message_queue(campaign_id, status)
+                            WHERE campaign_id IS NOT NULL;
+                    "#;
+                    transaction.batch_execute(migration_sql).await?;
+                }
+                9 => {
+                    // Versioned three-arm assignment and provider-neutral LLM usage ledger.
+                    let migration_sql = r#"
+                        ALTER TABLE campaign_recipients
+                            ADD COLUMN assignment_version VARCHAR(64),
+                            ADD COLUMN assignment_bucket INTEGER,
+                            ADD COLUMN baseline_credits INTEGER;
+
+                        UPDATE campaign_recipients
+                        SET assignment_version = 'legacy-conditional-v0',
+                            baseline_credits = 0;
+
+                        ALTER TABLE campaign_recipients
+                            ALTER COLUMN assignment_version SET NOT NULL,
+                            ALTER COLUMN baseline_credits SET NOT NULL,
+                            ADD CONSTRAINT campaign_assignment_bucket_check
+                                CHECK (assignment_bucket IS NULL OR assignment_bucket BETWEEN 0 AND 9999),
+                            ADD CONSTRAINT campaign_baseline_credits_check
+                                CHECK (baseline_credits >= 0);
+
+                        ALTER TABLE user_analyses
+                            ADD COLUMN result_source VARCHAR(16)
+                                CHECK (result_source IN ('generated', 'cache')),
+                            ADD COLUMN llm_cache_key VARCHAR(64),
+                            ADD COLUMN experiment_campaign_id BIGINT REFERENCES campaigns(id);
+                        CREATE INDEX idx_user_analyses_experiment_campaign
+                            ON user_analyses(experiment_campaign_id, analysis_timestamp);
+
+                        CREATE TABLE llm_attempts (
+                            attempt_key VARCHAR(64) PRIMARY KEY,
+                            generation_key VARCHAR(64) NOT NULL,
+                            user_analysis_id INTEGER REFERENCES user_analyses(id) ON DELETE SET NULL,
+                            operation VARCHAR(32) NOT NULL,
+                            provider VARCHAR(32) NOT NULL,
+                            model VARCHAR(128) NOT NULL,
+                            model_stage VARCHAR(16) NOT NULL,
+                            response_round INTEGER NOT NULL CHECK (response_round >= 0),
+                            transport_round INTEGER NOT NULL CHECK (transport_round >= 0),
+                            status VARCHAR(24) NOT NULL CHECK (status IN (
+                                'started', 'succeeded', 'http_error', 'transport_error',
+                                'timeout_unknown', 'response_invalid'
+                            )),
+                            consumer_outcome VARCHAR(16)
+                                CHECK (consumer_outcome IN ('accepted', 'incomplete', 'unparsed')),
+                            billing_certainty VARCHAR(16) NOT NULL CHECK (billing_certainty IN (
+                                'known', 'unknown', 'not_billed'
+                            )),
+                            http_status INTEGER,
+                            error_class VARCHAR(64),
+                            provider_response_id VARCHAR(255),
+                            model_version VARCHAR(128),
+                            prompt_tokens BIGINT CHECK (prompt_tokens >= 0),
+                            cached_content_tokens BIGINT CHECK (cached_content_tokens >= 0),
+                            candidate_tokens BIGINT CHECK (candidate_tokens >= 0),
+                            thought_tokens BIGINT CHECK (thought_tokens >= 0),
+                            tool_prompt_tokens BIGINT CHECK (tool_prompt_tokens >= 0),
+                            total_tokens BIGINT CHECK (total_tokens >= 0),
+                            usage_metadata JSONB,
+                            started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                            finished_at TIMESTAMP WITH TIME ZONE,
+                            UNIQUE (generation_key, model_stage, response_round, transport_round)
+                        );
+                        CREATE INDEX idx_llm_attempts_analysis ON llm_attempts(user_analysis_id);
+                        CREATE INDEX idx_llm_attempts_model_time ON llm_attempts(model, started_at);
                     "#;
                     transaction.batch_execute(migration_sql).await?;
                 }
