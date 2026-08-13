@@ -3,6 +3,7 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
+use tg_main::llm::{query_llm, GEMINI_FLASH_LITE_MODEL};
 use tokio_postgres::Row;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
@@ -19,6 +20,24 @@ struct UserWithoutLanguage {
     first_name: Option<String>,
     last_name: Option<String>,
 }
+
+const LANGUAGE_INFERENCE_PROMPT: &str = r#"You are a language detection expert. For each user below, analyze their name and username to determine their most likely language.
+
+You must choose ONLY from these 4 options:
+- "en" for English speakers
+- "ru" for Russian speakers
+- "es" for Spanish speakers
+- null if you cannot determine with reasonable confidence
+
+Consider:
+1. Character sets (Latin vs Cyrillic)
+2. Common name patterns (e.g., -ov/-ev endings for Russian, Hispanic surnames for Spanish)
+3. Username conventions
+
+Respond with ONLY a JSON array where each element is {"user_id": <id>, "language": "<code>"}.
+
+Users to analyze:
+"#;
 
 impl From<Row> for UserWithoutLanguage {
     fn from(row: Row) -> Self {
@@ -60,38 +79,17 @@ async fn infer_language_batch(
         return Ok(Vec::new());
     }
 
-    let mut prompt = format!(
-        r#"You are a language detection expert. For each user below, analyze their name and username to determine their most likely language.
-
-You must choose ONLY from these 4 options:
-- "en" for English speakers
-- "ru" for Russian speakers
-- "es" for Spanish speakers
-- null if you cannot determine with reasonable confidence
-
-Consider:
-1. Character sets (Latin vs Cyrillic)
-2. Common name patterns (e.g., -ov/-ev endings for Russian, Hispanic surnames for Spanish)
-3. Username conventions
-
-Respond with ONLY a JSON array where each element is {{"user_id": <id>, "language": "<code>"}}.
-
-Users to analyze:
-"#
-    );
+    let mut prompt = LANGUAGE_INFERENCE_PROMPT.to_string();
 
     for user in users {
         let user_info = prepare_user_data_for_inference(user);
         prompt.push_str(&format!("\nUser ID {}:\n{}\n", user.id, user_info));
     }
 
-    // use Gemini Flash 1.5 for efficiency
-    match gemini_rs::chat("gemini-2.5-flash-lite-preview-06-17")
-        .send_message(&prompt)
-        .await
-    {
+    // use the stable Flash-Lite model for efficiency
+    match query_llm(&prompt, GEMINI_FLASH_LITE_MODEL).await {
         Ok(response) => {
-            let text = response.to_string();
+            let text = response.content;
 
             // parse JSON response
             let cleaned_text = if text.contains("```json") {
@@ -206,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(
             "Processing batch {}/{}",
             batch_idx + 1,
-            (users.len() + BATCH_SIZE - 1) / BATCH_SIZE
+            users.len().div_ceil(BATCH_SIZE)
         );
 
         // infer languages
@@ -236,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // small delay to avoid rate limiting
-        if batch_idx + 1 < (users.len() + BATCH_SIZE - 1) / BATCH_SIZE {
+        if batch_idx + 1 < users.len().div_ceil(BATCH_SIZE) {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     }
@@ -270,4 +268,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LANGUAGE_INFERENCE_PROMPT;
+
+    #[test]
+    fn prompt_uses_single_braces_for_the_json_example() {
+        assert!(LANGUAGE_INFERENCE_PROMPT.contains(r#"{"user_id": <id>, "language": "<code>"}"#));
+        assert!(!LANGUAGE_INFERENCE_PROMPT.contains("{{"));
+        assert!(!LANGUAGE_INFERENCE_PROMPT.contains("}}"));
+    }
 }

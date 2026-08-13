@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // find session file
     let session_file = fs::read_dir("sessions")?
         .filter_map(|e| e.ok())
-        .find(|e| e.path().extension().map_or(false, |ext| ext == "session"))
+        .find(|e| e.path().extension().is_some_and(|ext| ext == "session"))
         .map(|e| e.path())
         .ok_or("No session file found")?;
 

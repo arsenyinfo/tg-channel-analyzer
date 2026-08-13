@@ -35,7 +35,10 @@ impl CallbackHandler {
         InlineKeyboardMarkup::new(vec![vec![single_button], vec![bulk_button]])
     }
 
-    pub fn create_analysis_selection_keyboard(channel_name: &str, lang: Lang) -> InlineKeyboardMarkup {
+    pub fn create_analysis_selection_keyboard(
+        channel_name: &str,
+        lang: Lang,
+    ) -> InlineKeyboardMarkup {
         let professional_button = InlineKeyboardButton::callback(
             lang.btn_professional_analysis(),
             format!("analysis_professional_{}", channel_name),
@@ -141,7 +144,10 @@ impl CallbackHandler {
             // reject anything but the known analysis types; callback data is user-controlled,
             // and an unknown/empty type would otherwise fail the DB CHECK or panic downstream
             if !matches!(analysis_type, "professional" | "personal" | "roast") {
-                error!("Invalid analysis type in callback data: {:?}", analysis_type);
+                error!(
+                    "Invalid analysis type in callback data: {:?}",
+                    analysis_type
+                );
                 ctx.bot.answer_callback_query(&query.id).await?;
                 return Ok(());
             }
@@ -190,10 +196,15 @@ impl CallbackHandler {
                     channel_name,
                     analysis_type,
                     query.from.language_code.as_deref(),
+                    &query.id,
                 )
                 .await
             {
-                Ok(id) => id,
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    ctx.bot.answer_callback_query(&query.id).await?;
+                    return Ok(());
+                }
                 Err(e) => {
                     let error_msg = match e {
                         UserManagerError::UserNotFound(_) => lang.error_user_not_found(),

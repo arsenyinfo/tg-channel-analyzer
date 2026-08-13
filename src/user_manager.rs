@@ -241,7 +241,8 @@ impl UserManager {
         let telegram_user_id: i64 = row.get(1);
 
         let milestone_rewards =
-            Self::award_milestone_rewards(transaction, referrer_user_id, new_referral_count).await?;
+            Self::award_milestone_rewards(transaction, referrer_user_id, new_referral_count)
+                .await?;
 
         let is_celebration = Self::is_celebration_milestone(new_referral_count);
         info!(
@@ -378,29 +379,44 @@ impl UserManager {
         Ok(())
     }
 
-    /// creates a pending analysis record without consuming credit
+    /// Claims a Telegram callback and creates its pending analysis without consuming credit.
+    /// Returns `None` when the callback was already claimed by another delivery.
     pub async fn create_pending_analysis(
         &self,
         user_id: i32,
         channel_name: &str,
         analysis_type: &str,
         language: Option<&str>,
-    ) -> Result<i32, UserManagerError> {
+        telegram_callback_query_id: &str,
+    ) -> Result<Option<i32>, UserManagerError> {
         let client = self.pool.get().await?;
 
-        // create pending analysis record
         let analysis_id = client
-            .query_one(
-                "INSERT INTO user_analyses (user_id, channel_name, credits_used, analysis_type, status, language) VALUES ($1, $2, 0, $3, 'pending', $4) RETURNING id",
-                &[&user_id, &channel_name, &analysis_type, &language],
+            .query_opt(
+                "INSERT INTO user_analyses
+                    (user_id, channel_name, credits_used, analysis_type, status, language, telegram_callback_query_id)
+                 VALUES ($1, $2, 0, $3, 'pending', $4, $5)
+                 ON CONFLICT (telegram_callback_query_id) DO NOTHING
+                 RETURNING id",
+                &[
+                    &user_id,
+                    &channel_name,
+                    &analysis_type,
+                    &language,
+                    &telegram_callback_query_id,
+                ],
             )
             .await?
-            .get::<_, i32>(0);
+            .map(|row| row.get::<_, i32>(0));
 
-        info!(
-            "Created pending analysis {} for user {} (channel: {}, lang: {:?})",
-            analysis_id, user_id, channel_name, language
-        );
+        if let Some(analysis_id) = analysis_id {
+            info!(
+                "Created pending analysis {} for user {} (channel: {}, lang: {:?})",
+                analysis_id, user_id, channel_name, language
+            );
+        } else {
+            info!("Callback query was already claimed; skipping duplicate analysis");
+        }
         Ok(analysis_id)
     }
 

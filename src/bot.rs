@@ -142,14 +142,12 @@ impl TelegramBot {
             };
 
             let update_result = match &send_result {
-                Ok(_) => {
-                    transaction
-                        .execute(
-                            "UPDATE message_queue SET status = 'sent', sent_at = NOW() WHERE id = $1",
-                            &[&id],
-                        )
-                        .await
-                }
+                Ok(_) => transaction
+                    .execute(
+                        "UPDATE message_queue SET status = 'sent', sent_at = NOW() WHERE id = $1",
+                        &[&id],
+                    )
+                    .await,
                 Err(e) => {
                     let error_msg = e.to_string();
                     transaction
@@ -384,7 +382,7 @@ impl TelegramBot {
             _ => return None,
         };
 
-        let cache_key = cache.get_llm_cache_key(&messages, "analysis");
+        let cache_key = cache.get_analysis_cache_key(&messages);
 
         let cached_result = match cache.load_llm_result(&cache_key).await {
             Some(result) => result,
@@ -416,6 +414,9 @@ impl TelegramBot {
         }
     }
 
+    // This is the task boundary used by both callbacks and startup recovery; keeping the
+    // dependencies explicit makes ownership across the spawned task clear.
+    #[allow(clippy::too_many_arguments)]
     pub async fn perform_single_analysis(
         bot: Arc<Bot>,
         user_chat_id: ChatId,
@@ -519,31 +520,27 @@ impl TelegramBot {
 
         let cached_result = {
             let engine = analysis_engine.lock().await;
-            engine
-                .cache
-                .load_llm_result(&analysis_data.cache_key)
-                .await
+            engine.cache.load_llm_result(&analysis_data.cache_key).await
         };
 
         let result = if let Some(cached_result) = cached_result {
             info!("Using cached LLM result for channel {}", channel_name);
             cached_result
         } else {
-            let prompt = match crate::prompts::analysis::generate_analysis_prompt(
-                &analysis_data.messages,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    error!(
-                        "Failed to generate analysis prompt for channel {}: {}",
-                        channel_name, e
-                    );
-                    bot.send_message(user_chat_id, lang.error_prompt_generation())
-                        .parse_mode(ParseMode::Html)
-                        .await?;
-                    return Err(e);
-                }
-            };
+            let prompt =
+                match crate::prompts::analysis::generate_analysis_prompt(&analysis_data.messages) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!(
+                            "Failed to generate analysis prompt for channel {}: {}",
+                            channel_name, e
+                        );
+                        bot.send_message(user_chat_id, lang.error_prompt_generation())
+                            .parse_mode(ParseMode::Html)
+                            .await?;
+                        return Err(e);
+                    }
+                };
 
             info!(
                 "Querying LLM for {} analysis of channel {}...",
@@ -713,8 +710,8 @@ impl TelegramBot {
                 let html_content = MessageFormatter::markdown_to_html_safe(content);
 
                 // prepare header template that will be added to each part
-                let header =
-                    lang.analysis_result_header(&MessageFormatter::escape_html(channel_name), user_id);
+                let header = lang
+                    .analysis_result_header(&MessageFormatter::escape_html(channel_name), user_id);
                 let analysis_header = lang.analysis_type_header(analysis_type);
 
                 // calculate available space for content after headers (using UTF-16 code units as Telegram does)
@@ -760,11 +757,8 @@ impl TelegramBot {
                     "No {} analysis content available for channel: {} (user: {})",
                     analysis_type, channel_name, user_chat_id
                 );
-                bot.send_message(
-                    user_chat_id,
-                    lang.error_no_analysis_content(analysis_type),
-                )
-                .await?;
+                bot.send_message(user_chat_id, lang.error_no_analysis_content(analysis_type))
+                    .await?;
             }
         }
 

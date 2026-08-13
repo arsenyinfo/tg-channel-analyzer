@@ -249,8 +249,8 @@ impl TelegramWebScraper {
     }
 
     fn normalize_channel_url(&self, channel_url: &str) -> Result<String, WebScrapingError> {
-        let clean_url = if channel_url.starts_with('@') {
-            format!("https://t.me/s/{}/", &channel_url[1..])
+        let clean_url = if let Some(channel_name) = channel_url.strip_prefix('@') {
+            format!("https://t.me/s/{}/", channel_name)
         } else if channel_url.starts_with("https://t.me/") && !channel_url.contains("/s/") {
             // convert t.me/channel to t.me/s/channel/
             let channel_name = channel_url
@@ -339,7 +339,7 @@ impl TelegramWebScraper {
             if let Some(message_elem) = wrap.select(&data_post_selector).next() {
                 if let Some(data_post) = message_elem.value().attr("data-post") {
                     // data-post format is "channel_name/message_id" or "channel_name/message_idg"
-                    if let Some(post_id_str) = data_post.split('/').last() {
+                    if let Some(post_id_str) = data_post.split('/').next_back() {
                         // remove any non-numeric suffixes like 'g'
                         let numeric_part: String =
                             post_id_str.chars().filter(|c| c.is_ascii_digit()).collect();

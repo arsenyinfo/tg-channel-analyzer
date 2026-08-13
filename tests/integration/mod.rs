@@ -3,14 +3,52 @@ use std::env;
 use std::sync::Arc;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
+const TEST_DATABASE_PREFIX: &str = "channel_bot_test_";
+
 pub mod mock_bot;
 pub mod referral_tests;
 pub mod test_utils;
+
+mod analysis_idempotency_tests;
 
 /// test database configuration and setup
 pub struct TestDatabase {
     pub pool: Arc<deadpool_postgres::Pool>,
     pub db_name: String,
+    admin_database_url: String,
+}
+
+fn validate_test_database_url(
+    database_url: String,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let parsed = url::Url::parse(&database_url)?;
+
+    if !matches!(parsed.scheme(), "postgres" | "postgresql") {
+        return Err("TEST_DATABASE_URL must use the postgres or postgresql scheme".into());
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or("TEST_DATABASE_URL must include a host")?;
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return Err(
+            "TEST_DATABASE_URL must use localhost; integration tests create and drop databases"
+                .into(),
+        );
+    }
+
+    if parsed.path() != "/postgres" {
+        return Err("TEST_DATABASE_URL must select the postgres admin database".into());
+    }
+
+    Ok(database_url)
+}
+
+fn test_database_url() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let database_url = env::var("TEST_DATABASE_URL").map_err(|_| {
+        "TEST_DATABASE_URL must point to the local PostgreSQL admin database; run ./scripts/test-integration.sh"
+    })?;
+    validate_test_database_url(database_url)
 }
 
 impl TestDatabase {
@@ -22,19 +60,17 @@ impl TestDatabase {
         let tls = MakeRustlsConnect::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(rustls::RootCertStore {
-                    roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+                    roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
                 })
                 .with_no_client_auth(),
         );
 
-        // use external docker postgres - expect it to be running
-        let database_url = env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
-            "postgresql://postgres:postgres@localhost:5432/postgres".to_string()
-        });
+        // Require an explicit, local admin URL because this fixture creates and drops databases.
+        let database_url = test_database_url()?;
 
         // generate unique database name for this test
         let test_id = fastrand::u64(..);
-        let db_name = format!("test_db_{}", test_id);
+        let db_name = format!("{TEST_DATABASE_PREFIX}{test_id}");
 
         // connect to default postgres database to create test database
         let mut cfg = Config::new();
@@ -71,6 +107,7 @@ impl TestDatabase {
         Ok(Self {
             pool: Arc::new(pool),
             db_name,
+            admin_database_url: database_url,
         })
     }
 
@@ -89,24 +126,24 @@ impl TestDatabase {
 
     /// cleans up the test database
     pub async fn cleanup(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !self.db_name.starts_with(TEST_DATABASE_PREFIX) {
+            return Err("refusing to drop a database without the integration-test prefix".into());
+        }
+
         // close all connections first
         self.pool.close();
-
-        // connect to admin database to drop the test database
-        let database_url = env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
-            "postgresql://postgres:postgres@localhost:5432/postgres".to_string()
-        });
 
         let tls = MakeRustlsConnect::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(rustls::RootCertStore {
-                    roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+                    roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
                 })
                 .with_no_client_auth(),
         );
 
         let mut cfg = Config::new();
-        cfg.url = Some(database_url);
+        // Use the same server that created the database even if the process environment changes.
+        cfg.url = Some(self.admin_database_url.clone());
         cfg.manager = Some(deadpool_postgres::ManagerConfig {
             recycling_method: deadpool_postgres::RecyclingMethod::Fast,
         });
@@ -151,6 +188,22 @@ impl Drop for TestDatabase {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_database_url_validation() {
+        assert!(validate_test_database_url(
+            "postgresql://postgres:postgres@127.0.0.1:55432/postgres".to_string()
+        )
+        .is_ok());
+        assert!(validate_test_database_url(
+            "postgresql://postgres:postgres@db.example.com/postgres".to_string()
+        )
+        .is_err());
+        assert!(validate_test_database_url(
+            "postgresql://postgres:postgres@127.0.0.1/production".to_string()
+        )
+        .is_err());
+    }
+
     #[tokio::test]
     async fn test_database_setup() {
         let db = TestDatabase::create_fresh()
@@ -176,7 +229,7 @@ mod tests {
             .await
             .expect("Failed to check schema");
 
-        assert!(tables.len() > 0, "No tables found in test database");
+        assert!(!tables.is_empty(), "No tables found in test database");
 
         // check for specific tables we need
         let table_names: Vec<String> = tables.iter().map(|row| row.get(0)).collect();

@@ -62,11 +62,7 @@ impl CommandHandler {
         Ok(())
     }
 
-    async fn handle_start_command(
-        ctx: BotContext,
-        msg: Message,
-        lang: Lang,
-    ) -> ResponseResult<()> {
+    async fn handle_start_command(ctx: BotContext, msg: Message, lang: Lang) -> ResponseResult<()> {
         // parse referral code from message text
         let referrer_user_id = Self::parse_referral_code(&ctx, &msg).await;
 

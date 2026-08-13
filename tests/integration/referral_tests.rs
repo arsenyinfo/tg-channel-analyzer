@@ -245,7 +245,7 @@ async fn test_paid_referral_rewards() {
         .expect("Failed to create referee");
 
     // verify initial state
-    TestAssertions::assert_user_credit_count(&db, referrer.id, 1) // only initial credit
+    TestAssertions::assert_user_credit_count(&db, referrer.id, 2) // initial + milestone at 1 referral
         .await
         .expect("Initial referrer credit assertion failed");
 
@@ -265,7 +265,7 @@ async fn test_paid_referral_rewards() {
         .await
         .expect("Paid referral count assertion failed");
 
-    TestAssertions::assert_user_credit_count(&db, referrer.id, 2) // 1 initial + 1 from paid referral
+    TestAssertions::assert_user_credit_count(&db, referrer.id, 3) // initial + milestone + paid referral
         .await
         .expect("Post-payment referrer credit assertion failed");
 

@@ -29,7 +29,7 @@ impl MigrationManager {
         }
 
         // check if we need to run any new migrations (always check, even after initial setup)
-        let current_version = Self::get_current_version(&mut client).await?;
+        let current_version = Self::get_current_version(&client).await?;
         if current_version < Self::latest_version() {
             let transaction = client.transaction().await?;
             Self::run_pending_migrations(&transaction, current_version).await?;
@@ -119,7 +119,7 @@ impl MigrationManager {
     }
 
     fn latest_version() -> i32 {
-        6 // increment this when adding new migrations
+        7 // increment this when adding new migrations
     }
 
     async fn run_pending_migrations(
@@ -255,6 +255,18 @@ impl MigrationManager {
                         -- reconciliation would refund every historical completed analysis.
                         ALTER TABLE user_analyses ADD COLUMN delivered_at TIMESTAMP WITH TIME ZONE;
                         UPDATE user_analyses SET delivered_at = analysis_timestamp WHERE status = 'completed';
+                    "#;
+                    transaction.batch_execute(migration_sql).await?;
+                }
+                7 => {
+                    // Telegram may redeliver the same callback query. Persist its globally
+                    // unique ID on the analysis row so only one worker can claim it.
+                    let migration_sql = r#"
+                        ALTER TABLE user_analyses
+                        ADD COLUMN telegram_callback_query_id VARCHAR(255);
+
+                        CREATE UNIQUE INDEX idx_user_analyses_callback_query_id
+                        ON user_analyses (telegram_callback_query_id);
                     "#;
                     transaction.batch_execute(migration_sql).await?;
                 }

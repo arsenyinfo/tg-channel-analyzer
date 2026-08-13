@@ -5,7 +5,7 @@ use image::{GenericImageView, ImageFormat};
 use log::{error, info, warn};
 use regex::Regex;
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::io::Cursor;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -53,11 +53,36 @@ pub fn get_gemini_rate_limiter() -> &'static GeminiRateLimiter {
 pub const MAX_RETRIES: u32 = 3;
 pub const BASE_DELAY_MS: u64 = 1000;
 pub const GEMINI_TIMEOUT_SECS: u64 = 300;
+pub const ANALYSIS_MODEL: &str = "gemini-3.7-flash";
+pub const GEMINI_FLASH_LITE_MODEL: &str = "gemini-2.5-flash-lite";
 
 #[derive(Debug)]
 pub struct LLMResponse {
     pub content: String,
 }
+
+#[derive(Debug)]
+enum GeminiRequestError {
+    Retryable(String),
+    Permanent(String),
+}
+
+impl GeminiRequestError {
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
+
+impl std::fmt::Display for GeminiRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::Retryable(message) | Self::Permanent(message) => message,
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for GeminiRequestError {}
 
 pub fn extract_tag(text: &str, tag: &str) -> Option<String> {
     let pattern = format!(r"(?s)<{}>(.*?)</{}>", tag, tag);
@@ -73,18 +98,24 @@ pub async fn query_llm(
 ) -> Result<LLMResponse, Box<dyn std::error::Error + Send + Sync>> {
     info!("Querying LLM with model: {}", model);
 
-    // apply rate limiting before each attempt
-    get_gemini_rate_limiter().wait_for_api_call().await;
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .map_err(|_| "GEMINI_API_KEY environment variable not set")?;
+    let client = Client::new();
 
     for attempt in 0..=MAX_RETRIES {
+        get_gemini_rate_limiter().wait_for_api_call().await;
         let response = match timeout(
             Duration::from_secs(GEMINI_TIMEOUT_SECS),
-            gemini_rs::chat(model).send_message(prompt),
+            send_gemini_message(&client, &api_key, model, prompt),
         )
         .await
         {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
+                if !e.is_retryable() {
+                    error!("Gemini API request failed permanently: {}", e);
+                    return Err(e.into());
+                }
                 if attempt == MAX_RETRIES {
                     error!(
                         "Failed to get response from Gemini API after {} attempts: {:?}",
@@ -128,27 +159,7 @@ pub async fn query_llm(
             }
         };
 
-        let content = response.to_string();
-
-        if content.is_empty() {
-            if attempt == MAX_RETRIES {
-                error!(
-                    "Received empty response from Gemini API after {} attempts",
-                    MAX_RETRIES + 1
-                );
-                return Err("Empty response from Gemini API".into());
-            }
-
-            let delay = calculate_delay(attempt);
-            warn!(
-                "Received empty response from Gemini API (attempt {}/{}). Retrying in {}ms",
-                attempt + 1,
-                MAX_RETRIES + 1,
-                delay.as_millis()
-            );
-            sleep(delay).await;
-            continue;
-        }
+        let content = response;
 
         info!(
             "Received LLM response of length: {} (attempt {})",
@@ -159,6 +170,98 @@ pub async fn query_llm(
     }
 
     unreachable!()
+}
+
+async fn send_gemini_message(
+    client: &Client,
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<String, GeminiRequestError> {
+    let response = client
+        .post(format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        ))
+        .header("x-goog-api-key", api_key)
+        .json(&json!({
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}]
+        }))
+        .send()
+        .await
+        .map_err(|error| GeminiRequestError::Retryable(error.to_string()))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| GeminiRequestError::Retryable(error.to_string()))?;
+    if !status.is_success() {
+        return Err(classify_gemini_status(status, &body));
+    }
+
+    let response_json: Value = serde_json::from_str(&body)
+        .map_err(|error| GeminiRequestError::Permanent(error.to_string()))?;
+    let content = visible_gemini_text(&response_json);
+    if content.is_empty() {
+        Err(GeminiRequestError::Permanent(
+            "Gemini response did not contain visible text".to_string(),
+        ))
+    } else {
+        Ok(content)
+    }
+}
+
+fn classify_gemini_status(status: reqwest::StatusCode, body: &str) -> GeminiRequestError {
+    let message = format!("Gemini API error {status}: {body}");
+    if status.as_u16() == 429 || status.is_server_error() {
+        GeminiRequestError::Retryable(message)
+    } else {
+        GeminiRequestError::Permanent(message)
+    }
+}
+
+fn visible_gemini_text(response: &Value) -> String {
+    response["candidates"][0]["content"]["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|part| part["thought"] != true)
+        .filter_map(|part| part["text"].as_str())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_visible_text_without_deserializing_new_response_fields() {
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thought": true, "text": "internal"},
+                        {"text": "migration-ok", "thoughtSignature": "opaque"}
+                    ]
+                },
+                "finishReason": "A_FUTURE_FINISH_REASON"
+            }]
+        });
+
+        assert_eq!(visible_gemini_text(&response), "migration-ok");
+    }
+
+    #[test]
+    fn retries_only_rate_limits_and_server_errors() {
+        assert!(!classify_gemini_status(reqwest::StatusCode::BAD_REQUEST, "bad").is_retryable());
+        assert!(
+            classify_gemini_status(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down")
+                .is_retryable()
+        );
+        assert!(
+            classify_gemini_status(reqwest::StatusCode::SERVICE_UNAVAILABLE, "later")
+                .is_retryable()
+        );
+    }
 }
 
 pub fn calculate_delay(attempt: u32) -> Duration {
@@ -347,8 +450,8 @@ async fn describe_single_image(
 
     // make API call to Gemini
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite-preview-06-17:generateContent?key={}",
-        api_key
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        GEMINI_FLASH_LITE_MODEL, api_key
     );
 
     let response = client

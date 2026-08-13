@@ -3,7 +3,7 @@ use log::{error, info};
 use std::sync::Arc;
 use tg_main::analysis::AnalysisEngine;
 use tg_main::cache::CacheManager;
-use tg_main::llm::query_llm;
+use tg_main::llm::{query_llm, ANALYSIS_MODEL};
 
 #[derive(Parser, Debug)]
 #[command(name = "custom_prompt")]
@@ -99,7 +99,7 @@ Please provide your analysis based on the above messages."#,
 
     // query LLM
     info!("Sending prompt to LLM...");
-    match query_llm(&full_prompt, "gemini-3-flash-preview").await {
+    match query_llm(&full_prompt, ANALYSIS_MODEL).await {
         Ok(response) => {
             // print response directly to stdout
             println!("{}", response.content);

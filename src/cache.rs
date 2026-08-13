@@ -1,11 +1,11 @@
 use deadpool_postgres::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use log::{error, info, warn};
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::analysis::MessageDict;
@@ -136,9 +136,18 @@ impl CacheManager {
         format!("{:x}", hasher.finish())
     }
 
-    pub fn get_llm_cache_key(&self, messages: &[MessageDict], prompt_type: &str) -> String {
-        let cache_input = (messages, prompt_type);
+    fn get_llm_cache_key(
+        messages: &[MessageDict],
+        prompt_type: &str,
+        cache_version: &str,
+        model: &str,
+    ) -> String {
+        let cache_input = (messages, prompt_type, cache_version, model);
         Self::hash_content(&cache_input)
+    }
+
+    pub fn get_analysis_cache_key(&self, messages: &[MessageDict]) -> String {
+        Self::get_llm_cache_key(messages, "analysis", "v2", crate::llm::ANALYSIS_MODEL)
     }
 
     pub async fn load_llm_result(&self, cache_key: &str) -> Option<AnalysisResult> {
@@ -211,4 +220,33 @@ pub struct AnalysisResult {
     pub personal: Option<String>,
     pub roast: Option<String>,
     pub messages_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn messages() -> Vec<MessageDict> {
+        vec![MessageDict {
+            date: Some("2026-08-13".to_string()),
+            message: Some("hello".to_string()),
+            images: None,
+        }]
+    }
+
+    #[test]
+    fn llm_cache_key_includes_model_and_cache_version() {
+        let messages = messages();
+        let current =
+            CacheManager::get_llm_cache_key(&messages, "analysis", "v2", "gemini-3.7-flash");
+
+        assert_ne!(
+            current,
+            CacheManager::get_llm_cache_key(&messages, "analysis", "v2", "gemini-3-flash-preview",)
+        );
+        assert_ne!(
+            current,
+            CacheManager::get_llm_cache_key(&messages, "analysis", "v1", "gemini-3.7-flash",)
+        );
+    }
 }

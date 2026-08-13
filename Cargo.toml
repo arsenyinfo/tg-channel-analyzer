@@ -35,13 +35,15 @@ reqwest = { version = "0.11", features = [
 ] }
 grammers-client = "0.7"
 grammers-session = "0.7"
-gemini-rs = "2.0.0"
 regex = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 teloxide = { version = "0.14", features = ["macros"] }
 tokio-stream = "0.1"
 fastrand = "2.0"
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tokio-postgres = { version = "0.7", features = [
+    "with-chrono-0_4",
+    "with-serde_json-1",
+] }
 deadpool-postgres = "0.14"
 dotenvy = "0.15"
 tokio-postgres-rustls = "0.12"
@@ -64,3 +66,8 @@ lru = "0.12"
 
 [dev-dependencies]
 tempfile = "3.0"
+
+# Remove the Rust future-incompatibility in proc-macro-error2 2.0.1 until
+# https://github.com/GnomedDev/proc-macro-error-2/pull/14 is released.
+[patch.crates-io]
+proc-macro-error2 = { git = "https://github.com/fgardt/proc-macro-error-2", rev = "53ff94b61c678593158db1a3d50269c6f0de0db7" }

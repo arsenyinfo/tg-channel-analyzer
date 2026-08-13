@@ -172,31 +172,30 @@ impl PaymentHandler {
                     let referrer_user_id = reward_info.referrer_user_id.unwrap_or(0);
 
                     // send notification to referrer
-                    let reward_msg = if reward_info.paid_rewards > 0
-                        && reward_info.milestone_rewards > 0
-                    {
-                        lang.referral_paid_and_milestone(
-                            reward_info.total_credits_awarded,
-                            reward_info.referral_count,
-                            reward_info.paid_rewards,
-                            reward_info.milestone_rewards,
-                            referrer_user_id,
-                        )
-                    } else if reward_info.paid_rewards > 0 {
-                        lang.referral_paid_only(
-                            reward_info.paid_rewards,
-                            reward_info.referral_count,
-                            referrer_user_id,
-                        )
-                    } else if reward_info.milestone_rewards > 0 {
-                        lang.referral_milestone_only(
-                            reward_info.milestone_rewards,
-                            reward_info.referral_count,
-                            referrer_user_id,
-                        )
-                    } else {
-                        String::new()
-                    };
+                    let reward_msg =
+                        if reward_info.paid_rewards > 0 && reward_info.milestone_rewards > 0 {
+                            lang.referral_paid_and_milestone(
+                                reward_info.total_credits_awarded,
+                                reward_info.referral_count,
+                                reward_info.paid_rewards,
+                                reward_info.milestone_rewards,
+                                referrer_user_id,
+                            )
+                        } else if reward_info.paid_rewards > 0 {
+                            lang.referral_paid_only(
+                                reward_info.paid_rewards,
+                                reward_info.referral_count,
+                                referrer_user_id,
+                            )
+                        } else if reward_info.milestone_rewards > 0 {
+                            lang.referral_milestone_only(
+                                reward_info.milestone_rewards,
+                                reward_info.referral_count,
+                                referrer_user_id,
+                            )
+                        } else {
+                            String::new()
+                        };
 
                     if !reward_msg.is_empty() {
                         let _ = bot

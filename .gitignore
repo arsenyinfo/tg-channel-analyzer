@@ -11,7 +11,6 @@ cache/
 
 # Build artifacts
 /target/
-Cargo.lock
 
 # IDE files
 .vscode/

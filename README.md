@@ -67,3 +67,27 @@ This bot requires Telegram user sessions to fetch channels. Sessions allow the b
 ```bash
 cargo run
 ```
+
+### Testing
+
+Run the PostgreSQL-backed integration suite with one command:
+
+```bash
+./scripts/test-integration.sh
+```
+
+The script starts an ephemeral PostgreSQL 16 container on local port `55432`, sets
+`TEST_DATABASE_URL`, runs the integration tests with the checked-in lockfile, and
+removes the container on exit. Override `TEST_POSTGRES_PORT` if that port is in use.
+
+To run the tests against an already-running local PostgreSQL instance, set the
+admin database URL explicitly:
+
+```bash
+TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/postgres \
+  cargo test --locked --test integration
+```
+
+For safety, the integration harness accepts only localhost URLs selecting the
+`postgres` admin database. Each test creates and drops only a uniquely named
+`channel_bot_test_*` database.

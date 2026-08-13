@@ -1,5 +1,5 @@
 use crate::cache::AnalysisResult;
-use crate::llm::{extract_tag, query_llm};
+use crate::llm::{extract_tag, query_llm, ANALYSIS_MODEL};
 use log::{error, info, warn};
 
 pub async fn query_and_parse_analysis(
@@ -10,9 +10,9 @@ pub async fn query_and_parse_analysis(
     async fn try_model(
         prompt: &str,
         model: &str,
-        api_retries: u32,
+        response_attempts: u32,
     ) -> Result<AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
-        for api_attempt in 0..api_retries {
+        for response_attempt in 0..response_attempts {
             match query_llm(prompt, model).await {
                 Ok(response) => {
                     let professional = extract_tag(&response.content, "professional");
@@ -32,9 +32,9 @@ pub async fn query_and_parse_analysis(
 
                     if missing.is_empty() {
                         info!(
-                            "Complete analysis received from {} (api_attempt: {})",
+                            "Complete analysis received from {} (response_attempt: {})",
                             model,
-                            api_attempt + 1
+                            response_attempt + 1
                         );
                         return Ok(AnalysisResult {
                             professional,
@@ -45,41 +45,44 @@ pub async fn query_and_parse_analysis(
                     }
 
                     warn!(
-                        "Missing analysis sections [{}] from {} (api_attempt: {})",
+                        "Missing analysis sections [{}] from {} (response_attempt: {})",
                         missing.join(", "),
                         model,
-                        api_attempt + 1
+                        response_attempt + 1
                     );
-                    if api_attempt == api_retries - 1 {
+                    if response_attempt == response_attempts - 1 {
                         return Err(format!(
-                            "Failed to get complete analysis from {} after {} API attempts (missing: {})",
+                            "Failed to get complete analysis from {} after {} response attempts (missing: {})",
                             model,
-                            api_retries,
+                            response_attempts,
                             missing.join(", ")
                         )
                         .into());
                     }
                 }
                 Err(e) => {
-                    error!("{} API attempt {} failed: {}", model, api_attempt + 1, e);
-                    if api_attempt == api_retries - 1 {
-                        return Err(e);
-                    }
+                    // query_llm already owns transport retries; only repeat here when a
+                    // successful response is missing required analysis sections.
+                    error!("{} API request failed: {}", model, e);
+                    return Err(e);
                 }
             }
         }
         Err(format!(
-            "Unexpected failure in {} after {} API attempts",
-            model, api_retries
+            "Unexpected failure in {} after {} response attempts",
+            model, response_attempts
         )
         .into())
     }
 
-    // try gemini-3-flash-preview with retries
-    match try_model(prompt, "gemini-3-flash-preview", 2).await {
+    // try the primary analysis model with retries
+    match try_model(prompt, ANALYSIS_MODEL, 2).await {
         Ok(result) => return Ok(result),
         Err(e) => {
-            warn!("Gemini 3 Flash failed with error: {}, trying fallback", e);
+            warn!(
+                "{} failed with error: {}, trying fallback",
+                ANALYSIS_MODEL, e
+            );
         }
     }
 

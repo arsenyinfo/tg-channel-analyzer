@@ -28,7 +28,7 @@ cargo test
 cargo check
 
 # run integration tests specifically
-cargo test --test integration
+./scripts/test-integration.sh
 ```
 
 ### Binary Tools
@@ -129,8 +129,9 @@ DATABASE_URL=postgresql://username:password@host/database
 
 - Integration tests in `tests/integration/`
 - Mock bot implementation for testing
-- External PostgreSQL database required for integration tests
-- Test database setup handled automatically
+- `./scripts/test-integration.sh` starts and removes an ephemeral PostgreSQL container
+- Direct test runs require an explicit local `TEST_DATABASE_URL` selecting `/postgres`
+- Test database setup and teardown are handled automatically
 
 ## Important Notes
 
