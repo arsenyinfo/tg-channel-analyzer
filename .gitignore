@@ -27,3 +27,6 @@ Thumbs.db
 
 # vibecoding
 .claude/*
+
+# Local LLM comparison outputs
+model-vibe-check/

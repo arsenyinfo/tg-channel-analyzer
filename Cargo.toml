@@ -16,6 +16,10 @@ path = "src/bin/bulk_messenger.rs"
 name = "custom_prompt"
 path = "src/bin/custom_prompt.rs"
 
+[[bin]]
+name = "model_vibe_check"
+path = "src/bin/model_vibe_check.rs"
+
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
