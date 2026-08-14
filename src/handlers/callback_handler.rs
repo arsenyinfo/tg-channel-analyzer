@@ -152,6 +152,12 @@ impl CallbackHandler {
                 return Ok(());
             }
 
+            // Stop Telegram's loading spinner immediately. The database and analysis engine may
+            // be busy, but acknowledging the tap must not wait behind either of them.
+            if let Err(e) = ctx.bot.answer_callback_query(&query.id).await {
+                error!("Failed to acknowledge analysis callback: {}", e);
+            }
+
             let telegram_user_id = query.from.id.0 as i64;
 
             // check if user has credits before starting analysis
@@ -184,7 +190,6 @@ impl CallbackHandler {
                     .reply_markup(Self::create_payment_keyboard(lang))
                     .await?;
 
-                ctx.bot.answer_callback_query(&query.id).await?;
                 return Ok(());
             }
 
@@ -202,7 +207,6 @@ impl CallbackHandler {
             {
                 Ok(Some(id)) => id,
                 Ok(None) => {
-                    ctx.bot.answer_callback_query(&query.id).await?;
                     return Ok(());
                 }
                 Err(e) => {
@@ -214,10 +218,19 @@ impl CallbackHandler {
                         .bot
                         .send_message(Self::get_chat_id(message), error_msg)
                         .await;
-                    ctx.bot.answer_callback_query(&query.id).await?;
                     return Ok(());
                 }
             };
+
+            // This prompt asks for one choice. Remove its keyboard once a choice is claimed so
+            // the same message cannot be used to enqueue more analyses accidentally.
+            if let Err(e) = ctx
+                .bot
+                .edit_message_reply_markup(Self::get_chat_id(message), message.id())
+                .await
+            {
+                error!("Failed to remove used analysis keyboard: {}", e);
+            }
 
             // start analysis in background
             Self::start_analysis_in_background(
@@ -230,9 +243,10 @@ impl CallbackHandler {
                 lang,
             )
             .await;
+        } else {
+            ctx.bot.answer_callback_query(&query.id).await?;
         }
 
-        ctx.bot.answer_callback_query(&query.id).await?;
         Ok(())
     }
 

@@ -52,6 +52,21 @@ async fn duplicate_callback_query_creates_only_one_analysis() {
         .next()
         .expect("One callback delivery must own the analysis");
 
+    let second_tap = user_manager
+        .create_pending_analysis(
+            user.id,
+            "test_channel",
+            "personal",
+            Some("en"),
+            "distinct-callback-while-pending",
+        )
+        .await
+        .expect("Second tap claim failed");
+    assert_eq!(
+        second_tap, None,
+        "a distinct tap must not create duplicate work while the channel is pending"
+    );
+
     let remaining_credits = user_manager
         .atomic_complete_analysis(analysis_id, user.id, "generated", Some("test-cache-key"))
         .await
@@ -69,6 +84,22 @@ async fn duplicate_callback_query_creates_only_one_analysis() {
         .await
         .expect("Late duplicate claim failed");
     assert_eq!(late_duplicate, None, "a completed callback remains claimed");
+
+    let later_request = user_manager
+        .create_pending_analysis(
+            user.id,
+            "test_channel",
+            "personal",
+            Some("en"),
+            "distinct-callback-after-completion",
+        )
+        .await
+        .expect("Later analysis claim failed")
+        .expect("A new analysis must be allowed after the prior one completes");
+    user_manager
+        .mark_analysis_failed(later_request)
+        .await
+        .expect("Failed to clean up later analysis");
 
     let client = db.pool.get().await.expect("Failed to get database client");
     let analysis_count: i64 = client

@@ -849,6 +849,12 @@ impl TelegramBot {
             analysis_type, channel_name
         );
 
+        // Give immediate feedback before touching the global analysis-engine mutex. Preparing
+        // another channel may hold that mutex across network I/O, and previously this message
+        // was delayed long enough for users to tap several analysis buttons.
+        bot.send_message(user_chat_id, lang.analysis_in_progress(&analysis_type))
+            .await?;
+
         let cache = {
             let engine = analysis_engine.lock().await;
             engine.cache.clone()
@@ -878,9 +884,6 @@ impl TelegramBot {
 
             return Ok(());
         }
-
-        bot.send_message(user_chat_id, lang.analysis_in_progress(&analysis_type))
-            .await?;
 
         let wait_needed = {
             let engine = analysis_engine.lock().await;

@@ -423,9 +423,40 @@ impl UserManager {
         language: Option<&str>,
         telegram_callback_query_id: &str,
     ) -> Result<Option<i32>, UserManagerError> {
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
 
-        let analysis_id = client
+        // A Telegram callback ID only deduplicates redelivery of the same tap. A user can tap
+        // several buttons while the first analysis is waiting behind the engine lock, producing
+        // distinct callback IDs and duplicate work. Serialize claims per user/channel and allow
+        // only one pending analysis for that channel at a time.
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock($1, hashtext(LOWER($2)))",
+                &[&user_id, &channel_name],
+            )
+            .await?;
+
+        let already_pending = transaction
+            .query_opt(
+                "SELECT id FROM user_analyses
+                 WHERE user_id = $1 AND LOWER(channel_name) = LOWER($2)
+                   AND status = 'pending'
+                 LIMIT 1",
+                &[&user_id, &channel_name],
+            )
+            .await?
+            .is_some();
+        if already_pending {
+            transaction.commit().await?;
+            info!(
+                "Analysis already pending for user {} and channel {}; skipping duplicate tap",
+                user_id, channel_name
+            );
+            return Ok(None);
+        }
+
+        let analysis_id = transaction
             .query_opt(
                 "INSERT INTO user_analyses
                     (user_id, channel_name, credits_used, analysis_type, status, language,
@@ -453,6 +484,8 @@ impl UserManager {
             )
             .await?
             .map(|row| row.get::<_, i32>(0));
+
+        transaction.commit().await?;
 
         if let Some(analysis_id) = analysis_id {
             info!(
