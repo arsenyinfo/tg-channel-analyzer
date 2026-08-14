@@ -147,7 +147,7 @@ impl CacheManager {
     }
 
     pub fn get_analysis_cache_key(&self, messages: &[MessageDict]) -> String {
-        Self::get_llm_cache_key(messages, "analysis", "v2", crate::llm::ANALYSIS_MODEL)
+        Self::get_llm_cache_key(messages, "analysis", "v3", crate::llm::ANALYSIS_MODEL)
     }
 
     pub async fn load_llm_result(&self, cache_key: &str) -> Option<AnalysisResult> {
@@ -238,15 +238,15 @@ mod tests {
     fn llm_cache_key_includes_model_and_cache_version() {
         let messages = messages();
         let current =
-            CacheManager::get_llm_cache_key(&messages, "analysis", "v2", "gemini-3.7-flash");
+            CacheManager::get_llm_cache_key(&messages, "analysis", "v3", "gemini-3.7-flash");
 
         assert_ne!(
             current,
-            CacheManager::get_llm_cache_key(&messages, "analysis", "v2", "gemini-3-flash-preview",)
+            CacheManager::get_llm_cache_key(&messages, "analysis", "v3", "gemini-3-flash-preview",)
         );
         assert_ne!(
             current,
-            CacheManager::get_llm_cache_key(&messages, "analysis", "v1", "gemini-3.7-flash",)
+            CacheManager::get_llm_cache_key(&messages, "analysis", "v2", "gemini-3.7-flash",)
         );
     }
 }

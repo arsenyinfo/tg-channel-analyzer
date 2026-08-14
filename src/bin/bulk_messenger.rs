@@ -57,38 +57,42 @@ struct LaunchArgs {
     contact_cooldown_days: i64,
 
     /// IANA timezone used for the campaign-wide send window.
-    #[arg(long, default_value = "Europe/Warsaw")]
+    #[arg(long, default_value = "UTC")]
     timezone: String,
 
-    #[arg(long, default_value = "09:00")]
+    #[arg(long, default_value = "08:00")]
     window_start: String,
 
     #[arg(long, default_value = "20:00")]
     window_end: String,
 
     /// Delay between recipients. Longer batches automatically spill into following days.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 20)]
     cadence_seconds: i64,
 
-    /// Control allocation in basis points (1,000 = 10%).
-    #[arg(long, default_value_t = 1_000)]
+    /// Optional no-contact control allocation in basis points (1,000 = 10%).
+    #[arg(long, default_value_t = 0)]
     holdout_bps: u16,
 
-    /// Message-only allocation in basis points (4,500 = 45%).
-    #[arg(long, default_value_t = 4_500)]
+    /// Message-only allocation in basis points (5,000 = 50%).
+    #[arg(long, default_value_t = 5_000)]
     message_bps: u16,
 
-    /// Message-plus-credit allocation in basis points (4,500 = 45%).
-    #[arg(long, default_value_t = 4_500)]
+    /// Message-plus-credit allocation in basis points (5,000 = 50%).
+    #[arg(long, default_value_t = 5_000)]
     message_credit_bps: u16,
 
     /// One-time credit grant for known paying users who currently have no credits.
     #[arg(long, default_value_t = 1)]
     paid_credit: i32,
 
-    /// One-time credit grant for known-free users in the credit arm.
+    /// One-time credit grant for known-free and legacy users in the credit arm.
     #[arg(long, default_value_t = 1)]
     free_credit: i32,
+
+    /// Versioned message copy. May change between batches of the same campaign.
+    #[arg(long, default_value = "google-gemini-v1")]
+    copy_version: String,
 
     /// Actually persist recipients, grants, and scheduled messages.
     #[arg(long)]
@@ -113,6 +117,7 @@ impl LaunchArgs {
             message_credit_bps: self.message_credit_bps,
             paid_credit: self.paid_credit,
             free_credit: self.free_credit,
+            copy_version: self.copy_version.clone(),
             ..CampaignConfig::default()
         }
     }
@@ -148,13 +153,47 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 preview.counts.holdout, preview.counts.message, preview.counts.message_credit
             );
             println!(
+                "  copy: a={}, b={}, c={}",
+                preview.counts.copy_a, preview.counts.copy_b, preview.counts.copy_c
+            );
+            println!(
                 "  maximum credit liability: {}",
                 preview.counts.maximum_credit_liability
             );
             println!("  assignment: {}", config.assignment_version);
-            println!("\nPaid sample:\n{}", preview.sample_paid_en);
-            println!("\nFree sample:\n{}", preview.sample_free_en);
-            println!("\nLegacy-unknown sample:\n{}", preview.sample_unknown_en);
+            println!("\nCopy A (EN):\n{}", preview.sample_copy_a_en);
+            println!("\nCopy B (EN):\n{}", preview.sample_copy_b_en);
+            println!("\nCopy C (EN):\n{}", preview.sample_copy_c_en);
+            println!("\nCopy A (RU):\n{}", preview.sample_copy_a_ru);
+            println!("\nCopy B (RU):\n{}", preview.sample_copy_b_ru);
+            println!("\nCopy C (RU):\n{}", preview.sample_copy_c_ru);
+            if config.paid_credit == config.free_credit {
+                println!(
+                    "\nCredit arm adds for every cohort (EN):\n{}",
+                    preview.free_credit_addendum_en
+                );
+                println!(
+                    "\nCredit arm adds for every cohort (RU):\n{}",
+                    preview.free_credit_addendum_ru
+                );
+            } else {
+                println!(
+                    "\nPaid cohort credit arm adds (EN):\n{}",
+                    preview.paid_credit_addendum_en
+                );
+                println!(
+                    "\nPaid cohort credit arm adds (RU):\n{}",
+                    preview.paid_credit_addendum_ru
+                );
+                println!(
+                    "\nFree / legacy cohort credit arm adds (EN):\n{}",
+                    preview.free_credit_addendum_en
+                );
+                println!(
+                    "\nFree / legacy cohort credit arm adds (RU):\n{}",
+                    preview.free_credit_addendum_ru
+                );
+            }
 
             if !args.execute {
                 println!("\nDRY RUN: no recipients, credits, or messages were written.");

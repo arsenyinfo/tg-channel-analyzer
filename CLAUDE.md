@@ -37,7 +37,7 @@ cargo check
 cargo run --bin authorize
 
 # preview a re-engagement campaign (dry-run by default)
-cargo run --bin bulk_messenger -- launch --campaign gemini-3.7-launch
+cargo run --bin bulk_messenger -- launch --campaign channel-analysis-refresh-2026-08
 
 # fill user language data
 cargo run --bin fill_user_languages

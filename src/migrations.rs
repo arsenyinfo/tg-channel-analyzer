@@ -114,7 +114,7 @@ impl MigrationManager {
     }
 
     fn latest_version() -> i32 {
-        9 // increment this when adding new migrations
+        10 // increment this when adding new migrations
     }
 
     async fn run_pending_migrations(
@@ -436,6 +436,23 @@ impl MigrationManager {
                         );
                         CREATE INDEX idx_llm_attempts_analysis ON llm_attempts(user_analysis_id);
                         CREATE INDEX idx_llm_attempts_model_time ON llm_attempts(model, started_at);
+                    "#;
+                    transaction.batch_execute(migration_sql).await?;
+                }
+                10 => {
+                    // Persist independently randomized message-copy assignment.
+                    let migration_sql = r#"
+                        ALTER TABLE campaign_recipients
+                            ADD COLUMN copy_variant VARCHAR(1)
+                                CHECK (copy_variant IN ('a', 'b', 'c')),
+                            ADD COLUMN copy_assignment_bucket INTEGER
+                                CHECK (copy_assignment_bucket IS NULL
+                                    OR copy_assignment_bucket BETWEEN 0 AND 9999),
+                            ADD COLUMN copy_version VARCHAR(64);
+
+                        CREATE INDEX idx_campaign_recipients_copy
+                            ON campaign_recipients
+                                (campaign_id, copy_version, copy_variant, variant);
                     "#;
                     transaction.batch_execute(migration_sql).await?;
                 }

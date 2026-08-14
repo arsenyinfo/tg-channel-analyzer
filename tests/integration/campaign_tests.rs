@@ -16,7 +16,7 @@ fn grant_config() -> CampaignConfig {
         message_credit_bps: 10_000,
         paid_credit: 1,
         free_credit: 1,
-        copy_version: "gemini-3.7-reengagement-v1".to_string(),
+        copy_version: "google-gemini-v1".to_string(),
     }
 }
 
@@ -110,18 +110,43 @@ async fn campaign_classifies_cohorts_and_enrolls_batches_once() {
         .preview("integration-cohorts", &config, 10)
         .await
         .expect("Failed to preview campaign");
-    assert_eq!(preview.counts.total(), 2);
+    assert_eq!(preview.counts.total(), 3);
     assert_eq!(preview.counts.paid, 1);
     assert_eq!(preview.counts.free, 1);
-    assert_eq!(preview.counts.legacy_unknown, 0);
+    assert_eq!(preview.counts.legacy_unknown, 1);
+
+    let differentiated_preview = manager
+        .preview(
+            "integration-differentiated-preview",
+            &CampaignConfig {
+                paid_credit: 3,
+                free_credit: 1,
+                ..config.clone()
+            },
+            10,
+        )
+        .await
+        .expect("Failed to preview differentiated cohort grants");
+    assert!(differentiated_preview
+        .paid_credit_addendum_en
+        .contains("3 free analyses"));
+    assert!(differentiated_preview
+        .paid_credit_addendum_ru
+        .contains("3 бесплатных анализа"));
+    assert!(differentiated_preview
+        .free_credit_addendum_en
+        .contains("1 free analysis"));
+    assert!(differentiated_preview
+        .free_credit_addendum_ru
+        .contains("1 бесплатный анализ"));
 
     let first = manager
-        .enroll("integration-cohorts", &config, 2)
+        .enroll("integration-cohorts", &config, 3)
         .await
         .expect("Failed to enroll first campaign batch");
-    assert_eq!(first.enrolled, 2);
-    assert_eq!(first.queued, 2);
-    assert_eq!(first.credits_granted, 2);
+    assert_eq!(first.enrolled, 3);
+    assert_eq!(first.queued, 3);
+    assert_eq!(first.credits_granted, 3);
 
     let second = manager
         .enroll("integration-cohorts", &config, 2)
@@ -152,9 +177,9 @@ async fn campaign_classifies_cohorts_and_enrolls_batches_once() {
         .await
         .expect("Failed to inspect campaign persistence");
     assert_eq!(persisted.get::<_, i64>(0), 1);
-    assert_eq!(persisted.get::<_, i64>(1), 2);
-    assert_eq!(persisted.get::<_, i64>(2), 2);
-    assert_eq!(persisted.get::<_, i64>(3), 2);
+    assert_eq!(persisted.get::<_, i64>(1), 3);
+    assert_eq!(persisted.get::<_, i64>(2), 3);
+    assert_eq!(persisted.get::<_, i64>(3), 3);
 
     let cohort_rows = client
         .query(
@@ -172,7 +197,11 @@ async fn campaign_classifies_cohorts_and_enrolls_batches_once() {
         .collect();
     assert_eq!(
         cohorts,
-        vec![("free".to_string(), 1), ("paid".to_string(), 1),]
+        vec![
+            ("free".to_string(), 1),
+            ("legacy_unknown".to_string(), 1),
+            ("paid".to_string(), 1),
+        ]
     );
 
     let balances = client
@@ -185,7 +214,7 @@ async fn campaign_classifies_cohorts_and_enrolls_batches_once() {
     assert_eq!(balances.len(), 3);
     assert_eq!(balances[0].get::<_, i32>(1), 1);
     assert_eq!(balances[1].get::<_, i32>(1), 1);
-    assert_eq!(balances[2].get::<_, i32>(1), 0);
+    assert_eq!(balances[2].get::<_, i32>(1), 1);
 
     let all_scheduled_in_daytime: bool = client
         .query_one(
@@ -202,6 +231,41 @@ async fn campaign_classifies_cohorts_and_enrolls_batches_once() {
         .get(0);
     assert!(all_scheduled_in_daytime);
 
+    client
+        .execute(
+            "UPDATE campaigns
+             SET configuration = jsonb_set(
+                 configuration,
+                 '{copy_version}',
+                 to_jsonb('older-copy-v0'::TEXT)
+             )
+             WHERE campaign_key = 'integration-cohorts'",
+            &[],
+        )
+        .await
+        .expect("Failed to simulate an earlier copy version");
+
+    drop(client);
+
+    manager
+        .preview("integration-cohorts", &config, 10)
+        .await
+        .expect("Copy-only changes must remain previewable under the same campaign key");
+    manager
+        .enroll("integration-cohorts", &config, 10)
+        .await
+        .expect("Copy-only changes must remain enrollable under the same campaign key");
+    let client = db.pool.get().await.expect("Failed to get database client");
+    let current_copy: String = client
+        .query_one(
+            "SELECT configuration ->> 'copy_version'
+             FROM campaigns WHERE campaign_key = 'integration-cohorts'",
+            &[],
+        )
+        .await
+        .expect("Failed to inspect current campaign copy")
+        .get(0);
+    assert_eq!(current_copy, "google-gemini-v1");
     drop(client);
 
     let mut mismatched = config.clone();
@@ -242,6 +306,15 @@ async fn campaign_persists_holdout_without_message_or_credit() {
         message_credit_bps: 0,
         ..grant_config()
     };
+    let preview = manager
+        .preview("integration-holdout", &config, 10)
+        .await
+        .expect("Failed to preview holdout");
+    assert_eq!(preview.counts.holdout, 1);
+    assert_eq!(preview.counts.copy_a, 0);
+    assert_eq!(preview.counts.copy_b, 0);
+    assert_eq!(preview.counts.copy_c, 0);
+
     let enrolled = manager
         .enroll("integration-holdout", &config, 10)
         .await
@@ -262,7 +335,8 @@ async fn campaign_persists_holdout_without_message_or_credit() {
     let client = db.pool.get().await.expect("Failed to get database client");
     let recipient = client
         .query_one(
-            "SELECT cohort, variant, credits_granted
+            "SELECT cohort, variant, credits_granted,
+                    copy_variant, copy_assignment_bucket, copy_version
              FROM campaign_recipients
              WHERE user_id = $1",
             &[&user_id],
@@ -272,6 +346,21 @@ async fn campaign_persists_holdout_without_message_or_credit() {
     assert_eq!(recipient.get::<_, String>(0), "free");
     assert_eq!(recipient.get::<_, String>(1), "holdout");
     assert_eq!(recipient.get::<_, i32>(2), 0);
+    assert_eq!(recipient.get::<_, Option<String>>(3), None);
+    assert_eq!(recipient.get::<_, Option<i32>>(4), None);
+    assert_eq!(recipient.get::<_, Option<String>>(5), None);
+
+    let report = manager
+        .report("integration-holdout")
+        .await
+        .expect("Failed to report holdout campaign");
+    assert_eq!(
+        report
+            .iter()
+            .find(|(label, _)| { label == "recipient_copy:free:holdout:unassigned:unassigned" })
+            .map(|(_, count)| *count),
+        Some(1)
+    );
 
     let counts = client
         .query_one(
@@ -288,6 +377,111 @@ async fn campaign_persists_holdout_without_message_or_credit() {
     assert_eq!(counts.get::<_, i64>(2), 0);
 
     drop(client);
+    drop(manager);
+    db.cleanup().await.expect("Failed to cleanup test database");
+}
+
+#[tokio::test]
+async fn migration_10_leaves_historical_copy_attribution_unassigned() {
+    let db = TestDatabase::create_fresh()
+        .await
+        .expect("Failed to create test database");
+    let client = db.pool.get().await.expect("Failed to get database client");
+
+    client
+        .batch_execute(
+            "DROP INDEX idx_campaign_recipients_copy;
+             ALTER TABLE campaign_recipients
+                 DROP COLUMN copy_variant,
+                 DROP COLUMN copy_assignment_bucket,
+                 DROP COLUMN copy_version;
+             DELETE FROM schema_migrations WHERE version = 10;",
+        )
+        .await
+        .expect("Failed to recreate the version 9 campaign schema");
+
+    let user_id: i32 = client
+        .query_one(
+            "INSERT INTO users (telegram_user_id, analysis_credits)
+             VALUES (8200010, 0) RETURNING id",
+            &[],
+        )
+        .await
+        .expect("Failed to create historical user")
+        .get(0);
+    let campaign_id: i64 = client
+        .query_one(
+            "INSERT INTO campaigns
+                (campaign_key, configuration, timezone, send_window_start,
+                 send_window_end, cadence_seconds)
+             VALUES ('integration-historical-copy', '{}'::JSONB, 'Europe/Warsaw',
+                     TIME '09:00', TIME '20:00', 30)
+             RETURNING id",
+            &[],
+        )
+        .await
+        .expect("Failed to create historical campaign")
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO campaign_recipients
+                (campaign_id, user_id, cohort, variant, credits_granted,
+                 assignment_version, assignment_bucket, baseline_credits)
+             VALUES ($1, $2, 'legacy_unknown', 'message', 0,
+                     'legacy-conditional-v0', NULL, 0)",
+            &[&campaign_id, &user_id],
+        )
+        .await
+        .expect("Failed to create historical recipient");
+    client
+        .execute(
+            "INSERT INTO user_analyses
+                (user_id, channel_name, credits_used, analysis_type, status, delivered_at)
+             VALUES ($1, '@historical_copy_fixture', 1, 'professional',
+                     'completed', NOW())",
+            &[&user_id],
+        )
+        .await
+        .expect("Failed to create historical outcome");
+    drop(client);
+
+    tg_main::migrations::MigrationManager::run_migrations(&db.pool)
+        .await
+        .expect("Failed to apply migration 10");
+
+    let client = db.pool.get().await.expect("Failed to get database client");
+    let attribution = client
+        .query_one(
+            "SELECT copy_variant, copy_assignment_bucket, copy_version
+             FROM campaign_recipients WHERE campaign_id = $1 AND user_id = $2",
+            &[&campaign_id, &user_id],
+        )
+        .await
+        .expect("Failed to inspect migrated attribution");
+    assert_eq!(attribution.get::<_, Option<String>>(0), None);
+    assert_eq!(attribution.get::<_, Option<i32>>(1), None);
+    assert_eq!(attribution.get::<_, Option<String>>(2), None);
+    drop(client);
+
+    let manager = CampaignManager::new(db.pool.clone());
+    let report = manager
+        .report("integration-historical-copy")
+        .await
+        .expect("Failed to report migrated historical campaign");
+    for label in [
+        "recipient_copy:legacy_unknown:message:unassigned:unassigned",
+        "outcome_copy:legacy_unknown:message:unassigned:unassigned:analysis_7d",
+    ] {
+        assert_eq!(
+            report
+                .iter()
+                .find(|(reported, _)| reported == label)
+                .map(|(_, count)| *count),
+            Some(1),
+            "missing unassigned historical metric {label}"
+        );
+    }
+
     drop(manager);
     db.cleanup().await.expect("Failed to cleanup test database");
 }
@@ -357,7 +551,7 @@ async fn campaign_opt_out_cancels_pending_delivery_and_completion_is_terminal() 
 }
 
 #[tokio::test]
-async fn campaign_default_is_three_armed_within_paid_and_free_cohorts() {
+async fn campaign_default_contacts_all_users_with_two_arms_per_cohort() {
     let db = TestDatabase::create_fresh()
         .await
         .expect("Failed to create test database");
@@ -382,7 +576,7 @@ async fn campaign_default_is_three_armed_within_paid_and_free_cohorts() {
         .await
         .expect("Failed to preview experiment");
     assert_eq!(preview.counts.total(), 120);
-    assert!(preview.counts.holdout > 0);
+    assert_eq!(preview.counts.holdout, 0);
     assert!(preview.counts.message > 0);
     assert!(preview.counts.message_credit > 0);
     assert_eq!(
@@ -399,16 +593,22 @@ async fn campaign_default_is_three_armed_within_paid_and_free_cohorts() {
     let client = db.pool.get().await.expect("Failed to get database client");
     let arms = client
         .query(
-            "SELECT cohort, variant, COUNT(*)
+            "SELECT cohort, variant, copy_version, copy_variant, COUNT(*)
              FROM campaign_recipients
-             GROUP BY cohort, variant
-             ORDER BY cohort, variant",
+             GROUP BY cohort, variant, copy_version, copy_variant
+             ORDER BY cohort, variant, copy_version, copy_variant",
             &[],
         )
         .await
         .expect("Failed to inspect experiment arms");
-    assert_eq!(arms.len(), 6, "each cohort must contain all three arms");
-    assert!(arms.iter().all(|row| row.get::<_, i64>(2) > 0));
+    assert_eq!(
+        arms.len(),
+        12,
+        "each cohort and treatment must contain all three copies"
+    );
+    assert!(arms
+        .iter()
+        .all(|row| row.get::<_, String>(2) == "google-gemini-v1" && row.get::<_, i64>(4) > 0));
 
     let invalid_treatments: i64 = client
         .query_one(
@@ -430,7 +630,7 @@ async fn campaign_default_is_three_armed_within_paid_and_free_cohorts() {
 
     let attributed = client
         .query_one(
-            "SELECT campaign_id, user_id, cohort, variant
+            "SELECT campaign_id, user_id, cohort, variant, copy_version, copy_variant
              FROM campaign_recipients
              ORDER BY user_id LIMIT 1",
             &[],
@@ -441,6 +641,8 @@ async fn campaign_default_is_three_armed_within_paid_and_free_cohorts() {
     let user_id: i32 = attributed.get(1);
     let cohort: String = attributed.get(2);
     let variant: String = attributed.get(3);
+    let copy_version: String = attributed.get(4);
+    let copy_variant: String = attributed.get(5);
     let analysis_id: i32 = client
         .query_one(
             "INSERT INTO user_analyses
@@ -468,6 +670,16 @@ async fn campaign_default_is_three_armed_within_paid_and_free_cohorts() {
         )
         .await
         .expect("Failed to persist usage fixture");
+    client
+        .execute(
+            "INSERT INTO payments
+                (telegram_payment_charge_id, user_id, credits, stars_amount,
+                 invoice_payload, created_at)
+             VALUES ('integration-outcome-payment', $1, 1, 100, 'credits_1', NOW())",
+            &[&user_id],
+        )
+        .await
+        .expect("Failed to persist payment outcome fixture");
     drop(client);
 
     let report = manager
@@ -482,6 +694,21 @@ async fn campaign_default_is_three_armed_within_paid_and_free_cohorts() {
             .map(|(_, count)| *count),
         Some(100)
     );
+    for label in [
+        format!("outcome:{cohort}:{variant}:analysis_7d"),
+        format!("outcome:{cohort}:{variant}:payment_14d"),
+        format!("outcome_copy:{cohort}:{variant}:{copy_version}:{copy_variant}:analysis_7d"),
+        format!("outcome_copy:{cohort}:{variant}:{copy_version}:{copy_variant}:payment_14d"),
+    ] {
+        assert_eq!(
+            report
+                .iter()
+                .find(|(reported, _)| reported == &label)
+                .map(|(_, count)| *count),
+            Some(1),
+            "missing or incorrect outcome label {label}"
+        );
+    }
 
     drop(manager);
     db.cleanup().await.expect("Failed to cleanup test database");

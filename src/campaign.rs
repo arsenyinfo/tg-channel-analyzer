@@ -34,17 +34,17 @@ impl Default for CampaignConfig {
         Self {
             inactivity_days: 30,
             contact_cooldown_days: 14,
-            timezone: "Europe/Warsaw".to_string(),
-            window_start: "09:00".to_string(),
+            timezone: "UTC".to_string(),
+            window_start: "08:00".to_string(),
             window_end: "20:00".to_string(),
-            cadence_seconds: 10,
+            cadence_seconds: 20,
             assignment_version: "campaign-arm-v1".to_string(),
-            holdout_bps: 1_000,
-            message_bps: 4_500,
-            message_credit_bps: 4_500,
+            holdout_bps: 0,
+            message_bps: 5_000,
+            message_credit_bps: 5_000,
             paid_credit: 1,
             free_credit: 1,
-            copy_version: "gemini-3.7-reengagement-v1".to_string(),
+            copy_version: "google-gemini-v1".to_string(),
         }
     }
 }
@@ -76,7 +76,7 @@ impl CampaignConfig {
             )
             .into());
         }
-        if self.copy_version != "gemini-3.7-reengagement-v1" {
+        if self.copy_version != "google-gemini-v1" {
             return Err(format!("unsupported campaign copy version: {}", self.copy_version).into());
         }
 
@@ -113,6 +113,23 @@ pub enum Variant {
     Holdout,
     Message,
     MessageCredit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyVariant {
+    A,
+    B,
+    C,
+}
+
+impl CopyVariant {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::A => "a",
+            Self::B => "b",
+            Self::C => "c",
+        }
+    }
 }
 
 impl Variant {
@@ -164,6 +181,9 @@ pub struct CampaignCounts {
     pub holdout: usize,
     pub message: usize,
     pub message_credit: usize,
+    pub copy_a: usize,
+    pub copy_b: usize,
+    pub copy_c: usize,
     pub maximum_credit_liability: i32,
 }
 
@@ -196,14 +216,29 @@ impl CampaignCounts {
         }
         self.maximum_credit_liability += grant;
     }
+
+    fn add_copy(&mut self, copy: CopyVariant) {
+        match copy {
+            CopyVariant::A => self.copy_a += 1,
+            CopyVariant::B => self.copy_b += 1,
+            CopyVariant::C => self.copy_c += 1,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct CampaignPreview {
     pub counts: CampaignCounts,
-    pub sample_paid_en: String,
-    pub sample_free_en: String,
-    pub sample_unknown_en: String,
+    pub sample_copy_a_en: String,
+    pub sample_copy_b_en: String,
+    pub sample_copy_c_en: String,
+    pub sample_copy_a_ru: String,
+    pub sample_copy_b_ru: String,
+    pub sample_copy_c_ru: String,
+    pub paid_credit_addendum_en: String,
+    pub paid_credit_addendum_ru: String,
+    pub free_credit_addendum_en: String,
+    pub free_credit_addendum_ru: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -242,11 +277,10 @@ impl CampaignManager {
                 &[&campaign_key],
             )
             .await?
-            .map(|row| {
+            .map(|row| -> Result<i64, CampaignError> {
                 let stored: serde_json::Value = row.get(1);
-                let requested = serde_json::to_value(config).expect("campaign config serializes");
-                if stored != requested {
-                    Err("campaign key already exists with different configuration")
+                if !configuration_matches_except_copy(&stored, config)? {
+                    Err("campaign key already exists with different configuration".into())
                 } else {
                     Ok(row.get::<_, i64>(0))
                 }
@@ -263,13 +297,23 @@ impl CampaignManager {
             counts.add(candidate);
             let (variant, grant, _) = assignment(campaign_key, candidate, config);
             counts.add_assignment(variant, grant);
+            if variant != Variant::Holdout {
+                counts.add_copy(copy_assignment(campaign_key, candidate, variant).0);
+            }
         }
 
         Ok(CampaignPreview {
             counts,
-            sample_paid_en: render_message(Cohort::Paid, "en", 0, config.paid_credit),
-            sample_free_en: render_message(Cohort::Free, "en", 0, config.free_credit),
-            sample_unknown_en: render_message(Cohort::LegacyUnknown, "en", 0, 0),
+            sample_copy_a_en: render_message("en", 0, CopyVariant::A),
+            sample_copy_b_en: render_message("en", 0, CopyVariant::B),
+            sample_copy_c_en: render_message("en", 0, CopyVariant::C),
+            sample_copy_a_ru: render_message("ru", 0, CopyVariant::A),
+            sample_copy_b_ru: render_message("ru", 0, CopyVariant::B),
+            sample_copy_c_ru: render_message("ru", 0, CopyVariant::C),
+            paid_credit_addendum_en: render_credit_addendum("en", config.paid_credit),
+            paid_credit_addendum_ru: render_credit_addendum("ru", config.paid_credit),
+            free_credit_addendum_en: render_credit_addendum("en", config.free_credit),
+            free_credit_addendum_ru: render_credit_addendum("ru", config.free_credit),
         })
     }
 
@@ -303,14 +347,25 @@ impl CampaignManager {
             .await?;
         let campaign_id = if let Some(row) = campaign_row {
             let stored: serde_json::Value = row.get(1);
-            if stored != configuration {
+            if !configuration_matches_except_copy(&stored, config)? {
                 return Err("campaign key already exists with different configuration".into());
             }
             let status: String = row.get(2);
             if status != "active" {
                 return Err(format!("campaign is {status}; resume it before enrolling").into());
             }
-            row.get(0)
+            let campaign_id = row.get(0);
+            if stored != configuration {
+                transaction
+                    .execute(
+                        "UPDATE campaigns
+                         SET configuration = $2, updated_at = NOW()
+                         WHERE id = $1",
+                        &[&campaign_id, &configuration],
+                    )
+                    .await?;
+            }
+            campaign_id
         } else {
             transaction
                 .query_one(
@@ -363,12 +418,22 @@ impl CampaignManager {
 
         for candidate in candidates {
             let (variant, grant, assignment_bucket) = assignment(campaign_key, &candidate, config);
+            let copy = if variant == Variant::Holdout {
+                None
+            } else {
+                Some(copy_assignment(campaign_key, &candidate, variant))
+            };
+            let copy_variant = copy.map(|(copy_variant, _)| copy_variant);
+            let copy_variant_label = copy_variant.map(CopyVariant::as_str);
+            let copy_assignment_bucket = copy.map(|(_, bucket)| i32::from(bucket));
+            let copy_version = copy.map(|_| config.copy_version.as_str());
             let inserted = transaction
                 .execute(
                     "INSERT INTO campaign_recipients
                         (campaign_id, user_id, cohort, variant, credits_granted,
-                         assignment_version, assignment_bucket, baseline_credits)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                         assignment_version, assignment_bucket, baseline_credits,
+                         copy_variant, copy_assignment_bucket, copy_version)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                      ON CONFLICT (campaign_id, user_id) DO NOTHING",
                     &[
                         &campaign_id,
@@ -379,6 +444,9 @@ impl CampaignManager {
                         &config.assignment_version,
                         &i32::from(assignment_bucket),
                         &candidate.credits,
+                        &copy_variant_label,
+                        &copy_assignment_bucket,
+                        &copy_version,
                     ],
                 )
                 .await?;
@@ -419,8 +487,9 @@ impl CampaignManager {
             } else {
                 "en"
             };
-            let message =
-                render_message(candidate.cohort, language, candidate.credits + grant, grant);
+            let copy_variant = copy_variant
+                .ok_or("non-holdout campaign recipient has no message-copy assignment")?;
+            let message = render_message(language, grant, copy_variant);
             let queued = transaction
                 .execute(
                     "INSERT INTO message_queue
@@ -490,7 +559,26 @@ impl CampaignManager {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT label, count FROM (
+                "WITH recipient_outcomes AS (
+                    SELECT cr.*,
+                           EXISTS (
+                               SELECT 1 FROM user_analyses ua
+                               WHERE ua.user_id = cr.user_id
+                                 AND ua.status = 'completed' AND ua.delivered_at IS NOT NULL
+                                 AND ua.delivered_at >= cr.enrolled_at
+                                 AND ua.delivered_at < cr.enrolled_at + INTERVAL '7 days'
+                           ) AS analysis_7d,
+                           EXISTS (
+                               SELECT 1 FROM payments p
+                               WHERE p.user_id = cr.user_id
+                                 AND p.created_at >= cr.enrolled_at
+                                 AND p.created_at < cr.enrolled_at + INTERVAL '14 days'
+                           ) AS payment_14d
+                    FROM campaign_recipients cr
+                    JOIN campaigns c ON c.id = cr.campaign_id
+                    WHERE c.campaign_key = $1
+                 )
+                 SELECT label, count FROM (
                     SELECT 'campaign:status:' || status AS label, 1::BIGINT AS count
                     FROM campaigns WHERE campaign_key = $1
                     UNION ALL
@@ -500,36 +588,46 @@ impl CampaignManager {
                     WHERE c.campaign_key = $1
                     GROUP BY cohort, variant
                     UNION ALL
+                    SELECT 'recipient_copy:' || cohort || ':' || variant || ':'
+                           || COALESCE(copy_version, 'unassigned') || ':'
+                           || COALESCE(copy_variant, 'unassigned') AS label,
+                           COUNT(*) AS count
+                    FROM campaign_recipients cr
+                    JOIN campaigns c ON c.id = cr.campaign_id
+                    WHERE c.campaign_key = $1
+                    GROUP BY cohort, variant, copy_version, copy_variant
+                    UNION ALL
                     SELECT 'queue:' || mq.status AS label, COUNT(*) AS count
                     FROM message_queue mq
                     JOIN campaigns c ON c.id = mq.campaign_id
                     WHERE c.campaign_key = $1
                     GROUP BY mq.status
                     UNION ALL
-                    SELECT 'outcome:' || cr.cohort || ':' || cr.variant || ':analysis_7d' AS label, COUNT(*) AS count
-                    FROM campaign_recipients cr
-                    JOIN campaigns c ON c.id = cr.campaign_id
-                    WHERE c.campaign_key = $1
-                      AND EXISTS (
-                          SELECT 1 FROM user_analyses ua
-                          WHERE ua.user_id = cr.user_id
-                            AND ua.status = 'completed' AND ua.delivered_at IS NOT NULL
-                            AND ua.delivered_at >= cr.enrolled_at
-                            AND ua.delivered_at < cr.enrolled_at + INTERVAL '7 days'
-                      )
-                    GROUP BY cr.cohort, cr.variant
+                    SELECT 'outcome:' || cohort || ':' || variant || ':analysis_7d' AS label, COUNT(*) AS count
+                    FROM recipient_outcomes
+                    WHERE analysis_7d
+                    GROUP BY cohort, variant
                     UNION ALL
-                    SELECT 'outcome:' || cr.cohort || ':' || cr.variant || ':payment_14d' AS label, COUNT(*) AS count
-                    FROM campaign_recipients cr
-                    JOIN campaigns c ON c.id = cr.campaign_id
-                    WHERE c.campaign_key = $1
-                      AND EXISTS (
-                          SELECT 1 FROM payments p
-                          WHERE p.user_id = cr.user_id
-                            AND p.created_at >= cr.enrolled_at
-                            AND p.created_at < cr.enrolled_at + INTERVAL '14 days'
-                      )
-                    GROUP BY cr.cohort, cr.variant
+                    SELECT 'outcome_copy:' || cohort || ':' || variant || ':'
+                           || COALESCE(copy_version, 'unassigned') || ':'
+                           || COALESCE(copy_variant, 'unassigned') || ':analysis_7d' AS label,
+                           COUNT(*) AS count
+                    FROM recipient_outcomes
+                    WHERE analysis_7d
+                    GROUP BY cohort, variant, copy_version, copy_variant
+                    UNION ALL
+                    SELECT 'outcome:' || cohort || ':' || variant || ':payment_14d' AS label, COUNT(*) AS count
+                    FROM recipient_outcomes
+                    WHERE payment_14d
+                    GROUP BY cohort, variant
+                    UNION ALL
+                    SELECT 'outcome_copy:' || cohort || ':' || variant || ':'
+                           || COALESCE(copy_version, 'unassigned') || ':'
+                           || COALESCE(copy_variant, 'unassigned') || ':payment_14d' AS label,
+                           COUNT(*) AS count
+                    FROM recipient_outcomes
+                    WHERE payment_14d
+                    GROUP BY cohort, variant, copy_version, copy_variant
                     UNION ALL
                     SELECT 'credits:granted' AS label, COALESCE(SUM(cg.credits), 0)::BIGINT AS count
                     FROM campaigns c
@@ -623,10 +721,6 @@ async fn eligible_rows<C: GenericClient + Sync>(
                     )
               )
               AND u.analysis_credits = 0
-              AND (
-                  EXISTS (SELECT 1 FROM payments p WHERE p.user_id = u.id)
-                  OR u.created_at >= COALESCE((SELECT applied_at FROM payment_tracking), 'infinity')
-              )
               AND NOT EXISTS (
                   SELECT 1 FROM payments p
                   WHERE p.user_id = u.id
@@ -668,6 +762,15 @@ fn validate_campaign_key(key: &str) -> Result<(), CampaignError> {
     Ok(())
 }
 
+fn configuration_matches_except_copy(
+    stored: &serde_json::Value,
+    requested: &CampaignConfig,
+) -> Result<bool, CampaignError> {
+    let mut stored_config: CampaignConfig = serde_json::from_value(stored.clone())?;
+    stored_config.copy_version = requested.copy_version.clone();
+    Ok(stored_config == *requested)
+}
+
 fn stable_bucket(campaign_key: &str, cohort: Cohort, user_id: i32, version: &str) -> u16 {
     let mut hasher = Sha256::new();
     hasher.update(version.as_bytes());
@@ -705,57 +808,103 @@ fn assignment(
         let grant = match candidate.cohort {
             Cohort::Paid => config.paid_credit,
             Cohort::Free => config.free_credit,
-            Cohort::LegacyUnknown => 0,
+            Cohort::LegacyUnknown => config.free_credit,
         };
         (Variant::MessageCredit, grant, bucket)
     }
 }
 
-fn render_message(cohort: Cohort, language: &str, balance: i32, granted: i32) -> String {
+fn copy_assignment(
+    campaign_key: &str,
+    candidate: &Candidate,
+    treatment: Variant,
+) -> (CopyVariant, u16) {
+    let mut hasher = Sha256::new();
+    hasher.update(b"copy-arm-v1");
+    hasher.update([0]);
+    hasher.update(campaign_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(candidate.cohort.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(treatment.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(candidate.user_id.to_be_bytes());
+    let digest = hasher.finalize();
+    let prefix = u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 prefix is eight bytes"),
+    );
+    let bucket = (prefix % 10_000) as u16;
+    let copy = if bucket < 3_334 {
+        CopyVariant::A
+    } else if bucket < 6_667 {
+        CopyVariant::B
+    } else {
+        CopyVariant::C
+    };
+    (copy, bucket)
+}
+
+fn render_credit_addendum(language: &str, granted: i32) -> String {
+    if language == "ru" {
+        let last_two = granted.rem_euclid(100);
+        let analyses = if (11..=14).contains(&last_two) {
+            "бесплатных анализов"
+        } else {
+            match granted.rem_euclid(10) {
+                1 => "бесплатный анализ",
+                2..=4 => "бесплатных анализа",
+                _ => "бесплатных анализов",
+            }
+        };
+        format!("🎁 А ещё мы добавили вам <b>{granted} {analyses}</b>.")
+    } else {
+        let analyses = if granted == 1 {
+            "free analysis"
+        } else {
+            "free analyses"
+        };
+        format!("🎁 As a bonus, we added <b>{granted} {analyses}</b> to your balance.")
+    }
+}
+
+fn render_message(language: &str, granted: i32, copy_variant: CopyVariant) -> String {
     let russian = language == "ru";
-    match (russian, cohort, granted > 0, balance > 0) {
-        (true, Cohort::Paid, true, _) => format!(
-            "👋 <b>Мы обновили анализ каналов</b>\n\nТеперь отчёты создаёт Gemini 3.7 Flash — новый анализ стал точнее и полезнее.\n\nВ благодарность за вашу прошлую покупку мы добавили <b>{granted} бесплатный анализ</b>. Просто отправьте ссылку на публичный Telegram-канал."
+    let (opening, cta) = match (russian, copy_variant) {
+        (false, CopyVariant::A) => (
+            "⚡ <b>Channel analysis now runs on Google’s newest Gemini model</b>\n\nIt understands more context, catches subtler patterns, and produces a deeper, sharper report.",
+            "Send a link to your own channel, a blogger, or any public figure.",
         ),
-        (false, Cohort::Paid, true, _) => format!(
-            "👋 <b>Channel analysis just got a major upgrade</b>\n\nReports now run on Gemini 3.7 Flash for sharper, more useful insights.\n\nAs a thank-you for supporting the bot, we added <b>{granted} free analysis credit</b>. Send any public Telegram channel link to try it."
+        (false, CopyVariant::B) => (
+            "👀 <b>What does a Telegram channel reveal between the lines?</b>\n\nGoogle’s newest Gemini model analyzes posts together, connects details across time, and notices patterns that are easy to miss.",
+            "Send any public channel link and see what it finds.",
         ),
-        (true, Cohort::Paid, false, true) => format!(
-            "👋 <b>Мы обновили анализ каналов</b>\n\nТеперь отчёты создаёт Gemini 3.7 Flash — новый анализ стал точнее и полезнее.\n\nУ вас уже есть кредиты: <b>{balance}</b>. Отправьте ссылку на публичный Telegram-канал, чтобы попробовать."
+        (false, CopyVariant::C) => (
+            "🔎 <b>Send a channel. We’ll read between the lines.</b>\n\nChannel analysis just got a major upgrade with Google’s newest Gemini model: more context, better connections, deeper conclusions.",
+            "Try it on your own channel—or someone you’re curious about.",
         ),
-        (false, Cohort::Paid, false, true) => format!(
-            "👋 <b>Channel analysis just got a major upgrade</b>\n\nReports now run on Gemini 3.7 Flash for sharper, more useful insights.\n\nYou already have <b>{balance}</b> credit(s). Send any public Telegram channel link to try it."
+        (true, CopyVariant::A) => (
+            "⚡ <b>Теперь каналы анализирует новейшая модель Gemini от Google</b>\n\nОна учитывает больше контекста, замечает тонкие закономерности и делает разбор глубже и точнее.",
+            "Отправьте ссылку на свой канал, канал блогера или другого публичного автора.",
         ),
-        (true, Cohort::Paid, false, false) => "👋 <b>Мы обновили анализ каналов</b>\n\nТеперь отчёты создаёт Gemini 3.7 Flash — новый анализ стал точнее и полезнее. Спасибо, что уже поддерживали бота. Отправьте /buy1, чтобы вернуться.".to_string(),
-        (false, Cohort::Paid, false, false) => "👋 <b>Channel analysis just got a major upgrade</b>\n\nReports now run on Gemini 3.7 Flash for sharper, more useful insights. Thanks for supporting the bot before. Send /buy1 to come back.".to_string(),
-        (true, Cohort::Free, true, _) => format!(
-            "👋 <b>У анализа каналов новая модель</b>\n\nТеперь отчёты создаёт Gemini 3.7 Flash. Мы добавили вам <b>{granted} бесплатный анализ</b>, чтобы вы могли оценить обновление.\n\nОтправьте ссылку на публичный Telegram-канал."
+        (true, CopyVariant::B) => (
+            "👀 <b>Что Telegram-канал рассказывает между строк?</b>\n\nНовейшая модель Gemini от Google анализирует посты в контексте, связывает детали и замечает закономерности, которые легко упустить.",
+            "Отправьте ссылку на любой публичный канал и посмотрите, что она найдёт.",
         ),
-        (false, Cohort::Free, true, _) => format!(
-            "👋 <b>Channel analysis has a new model</b>\n\nReports now run on Gemini 3.7 Flash. We added <b>{granted} free analysis credit</b> so you can try the upgrade.\n\nSend any public Telegram channel link."
+        (true, CopyVariant::C) => (
+            "🔎 <b>Пришлите канал — мы прочитаем между строк</b>\n\nМы перевели анализ на новейшую модель Gemini от Google: больше контекста, точнее связи, глубже выводы.",
+            "Проверьте свой канал или кого-то, кто вам интересен.",
         ),
-        (true, Cohort::Free, false, true) => format!(
-            "👋 <b>У анализа каналов новая модель</b>\n\nТеперь отчёты создаёт Gemini 3.7 Flash. У вас осталось кредитов: <b>{balance}</b>.\n\nОтправьте ссылку на публичный Telegram-канал, чтобы увидеть новый отчёт."
-        ),
-        (false, Cohort::Free, false, true) => format!(
-            "👋 <b>Channel analysis has a new model</b>\n\nReports now run on Gemini 3.7 Flash. You still have <b>{balance}</b> credit(s).\n\nSend any public Telegram channel link to see the new report."
-        ),
-        (true, Cohort::Free, false, false) => "👋 <b>У анализа каналов новая модель</b>\n\nТеперь отчёты создаёт Gemini 3.7 Flash — анализ стал точнее и полезнее.\n\nЧтобы вернуться, отправьте /buy1, а затем ссылку на публичный Telegram-канал.".to_string(),
-        (false, Cohort::Free, false, false) => "👋 <b>Channel analysis has a new model</b>\n\nReports now run on Gemini 3.7 Flash for sharper, more useful insights.\n\nTo come back, send /buy1, then send any public Telegram channel link.".to_string(),
-        (true, Cohort::LegacyUnknown, true, _) => format!(
-            "👋 <b>Мы обновили анализ каналов</b>\n\nТеперь отчёты создаёт Gemini 3.7 Flash. Мы добавили вам <b>{granted} бесплатный анализ</b>. Отправьте ссылку на публичный Telegram-канал."
-        ),
-        (false, Cohort::LegacyUnknown, true, _) => format!(
-            "👋 <b>We upgraded channel analysis</b>\n\nReports now run on Gemini 3.7 Flash. We added <b>{granted} free analysis credit</b>. Send any public Telegram channel link to try it."
-        ),
-        (true, Cohort::LegacyUnknown, false, true) => format!(
-            "👋 <b>Мы обновили анализ каналов</b>\n\nТеперь отчёты создаёт Gemini 3.7 Flash. У вас осталось кредитов: <b>{balance}</b>. Отправьте ссылку на публичный Telegram-канал."
-        ),
-        (false, Cohort::LegacyUnknown, false, true) => format!(
-            "👋 <b>We upgraded channel analysis</b>\n\nReports now run on Gemini 3.7 Flash. You still have <b>{balance}</b> credit(s). Send any public Telegram channel link."
-        ),
-        (true, Cohort::LegacyUnknown, false, false) => "👋 <b>Мы обновили анализ каналов</b>\n\nТеперь отчёты создаёт Gemini 3.7 Flash — анализ стал точнее и полезнее. Чтобы вернуться, отправьте /buy1.".to_string(),
-        (false, Cohort::LegacyUnknown, false, false) => "👋 <b>We upgraded channel analysis</b>\n\nReports now run on Gemini 3.7 Flash for sharper, more useful insights. Send /buy1 to come back.".to_string(),
+    };
+
+    if granted > 0 {
+        format!(
+            "{opening}\n\n{}\n\n{cta}",
+            render_credit_addendum(language, granted)
+        )
+    } else {
+        format!("{opening}\n\n{cta}")
     }
 }
 
@@ -805,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn default_assignment_produces_all_three_arms_for_each_known_cohort() {
+    fn default_assignment_contacts_every_user_and_uses_both_message_arms() {
         let config = CampaignConfig::default();
         for cohort in [Cohort::Paid, Cohort::Free] {
             let mut seen = [false; 3];
@@ -823,17 +972,103 @@ mod tests {
                     Variant::MessageCredit => seen[2] = true,
                 }
             }
-            assert_eq!(seen, [true, true, true]);
+            assert_eq!(seen, [false, true, true]);
         }
     }
 
     #[test]
-    fn copy_is_separate_for_paid_and_free_users() {
-        let paid = render_message(Cohort::Paid, "en", 1, 1);
-        let free = render_message(Cohort::Free, "en", 0, 0);
-        assert!(paid.contains("thank-you"));
-        assert!(paid.contains("free analysis credit"));
-        assert!(free.contains("/buy1"));
-        assert_ne!(paid, free);
+    fn credit_is_the_only_copy_difference_between_treatments() {
+        for language in ["en", "ru"] {
+            for copy_variant in [CopyVariant::A, CopyVariant::B, CopyVariant::C] {
+                let without_credit = render_message(language, 0, copy_variant);
+                let with_credit = render_message(language, 1, copy_variant);
+                let addendum = format!("\n\n{}", render_credit_addendum(language, 1));
+                assert_eq!(with_credit.replace(&addendum, ""), without_credit);
+                assert!(!without_credit.contains("/buy1"));
+                assert!(!with_credit.contains("/buy1"));
+            }
+        }
+    }
+
+    #[test]
+    fn credit_addendum_pluralizes_grants() {
+        assert!(render_credit_addendum("en", 1).contains("1 free analysis"));
+        assert!(render_credit_addendum("en", 3).contains("3 free analyses"));
+        assert!(render_credit_addendum("ru", 1).contains("1 бесплатный анализ"));
+        assert!(render_credit_addendum("ru", 3).contains("3 бесплатных анализа"));
+        assert!(render_credit_addendum("ru", 11).contains("11 бесплатных анализов"));
+        assert!(render_credit_addendum("ru", 21).contains("21 бесплатный анализ"));
+    }
+
+    #[test]
+    fn all_three_copy_variants_are_distinct() {
+        let copies = [CopyVariant::A, CopyVariant::B, CopyVariant::C]
+            .map(|copy| render_message("en", 0, copy));
+        assert_ne!(copies[0], copies[1]);
+        assert_ne!(copies[1], copies[2]);
+        assert_ne!(copies[0], copies[2]);
+        assert!(copies
+            .iter()
+            .all(|copy| copy.contains("Google") && copy.contains("Gemini")));
+    }
+
+    #[test]
+    fn copy_assignment_is_stable_and_spans_all_variants() {
+        let mut seen = [false; 3];
+        for user_id in 1..1_000 {
+            let candidate = Candidate {
+                user_id,
+                telegram_user_id: i64::from(user_id),
+                language: None,
+                credits: 0,
+                cohort: Cohort::LegacyUnknown,
+            };
+            let first = copy_assignment("launch", &candidate, Variant::MessageCredit);
+            let second = copy_assignment("launch", &candidate, Variant::MessageCredit);
+            assert_eq!(first, second);
+            match first.0 {
+                CopyVariant::A => seen[0] = true,
+                CopyVariant::B => seen[1] = true,
+                CopyVariant::C => seen[2] = true,
+            }
+        }
+        assert_eq!(seen, [true, true, true]);
+    }
+
+    #[test]
+    fn legacy_users_receive_the_neutral_credit_offer() {
+        let config = CampaignConfig {
+            holdout_bps: 0,
+            message_bps: 0,
+            message_credit_bps: 10_000,
+            free_credit: 2,
+            ..CampaignConfig::default()
+        };
+        let candidate = Candidate {
+            user_id: 42,
+            telegram_user_id: 100,
+            language: None,
+            credits: 0,
+            cohort: Cohort::LegacyUnknown,
+        };
+        assert_eq!(assignment("launch", &candidate, &config).1, 2);
+        let copy = render_message("en", 2, CopyVariant::A);
+        assert!(copy.contains("2 free analyses"));
+        assert!(!copy.contains("/buy1"));
+    }
+
+    #[test]
+    fn campaign_configuration_allows_only_copy_version_to_change() {
+        let stored = CampaignConfig::default();
+        let stored_json = serde_json::to_value(&stored).expect("config serializes");
+
+        let mut new_copy = stored.clone();
+        new_copy.copy_version = "future-copy-v2".to_string();
+        assert!(configuration_matches_except_copy(&stored_json, &new_copy)
+            .expect("stored config deserializes"));
+
+        new_copy.cadence_seconds += 1;
+        assert!(!configuration_matches_except_copy(&stored_json, &new_copy)
+            .expect("stored config deserializes"));
     }
 }
