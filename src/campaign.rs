@@ -559,7 +559,20 @@ impl CampaignManager {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "WITH recipient_outcomes AS (
+                "WITH scoped_recipients AS (
+                    SELECT cr.*,
+                           COALESCE(cs.reason = 'experiment_exclusion', FALSE) AS excluded
+                    FROM campaign_recipients cr
+                    JOIN campaigns c ON c.id = cr.campaign_id
+                    JOIN users u ON u.id = cr.user_id
+                    LEFT JOIN campaign_suppressions cs
+                           ON cs.telegram_user_id = u.telegram_user_id
+                    WHERE c.campaign_key = $1
+                 ),
+                 included_recipients AS (
+                    SELECT * FROM scoped_recipients WHERE NOT excluded
+                 ),
+                 recipient_outcomes AS (
                     SELECT cr.*,
                            EXISTS (
                                SELECT 1 FROM user_analyses ua
@@ -574,34 +587,39 @@ impl CampaignManager {
                                  AND p.created_at >= cr.enrolled_at
                                  AND p.created_at < cr.enrolled_at + INTERVAL '14 days'
                            ) AS payment_14d
-                    FROM campaign_recipients cr
-                    JOIN campaigns c ON c.id = cr.campaign_id
-                    WHERE c.campaign_key = $1
+                    FROM included_recipients cr
                  )
                  SELECT label, count FROM (
                     SELECT 'campaign:status:' || status AS label, 1::BIGINT AS count
                     FROM campaigns WHERE campaign_key = $1
                     UNION ALL
                     SELECT 'recipient:' || cohort || ':' || variant AS label, COUNT(*) AS count
-                    FROM campaign_recipients cr
-                    JOIN campaigns c ON c.id = cr.campaign_id
-                    WHERE c.campaign_key = $1
+                    FROM included_recipients
                     GROUP BY cohort, variant
                     UNION ALL
                     SELECT 'recipient_copy:' || cohort || ':' || variant || ':'
                            || COALESCE(copy_version, 'unassigned') || ':'
                            || COALESCE(copy_variant, 'unassigned') AS label,
                            COUNT(*) AS count
-                    FROM campaign_recipients cr
-                    JOIN campaigns c ON c.id = cr.campaign_id
-                    WHERE c.campaign_key = $1
+                    FROM included_recipients
                     GROUP BY cohort, variant, copy_version, copy_variant
                     UNION ALL
-                    SELECT 'queue:' || mq.status AS label, COUNT(*) AS count
+                    SELECT 'recipient:excluded' AS label, COUNT(*) AS count
+                    FROM scoped_recipients
+                    WHERE excluded
+                    UNION ALL
+                    SELECT 'queue:' || CASE
+                               WHEN mq.last_error_code = 'experiment_exclusion' THEN 'excluded'
+                               ELSE mq.status
+                           END AS label,
+                           COUNT(*) AS count
                     FROM message_queue mq
                     JOIN campaigns c ON c.id = mq.campaign_id
                     WHERE c.campaign_key = $1
-                    GROUP BY mq.status
+                    GROUP BY CASE
+                               WHEN mq.last_error_code = 'experiment_exclusion' THEN 'excluded'
+                               ELSE mq.status
+                             END
                     UNION ALL
                     SELECT 'outcome:' || cohort || ':' || variant || ':analysis_7d' AS label, COUNT(*) AS count
                     FROM recipient_outcomes
@@ -637,34 +655,28 @@ impl CampaignManager {
                     UNION ALL
                     SELECT 'llm:' || cr.cohort || ':' || cr.variant || ':total_tokens' AS label,
                            COALESCE(SUM(la.total_tokens), 0)::BIGINT AS count
-                    FROM campaign_recipients cr
-                    JOIN campaigns c ON c.id = cr.campaign_id
+                    FROM included_recipients cr
                     LEFT JOIN user_analyses ua ON ua.experiment_campaign_id = cr.campaign_id
                                                   AND ua.user_id = cr.user_id
                     LEFT JOIN llm_attempts la ON la.user_analysis_id = ua.id
                                                 AND la.status = 'succeeded'
-                    WHERE c.campaign_key = $1
                     GROUP BY cr.cohort, cr.variant
                     UNION ALL
                     SELECT 'llm:' || cr.cohort || ':' || cr.variant || ':unknown_attempts' AS label,
                            COUNT(la.attempt_key)::BIGINT AS count
-                    FROM campaign_recipients cr
-                    JOIN campaigns c ON c.id = cr.campaign_id
+                    FROM included_recipients cr
                     LEFT JOIN user_analyses ua ON ua.experiment_campaign_id = cr.campaign_id
                                                   AND ua.user_id = cr.user_id
                     LEFT JOIN llm_attempts la ON la.user_analysis_id = ua.id
                                                 AND la.billing_certainty = 'unknown'
-                    WHERE c.campaign_key = $1
                     GROUP BY cr.cohort, cr.variant
                     UNION ALL
                     SELECT 'analysis:' || cr.cohort || ':' || cr.variant || ':cache' AS label,
                            COUNT(ua.id)::BIGINT AS count
-                    FROM campaign_recipients cr
-                    JOIN campaigns c ON c.id = cr.campaign_id
+                    FROM included_recipients cr
                     LEFT JOIN user_analyses ua ON ua.experiment_campaign_id = cr.campaign_id
                                                   AND ua.user_id = cr.user_id
                                                   AND ua.result_source = 'cache'
-                    WHERE c.campaign_key = $1
                     GROUP BY cr.cohort, cr.variant
                  ) stats ORDER BY label",
                 &[&campaign_key],

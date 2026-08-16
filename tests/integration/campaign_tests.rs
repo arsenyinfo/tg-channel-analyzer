@@ -710,6 +710,42 @@ async fn campaign_default_contacts_all_users_with_two_arms_per_cohort() {
         );
     }
 
+    let client = db.pool.get().await.expect("Failed to get database client");
+    client
+        .execute(
+            "INSERT INTO campaign_suppressions (telegram_user_id, reason)
+             SELECT telegram_user_id, 'experiment_exclusion' FROM users WHERE id = $1",
+            &[&user_id],
+        )
+        .await
+        .expect("Failed to exclude experiment recipient");
+    drop(client);
+
+    let excluded_report = manager
+        .report("integration-three-arm")
+        .await
+        .expect("Failed to report campaign exclusions");
+    assert_eq!(
+        excluded_report
+            .iter()
+            .find(|(label, _)| label == "recipient:excluded")
+            .map(|(_, count)| *count),
+        Some(1)
+    );
+    for label in [
+        format!("outcome:{cohort}:{variant}:analysis_7d"),
+        format!("outcome:{cohort}:{variant}:payment_14d"),
+        format!("outcome_copy:{cohort}:{variant}:{copy_version}:{copy_variant}:analysis_7d"),
+        format!("outcome_copy:{cohort}:{variant}:{copy_version}:{copy_variant}:payment_14d"),
+    ] {
+        assert!(
+            excluded_report
+                .iter()
+                .all(|(reported, _)| reported != &label),
+            "excluded recipient still contributed to {label}"
+        );
+    }
+
     drop(manager);
     db.cleanup().await.expect("Failed to cleanup test database");
 }
