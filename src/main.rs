@@ -124,14 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
 
-    let bot = TelegramBot::new(
-        &bot_token,
-        user_manager,
-        pool,
-        analysis_engine,
-        channel_locks,
-    )
-    .await?;
+    let bot = TelegramBot::new(&bot_token, user_manager, analysis_engine, channel_locks).await?;
 
     // spawn dispatcher in a task so a panic doesn't crash the runtime
     let dispatcher_result = tokio::spawn(async move { bot.run().await }).await;

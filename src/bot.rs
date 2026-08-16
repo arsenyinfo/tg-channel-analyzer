@@ -58,7 +58,6 @@ pub struct TelegramBot {
     bot: Arc<Bot>,
     analysis_engine: Arc<Mutex<AnalysisEngine>>,
     user_manager: Arc<UserManager>,
-    pool: Arc<Pool>,
     payment_handler: PaymentHandler,
     channel_locks: ChannelLocks,
 }
@@ -648,7 +647,6 @@ impl TelegramBot {
     pub async fn new(
         bot_token: &str,
         user_manager: Arc<UserManager>,
-        pool: Arc<Pool>,
         analysis_engine: Arc<Mutex<AnalysisEngine>>,
         channel_locks: ChannelLocks,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -659,7 +657,6 @@ impl TelegramBot {
             bot,
             analysis_engine,
             user_manager,
-            pool,
             payment_handler,
             channel_locks,
         })
@@ -673,11 +670,15 @@ impl TelegramBot {
         let queue_heartbeat = Arc::new(AtomicU64::new(0));
         Self::spawn_message_queue_watchdog(queue_heartbeat.clone());
 
+        // Keep queue claims on their own pool. Reusing the connection that ran startup
+        // migrations/recovery has intermittently left the first FOR UPDATE response unwoken on
+        // the production PostgreSQL proxy, while the same query on a fresh connection succeeds.
+        let queue_pool = Arc::new(CacheManager::create_pool().await?);
+
         // spawn message queue processor
         let bot_clone = self.bot.clone();
-        let pool_clone = self.pool.clone();
         tokio::spawn(async move {
-            Self::run_message_queue_processor(bot_clone, pool_clone, queue_heartbeat).await;
+            Self::run_message_queue_processor(bot_clone, queue_pool, queue_heartbeat).await;
         });
 
         // create context for all handlers (shares the engine + channel locks with recovery)
