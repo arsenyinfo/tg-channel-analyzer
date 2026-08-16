@@ -121,6 +121,31 @@ impl TelegramBot {
             .expect("failed to start message queue watchdog");
     }
 
+    fn spawn_message_queue_worker(bot: Arc<Bot>, heartbeat: Arc<AtomicU64>) {
+        std::thread::Builder::new()
+            .name("message-queue".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("failed to build message queue runtime");
+                runtime.block_on(async move {
+                    let pool = match CacheManager::create_pool().await {
+                        Ok(pool) => Arc::new(pool),
+                        Err(error) => {
+                            eprintln!("Failed to create message queue pool: {error}");
+                            std::process::exit(71);
+                        }
+                    };
+                    Self::run_message_queue_processor(bot, pool, heartbeat).await;
+                });
+                eprintln!("Message queue worker exited unexpectedly");
+                std::process::exit(71);
+            })
+            .expect("failed to start message queue worker");
+    }
+
     async fn sleep_with_queue_heartbeats(delay: std::time::Duration, heartbeat: &AtomicU64) {
         let deadline = tokio::time::Instant::now() + delay;
         loop {
@@ -670,16 +695,10 @@ impl TelegramBot {
         let queue_heartbeat = Arc::new(AtomicU64::new(0));
         Self::spawn_message_queue_watchdog(queue_heartbeat.clone());
 
-        // Keep queue claims on their own pool. Reusing the connection that ran startup
-        // migrations/recovery has intermittently left the first FOR UPDATE response unwoken on
-        // the production PostgreSQL proxy, while the same query on a fresh connection succeeds.
-        let queue_pool = Arc::new(CacheManager::create_pool().await?);
-
-        // spawn message queue processor
-        let bot_clone = self.bot.clone();
-        tokio::spawn(async move {
-            Self::run_message_queue_processor(bot_clone, queue_pool, queue_heartbeat).await;
-        });
+        // Isolate the queue's pool and database driver on their own runtime. The production bot
+        // runtime has intermittently lost the wake-up for a completed FOR UPDATE response, while
+        // the same query consistently completes in a standalone runtime.
+        Self::spawn_message_queue_worker(self.bot.clone(), queue_heartbeat);
 
         // create context for all handlers (shares the engine + channel locks with recovery)
         let ctx = BotContext {
