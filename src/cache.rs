@@ -1,6 +1,4 @@
-use deadpool_postgres::{
-    Config, ManagerConfig, Pool, PoolConfig, RecyclingMethod, Runtime, Timeouts,
-};
+use deadpool_postgres::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -40,12 +38,9 @@ impl CacheManager {
     fn database_config(database_url: String) -> Config {
         let mut config = Config::new();
         config.url = Some(database_url);
-        // A hard-closed proxy connection can still pass the default Fast is_closed() check.
-        // Use a real probe instead of Verified's empty simple-query string: some PostgreSQL
-        // proxies acknowledge that empty query but leave the following extended query hanging.
-        config.manager = Some(ManagerConfig {
-            recycling_method: RecyclingMethod::Custom("SELECT 1".to_string()),
-        });
+        // Keep deadpool's Fast recycling mode. Its simple-query based probe modes can leave the
+        // next extended query hanging behind some PostgreSQL proxies. Queue operations have their
+        // own watchdog and permanently detach a connection after any timeout or database error.
         // bound the pool and fail fast on exhaustion instead of blocking forever (the default
         // has no acquire timeout, so a leak/slow DB would silently wedge the bot)
         config.pool = Some(PoolConfig {
@@ -264,14 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn database_pool_probes_recycled_connections() {
+    fn database_pool_has_bounded_acquisition() {
         let config =
             CacheManager::database_config("postgresql://example.invalid/example".to_string());
 
-        assert_eq!(
-            config.get_manager_config().recycling_method,
-            RecyclingMethod::Custom("SELECT 1".to_string())
-        );
         let pool = config.get_pool_config();
         assert_eq!(pool.timeouts.wait, Some(Duration::from_secs(30)));
         assert_eq!(pool.timeouts.create, Some(Duration::from_secs(30)));

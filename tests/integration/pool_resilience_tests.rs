@@ -1,6 +1,4 @@
-use deadpool_postgres::{
-    Config, ManagerConfig, Object, Pool, PoolConfig, RecyclingMethod, Runtime,
-};
+use deadpool_postgres::{Config, Object, Pool, PoolConfig, Runtime};
 use std::time::Duration;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
@@ -12,10 +10,9 @@ fn database_url(db: &TestDatabase) -> String {
     url.to_string()
 }
 
-fn pool(db: &TestDatabase, recycling_method: RecyclingMethod) -> Pool {
+fn pool(db: &TestDatabase) -> Pool {
     let mut config = Config::new();
     config.url = Some(database_url(db));
-    config.manager = Some(ManagerConfig { recycling_method });
     config.pool = Some(PoolConfig {
         max_size: 1,
         ..Default::default()
@@ -42,11 +39,11 @@ async fn backend_pid(client: &deadpool_postgres::Object) -> i32 {
 }
 
 #[tokio::test]
-async fn probed_recycling_replaces_a_terminated_connection() {
+async fn recycling_replaces_a_terminated_connection() {
     let db = TestDatabase::create_fresh()
         .await
         .expect("Failed to create test database");
-    let verified_pool = pool(&db, RecyclingMethod::Custom("SELECT 1".to_string()));
+    let verified_pool = pool(&db);
 
     let client = verified_pool.get().await.expect("Failed to get client");
     let terminated_pid = backend_pid(&client).await;
@@ -80,7 +77,7 @@ async fn timed_out_operation_can_detach_and_replace_its_connection() {
     let db = TestDatabase::create_fresh()
         .await
         .expect("Failed to create test database");
-    let worker_pool = pool(&db, RecyclingMethod::Fast);
+    let worker_pool = pool(&db);
 
     let client = worker_pool.get().await.expect("Failed to get client");
     let timed_out_pid = backend_pid(&client).await;
