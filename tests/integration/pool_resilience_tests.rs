@@ -39,7 +39,7 @@ async fn backend_pid(client: &deadpool_postgres::Object) -> i32 {
 }
 
 #[tokio::test]
-async fn recycling_replaces_a_terminated_connection() {
+async fn failed_first_use_can_be_detached_and_replaced() {
     let db = TestDatabase::create_fresh()
         .await
         .expect("Failed to create test database");
@@ -58,10 +58,20 @@ async fn recycling_replaces_a_terminated_connection() {
     assert!(terminated);
     drop(admin);
 
+    let stale = tokio::time::timeout(Duration::from_secs(5), verified_pool.get())
+        .await
+        .expect("Timed out reacquiring terminated connection")
+        .expect("Failed to reacquire terminated connection");
+    assert!(
+        stale.query_one("SELECT 1", &[]).await.is_err(),
+        "first use of a hard-closed Fast-recycled connection should fail"
+    );
+    drop(Object::take(stale));
+
     let replacement = tokio::time::timeout(Duration::from_secs(5), verified_pool.get())
         .await
-        .expect("Timed out replacing terminated connection")
-        .expect("Failed to replace terminated connection");
+        .expect("Timed out replacing detached connection")
+        .expect("Failed to replace detached connection");
     let replacement_pid = backend_pid(&replacement).await;
     assert_ne!(replacement_pid, terminated_pid);
 
