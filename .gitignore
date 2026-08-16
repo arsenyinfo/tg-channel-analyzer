@@ -27,3 +27,6 @@ Thumbs.db
 
 # vibecoding
 .claude/*
+# Local prompt comparison outputs
+partially_unsupervised.md
+prompt-comparison-partially-unsupervised*.md
