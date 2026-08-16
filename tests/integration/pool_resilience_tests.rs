@@ -42,11 +42,11 @@ async fn backend_pid(client: &deadpool_postgres::Object) -> i32 {
 }
 
 #[tokio::test]
-async fn verified_recycling_replaces_a_terminated_connection() {
+async fn probed_recycling_replaces_a_terminated_connection() {
     let db = TestDatabase::create_fresh()
         .await
         .expect("Failed to create test database");
-    let verified_pool = pool(&db, RecyclingMethod::Verified);
+    let verified_pool = pool(&db, RecyclingMethod::Custom("SELECT 1".to_string()));
 
     let client = verified_pool.get().await.expect("Failed to get client");
     let terminated_pid = backend_pid(&client).await;

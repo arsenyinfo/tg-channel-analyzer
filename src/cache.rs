@@ -41,9 +41,10 @@ impl CacheManager {
         let mut config = Config::new();
         config.url = Some(database_url);
         // A hard-closed proxy connection can still pass the default Fast is_closed() check.
-        // Verified runs a test query before handing a pooled connection back to callers.
+        // Use a real probe instead of Verified's empty simple-query string: some PostgreSQL
+        // proxies acknowledge that empty query but leave the following extended query hanging.
         config.manager = Some(ManagerConfig {
-            recycling_method: RecyclingMethod::Verified,
+            recycling_method: RecyclingMethod::Custom("SELECT 1".to_string()),
         });
         // bound the pool and fail fast on exhaustion instead of blocking forever (the default
         // has no acquire timeout, so a leak/slow DB would silently wedge the bot)
@@ -263,13 +264,13 @@ mod tests {
     }
 
     #[test]
-    fn database_pool_verifies_recycled_connections() {
+    fn database_pool_probes_recycled_connections() {
         let config =
             CacheManager::database_config("postgresql://example.invalid/example".to_string());
 
         assert_eq!(
             config.get_manager_config().recycling_method,
-            RecyclingMethod::Verified
+            RecyclingMethod::Custom("SELECT 1".to_string())
         );
         let pool = config.get_pool_config();
         assert_eq!(pool.timeouts.wait, Some(Duration::from_secs(30)));
