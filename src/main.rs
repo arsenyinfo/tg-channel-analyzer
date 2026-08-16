@@ -134,10 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await?;
 
     // spawn dispatcher in a task so a panic doesn't crash the runtime
-    let dispatcher_result = tokio::spawn(async move {
-        bot.run().await;
-    })
-    .await;
+    let dispatcher_result = tokio::spawn(async move { bot.run().await }).await;
 
     // dispatcher exited — abort any still-running recovery tasks
     info!("Dispatcher exited, aborting remaining recovery tasks");
@@ -146,7 +143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     match dispatcher_result {
-        Ok(()) => Ok(()),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            error!("Bot runtime failed: {}", e);
+            Err(e)
+        }
         Err(e) => {
             error!("Bot dispatcher failed: {}", e);
             Err(format!("Bot dispatcher failed: {}", e).into())

@@ -35,6 +35,12 @@ struct QueuedMessage {
     lease_token: String,
 }
 
+enum QueueTickOutcome {
+    Healthy,
+    DatabaseError,
+    Backoff(std::time::Duration),
+}
+
 // per-channel locks to prevent concurrent LLM calls for the same channel
 pub type ChannelLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
@@ -71,6 +77,9 @@ pub struct BotContext {
 
 impl TelegramBot {
     const MESSAGE_QUEUE_LOCK_ID: i64 = 7_623_417_991;
+    const MESSAGE_QUEUE_TICK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const MESSAGE_QUEUE_HEARTBEAT_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(300);
 
     fn validate_and_normalize_channel(text: &str) -> Option<String> {
         // regex for valid telegram channel username (5-32 chars, alphanumeric and underscore)
@@ -95,6 +104,9 @@ impl TelegramBot {
     async fn run_message_queue_processor(bot: Arc<Bot>, pool: Arc<Pool>) {
         info!("Starting message queue processor");
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_heartbeat = tokio::time::Instant::now();
+
         loop {
             interval.tick().await;
             let mut client = match pool.get().await {
@@ -108,52 +120,92 @@ impl TelegramBot {
                     continue;
                 }
             };
-            let transaction = match client.transaction().await {
-                Ok(transaction) => transaction,
-                Err(e) => {
-                    error!("Failed to start queue claim transaction: {}", e);
-                    continue;
-                }
-            };
-            // The transaction-scoped advisory lock serializes claims across replicas and is
-            // always released by PostgreSQL on commit/rollback/connection loss.
-            let owns_lock: bool = match transaction
-                .query_one(
-                    "SELECT pg_try_advisory_xact_lock($1)",
-                    &[&Self::MESSAGE_QUEUE_LOCK_ID],
-                )
-                .await
-            {
-                Ok(row) => row.get(0),
-                Err(e) => {
-                    error!("Failed to coordinate queue claim: {}", e);
-                    continue;
-                }
-            };
-            if !owns_lock {
-                continue;
-            }
 
-            if let Err(e) = transaction
-                .execute(
-                    "UPDATE message_queue
+            match tokio::time::timeout(
+                Self::MESSAGE_QUEUE_TICK_TIMEOUT,
+                Self::process_message_queue_tick(&bot, &mut client),
+            )
+            .await
+            {
+                Ok(QueueTickOutcome::Healthy) => {
+                    if last_heartbeat.elapsed() >= Self::MESSAGE_QUEUE_HEARTBEAT_INTERVAL {
+                        info!("Message queue processor healthy");
+                        last_heartbeat = tokio::time::Instant::now();
+                    }
+                }
+                Ok(QueueTickOutcome::DatabaseError) => {
+                    error!("Message queue database tick failed; discarding the connection");
+                    drop(deadpool_postgres::Object::take(client));
+                }
+                Ok(QueueTickOutcome::Backoff(delay)) => {
+                    drop(client);
+                    tokio::time::sleep(delay).await;
+                }
+                Err(_) => {
+                    error!(
+                        "Message queue tick exceeded {}s; discarding the checked-out database connection",
+                        Self::MESSAGE_QUEUE_TICK_TIMEOUT.as_secs()
+                    );
+                    // The watchdog also covers Telegram I/O. Once a claim is committed, a timeout
+                    // deliberately leaves it processing so lease reconciliation marks its delivery
+                    // unknown instead of risking a duplicate. Always detach the checked-out client:
+                    // a PostgreSQL timeout may otherwise return a half-dead socket to the pool.
+                    drop(deadpool_postgres::Object::take(client));
+                }
+            }
+        }
+    }
+
+    async fn process_message_queue_tick(
+        bot: &Arc<Bot>,
+        client: &mut deadpool_postgres::Object,
+    ) -> QueueTickOutcome {
+        let transaction = match client.transaction().await {
+            Ok(transaction) => transaction,
+            Err(e) => {
+                error!("Failed to start queue claim transaction: {}", e);
+                return QueueTickOutcome::DatabaseError;
+            }
+        };
+        // The transaction-scoped advisory lock serializes claims across replicas and is
+        // always released by PostgreSQL on commit/rollback/connection loss.
+        let owns_lock: bool = match transaction
+            .query_one(
+                "SELECT pg_try_advisory_xact_lock($1)",
+                &[&Self::MESSAGE_QUEUE_LOCK_ID],
+            )
+            .await
+        {
+            Ok(row) => row.get(0),
+            Err(e) => {
+                error!("Failed to coordinate queue claim: {}", e);
+                return QueueTickOutcome::DatabaseError;
+            }
+        };
+        if !owns_lock {
+            return QueueTickOutcome::Healthy;
+        }
+
+        if let Err(e) = transaction
+            .execute(
+                "UPDATE message_queue
                      SET status = 'delivery_unknown', lease_token = NULL, leased_until = NULL,
                          last_error_code = 'lease_expired',
                          error_message = 'Delivery outcome unknown after worker interruption'
                      WHERE status = 'processing'
                        AND (leased_until IS NULL OR leased_until < NOW())",
-                    &[],
-                )
-                .await
-            {
-                error!("Failed to reconcile expired queue leases: {}", e);
-                continue;
-            }
+                &[],
+            )
+            .await
+        {
+            error!("Failed to reconcile expired queue leases: {}", e);
+            return QueueTickOutcome::DatabaseError;
+        }
 
-            let lease_token = format!("{:032x}", rand::random::<u128>());
-            let row = match transaction
-                .query_opt(
-                    r#"
+        let lease_token = format!("{:032x}", rand::random::<u128>());
+        let row = match transaction
+            .query_opt(
+                r#"
                     SELECT mq.id, mq.telegram_user_id, mq.message, mq.parse_mode,
                            mq.campaign_id, mq.attempt_count, mq.max_attempts,
                            c.timezone, c.send_window_start, c.send_window_end,
@@ -183,155 +235,170 @@ impl TelegramBot {
                     LIMIT 1
                     FOR UPDATE OF mq SKIP LOCKED
                     "#,
-                    &[],
-                )
-                .await
-            {
-                Ok(row) => row,
-                Err(e) => {
-                    error!("Message queue selection failed: {}", e);
-                    continue;
-                }
-            };
-            let Some(row) = row else {
-                if let Err(e) = transaction.commit().await {
-                    error!("Failed to commit empty queue claim: {}", e);
-                }
-                continue;
-            };
+                &[],
+            )
+            .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                error!("Message queue selection failed: {}", e);
+                return QueueTickOutcome::DatabaseError;
+            }
+        };
+        let Some(row) = row else {
+            if let Err(e) = transaction.commit().await {
+                error!("Failed to commit empty queue claim: {}", e);
+                return QueueTickOutcome::DatabaseError;
+            }
+            return QueueTickOutcome::Healthy;
+        };
 
-            let queued = QueuedMessage {
-                id: row.get(0),
-                telegram_user_id: row.get(1),
-                message: row.get(2),
-                parse_mode: row.get(3),
-                campaign_id: row.get(4),
-                attempt_count: row.get::<_, i32>(5) + 1,
-                max_attempts: row.get(6),
-                timezone: row.get(7),
-                window_start: row.get(8),
-                window_end: row.get(9),
-                lease_token,
-            };
-            if let Err(e) = transaction
-                .execute(
-                    "UPDATE message_queue
+        let queued = QueuedMessage {
+            id: row.get(0),
+            telegram_user_id: row.get(1),
+            message: row.get(2),
+            parse_mode: row.get(3),
+            campaign_id: row.get(4),
+            attempt_count: row.get::<_, i32>(5) + 1,
+            max_attempts: row.get(6),
+            timezone: row.get(7),
+            window_start: row.get(8),
+            window_end: row.get(9),
+            lease_token,
+        };
+        if let Err(e) = transaction
+            .execute(
+                "UPDATE message_queue
                      SET status = 'processing', attempt_count = attempt_count + 1,
                          lease_token = $2, leased_until = NOW() + INTERVAL '5 minutes'
                      WHERE id = $1",
+                &[&queued.id, &queued.lease_token],
+            )
+            .await
+        {
+            error!("Message queue claim update failed: {}", e);
+            return QueueTickOutcome::DatabaseError;
+        }
+        if let Some(campaign_id) = queued.campaign_id {
+            let cadence_seconds: i32 = row.get(10);
+            if let Err(e) = transaction
+                .execute(
+                    "UPDATE campaigns
+                         SET next_send_at = NOW() + ($2::INTEGER * INTERVAL '1 second'),
+                             updated_at = NOW()
+                         WHERE id = $1",
+                    &[&campaign_id, &cadence_seconds],
+                )
+                .await
+            {
+                error!("Failed to advance campaign pacing: {}", e);
+                return QueueTickOutcome::DatabaseError;
+            }
+        }
+        if let Err(e) = transaction.commit().await {
+            error!("Failed to commit message queue claim: {}", e);
+            return QueueTickOutcome::DatabaseError;
+        }
+
+        if queued.campaign_id.is_some() {
+            match client
+                .query_opt(
+                    "SELECT 1 FROM campaign_suppressions WHERE telegram_user_id = $1",
+                    &[&queued.telegram_user_id],
+                )
+                .await
+            {
+                Ok(Some(_)) => {
+                    if let Err(e) = Self::finish_queue_row(
+                        &client,
+                        &queued,
+                        "failed",
+                        "user_opt_out",
+                        "Recipient opted out before delivery",
+                    )
+                    .await
+                    {
+                        error!("Failed to suppress queue row {}: {}", queued.id, e);
+                        return QueueTickOutcome::DatabaseError;
+                    }
+                    return QueueTickOutcome::Healthy;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!(
+                            "Could not verify suppression for queue row {}; leaving lease for safe reconciliation: {}",
+                            queued.id, e
+                        );
+                    return QueueTickOutcome::DatabaseError;
+                }
+            }
+        }
+
+        let parse_mode = match queued.parse_mode.as_str() {
+            "HTML" => ParseMode::Html,
+            "MarkdownV2" => ParseMode::MarkdownV2,
+            _ => {
+                error!("Queue row {} has invalid parse mode", queued.id);
+                if let Err(e) = Self::finish_queue_row(
+                    &client,
+                    &queued,
+                    "failed",
+                    "invalid_parse_mode",
+                    "Invalid parse mode",
+                )
+                .await
+                {
+                    error!("Failed to reject queue row {}: {}", queued.id, e);
+                    return QueueTickOutcome::DatabaseError;
+                }
+                return QueueTickOutcome::Healthy;
+            }
+        };
+
+        match bot
+            .send_message(ChatId(queued.telegram_user_id), &queued.message)
+            .parse_mode(parse_mode)
+            .await
+        {
+            Ok(_) => match client
+                .execute(
+                    "UPDATE message_queue
+                         SET status = 'sent', sent_at = NOW(), lease_token = NULL,
+                             leased_until = NULL, error_message = NULL, last_error_code = NULL
+                         WHERE id = $1 AND status = 'processing' AND lease_token = $2",
                     &[&queued.id, &queued.lease_token],
                 )
                 .await
             {
-                error!("Message queue claim update failed: {}", e);
-                continue;
-            }
-            if let Some(campaign_id) = queued.campaign_id {
-                let cadence_seconds: i32 = row.get(10);
-                if let Err(e) = transaction
-                    .execute(
-                        "UPDATE campaigns
-                         SET next_send_at = NOW() + ($2::INTEGER * INTERVAL '1 second'),
-                             updated_at = NOW()
-                         WHERE id = $1",
-                        &[&campaign_id, &cadence_seconds],
-                    )
-                    .await
-                {
-                    error!("Failed to advance campaign pacing: {}", e);
-                    continue;
-                }
-            }
-            if let Err(e) = transaction.commit().await {
-                error!("Failed to commit message queue claim: {}", e);
-                continue;
-            }
-
-            if queued.campaign_id.is_some() {
-                match client
-                    .query_opt(
-                        "SELECT 1 FROM campaign_suppressions WHERE telegram_user_id = $1",
-                        &[&queued.telegram_user_id],
-                    )
-                    .await
-                {
-                    Ok(Some(_)) => {
-                        let _ = Self::finish_queue_row(
-                            &client,
-                            &queued,
-                            "failed",
-                            "user_opt_out",
-                            "Recipient opted out before delivery",
-                        )
-                        .await;
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        error!(
-                            "Could not verify suppression for queue row {}; leaving lease for safe reconciliation: {}",
-                            queued.id, e
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            let parse_mode = match queued.parse_mode.as_str() {
-                "HTML" => ParseMode::Html,
-                "MarkdownV2" => ParseMode::MarkdownV2,
-                _ => {
-                    error!("Queue row {} has invalid parse mode", queued.id);
-                    let _ = Self::finish_queue_row(
-                        &client,
-                        &queued,
-                        "failed",
-                        "invalid_parse_mode",
-                        "Invalid parse mode",
-                    )
-                    .await;
-                    continue;
-                }
-            };
-
-            match bot
-                .send_message(ChatId(queued.telegram_user_id), &queued.message)
-                .parse_mode(parse_mode)
-                .await
-            {
-                Ok(_) => match client
-                    .execute(
-                        "UPDATE message_queue
-                         SET status = 'sent', sent_at = NOW(), lease_token = NULL,
-                             leased_until = NULL, error_message = NULL, last_error_code = NULL
-                         WHERE id = $1 AND status = 'processing' AND lease_token = $2",
-                        &[&queued.id, &queued.lease_token],
-                    )
-                    .await
-                {
-                    Ok(1) => {}
-                    Ok(_) => error!(
+                Ok(1) => QueueTickOutcome::Healthy,
+                Ok(_) => {
+                    error!(
                         "Queue row {} lost its lease after Telegram accepted it",
                         queued.id
-                    ),
-                    Err(e) => error!(
+                    );
+                    QueueTickOutcome::Healthy
+                }
+                Err(e) => {
+                    error!(
                         "Telegram accepted queue row {}, but recording success failed: {}",
                         queued.id, e
-                    ),
-                },
-                Err(e) => {
-                    if let Err(update_error) = Self::handle_queue_error(&client, &queued, &e).await
-                    {
-                        error!(
-                            "Failed to record delivery error for queue row {}: {}",
-                            queued.id, update_error
-                        );
-                    }
-                    if matches!(e, RequestError::Api(ApiError::InvalidToken)) {
-                        error!("Telegram rejected the bot token; queue worker backing off");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
-                    }
+                    );
+                    QueueTickOutcome::DatabaseError
                 }
+            },
+            Err(e) => {
+                if let Err(update_error) = Self::handle_queue_error(&client, &queued, &e).await {
+                    error!(
+                        "Failed to record delivery error for queue row {}: {}",
+                        queued.id, update_error
+                    );
+                    return QueueTickOutcome::DatabaseError;
+                }
+                if matches!(e, RequestError::Api(ApiError::InvalidToken)) {
+                    error!("Telegram rejected the bot token; queue worker backing off");
+                    return QueueTickOutcome::Backoff(std::time::Duration::from_secs(3600));
+                }
+                QueueTickOutcome::Healthy
             }
         }
     }
@@ -608,13 +675,14 @@ impl TelegramBot {
         })
     }
 
-    pub async fn run(&self) {
+    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting Telegram bot...");
 
-        // spawn message queue processor
+        // Retain the queue worker handle. If it panics or exits, fail the process so systemd can
+        // restart the complete runtime and pool instead of leaving a half-healthy bot online.
         let bot_clone = self.bot.clone();
         let pool_clone = self.pool.clone();
-        tokio::spawn(async move {
+        let mut queue_worker = tokio::spawn(async move {
             Self::run_message_queue_processor(bot_clone, pool_clone).await;
         });
 
@@ -679,16 +747,25 @@ impl TelegramBot {
                     })),
             );
 
-        Dispatcher::builder(self.bot.clone(), handler)
+        let mut dispatcher = Dispatcher::builder(self.bot.clone(), handler)
             .error_handler(
                 teloxide::error_handlers::LoggingErrorHandler::with_custom_text(
                     "An error from the update listener",
                 ),
             )
             .enable_ctrlc_handler()
-            .build()
-            .dispatch()
-            .await;
+            .build();
+
+        tokio::select! {
+            _ = dispatcher.dispatch() => {
+                queue_worker.abort();
+                let _ = queue_worker.await;
+                Ok(())
+            }
+            worker_result = &mut queue_worker => {
+                Err(format!("message queue processor exited unexpectedly: {worker_result:?}").into())
+            }
+        }
     }
 
     async fn handle_message(ctx: BotContext, msg: Message) -> ResponseResult<()> {

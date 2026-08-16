@@ -1,4 +1,6 @@
-use deadpool_postgres::{Config, Pool, PoolConfig, Runtime, Timeouts};
+use deadpool_postgres::{
+    Config, ManagerConfig, Pool, PoolConfig, RecyclingMethod, Runtime, Timeouts,
+};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -24,8 +26,25 @@ impl CacheManager {
         let database_url =
             env::var("DATABASE_URL").map_err(|_| "DATABASE_URL environment variable not set")?;
 
+        let config = Self::database_config(database_url);
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls = MakeRustlsConnect::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+        Ok(config.create_pool(Some(Runtime::Tokio1), tls)?)
+    }
+
+    fn database_config(database_url: String) -> Config {
         let mut config = Config::new();
         config.url = Some(database_url);
+        // A hard-closed proxy connection can still pass the default Fast is_closed() check.
+        // Verified runs a test query before handing a pooled connection back to callers.
+        config.manager = Some(ManagerConfig {
+            recycling_method: RecyclingMethod::Verified,
+        });
         // bound the pool and fail fast on exhaustion instead of blocking forever (the default
         // has no acquire timeout, so a leak/slow DB would silently wedge the bot)
         config.pool = Some(PoolConfig {
@@ -37,14 +56,7 @@ impl CacheManager {
             },
             ..Default::default()
         });
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls = MakeRustlsConnect::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        );
-        Ok(config.create_pool(Some(Runtime::Tokio1), tls)?)
+        config
     }
 
     // channel message cache (7-day TTL)
@@ -248,5 +260,20 @@ mod tests {
             current,
             CacheManager::get_llm_cache_key(&messages, "analysis", "v2", "gemini-3.7-flash",)
         );
+    }
+
+    #[test]
+    fn database_pool_verifies_recycled_connections() {
+        let config =
+            CacheManager::database_config("postgresql://example.invalid/example".to_string());
+
+        assert_eq!(
+            config.get_manager_config().recycling_method,
+            RecyclingMethod::Verified
+        );
+        let pool = config.get_pool_config();
+        assert_eq!(pool.timeouts.wait, Some(Duration::from_secs(30)));
+        assert_eq!(pool.timeouts.create, Some(Duration::from_secs(30)));
+        assert_eq!(pool.timeouts.recycle, Some(Duration::from_secs(30)));
     }
 }

@@ -11,6 +11,7 @@ pub mod test_utils;
 
 mod analysis_idempotency_tests;
 mod campaign_tests;
+mod pool_resilience_tests;
 
 /// test database configuration and setup
 pub struct TestDatabase {
