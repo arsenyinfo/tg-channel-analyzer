@@ -35,6 +35,24 @@ struct QueuedMessage {
     lease_token: String,
 }
 
+#[cfg(test)]
+mod queue_watchdog_tests {
+    use super::TelegramBot;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn detects_a_worker_that_stops_reporting_progress() {
+        let (_progress_tx, progress_rx) = tokio::sync::watch::channel(tokio::time::Instant::now());
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            TelegramBot::wait_for_queue_stall(progress_rx, Duration::from_millis(20)),
+        )
+        .await
+        .expect("queue watchdog did not detect the stalled worker");
+    }
+}
+
 enum QueueTickOutcome {
     Healthy,
     DatabaseError,
@@ -77,7 +95,8 @@ pub struct BotContext {
 
 impl TelegramBot {
     const MESSAGE_QUEUE_LOCK_ID: i64 = 7_623_417_991;
-    const MESSAGE_QUEUE_TICK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    const MESSAGE_QUEUE_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+    const MESSAGE_QUEUE_BACKOFF_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(30);
     const MESSAGE_QUEUE_HEARTBEAT_INTERVAL: std::time::Duration =
         std::time::Duration::from_secs(300);
 
@@ -101,7 +120,11 @@ impl TelegramBot {
         None
     }
 
-    async fn run_message_queue_processor(bot: Arc<Bot>, pool: Arc<Pool>) {
+    async fn run_message_queue_processor(
+        bot: Arc<Bot>,
+        pool: Arc<Pool>,
+        progress: tokio::sync::watch::Sender<tokio::time::Instant>,
+    ) {
         info!("Starting message queue processor");
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -109,6 +132,7 @@ impl TelegramBot {
 
         loop {
             interval.tick().await;
+            progress.send_replace(tokio::time::Instant::now());
             let mut client = match pool.get().await {
                 Ok(client) => client,
                 Err(e) => {
@@ -121,36 +145,60 @@ impl TelegramBot {
                 }
             };
 
-            match tokio::time::timeout(
-                Self::MESSAGE_QUEUE_TICK_TIMEOUT,
-                Self::process_message_queue_tick(&bot, &mut client),
-            )
-            .await
-            {
-                Ok(QueueTickOutcome::Healthy) => {
+            match Self::process_message_queue_tick(&bot, &mut client).await {
+                QueueTickOutcome::Healthy => {
                     if last_heartbeat.elapsed() >= Self::MESSAGE_QUEUE_HEARTBEAT_INTERVAL {
                         info!("Message queue processor healthy");
                         last_heartbeat = tokio::time::Instant::now();
                     }
                 }
-                Ok(QueueTickOutcome::DatabaseError) => {
+                QueueTickOutcome::DatabaseError => {
                     error!("Message queue database tick failed; discarding the connection");
                     drop(deadpool_postgres::Object::take(client));
                 }
-                Ok(QueueTickOutcome::Backoff(delay)) => {
+                QueueTickOutcome::Backoff(delay) => {
                     drop(client);
-                    tokio::time::sleep(delay).await;
+                    Self::sleep_with_queue_heartbeats(delay, &progress).await;
                 }
-                Err(_) => {
-                    error!(
-                        "Message queue tick exceeded {}s; discarding the checked-out database connection",
-                        Self::MESSAGE_QUEUE_TICK_TIMEOUT.as_secs()
-                    );
-                    // The watchdog also covers Telegram I/O. Once a claim is committed, a timeout
-                    // deliberately leaves it processing so lease reconciliation marks its delivery
-                    // unknown instead of risking a duplicate. Always detach the checked-out client:
-                    // a PostgreSQL timeout may otherwise return a half-dead socket to the pool.
-                    drop(deadpool_postgres::Object::take(client));
+            }
+        }
+    }
+
+    async fn sleep_with_queue_heartbeats(
+        delay: std::time::Duration,
+        progress: &tokio::sync::watch::Sender<tokio::time::Instant>,
+    ) {
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            progress.send_replace(tokio::time::Instant::now());
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep_until(std::cmp::min(
+                deadline,
+                now + Self::MESSAGE_QUEUE_BACKOFF_HEARTBEAT,
+            ))
+            .await;
+        }
+    }
+
+    async fn wait_for_queue_stall(
+        mut progress: tokio::sync::watch::Receiver<tokio::time::Instant>,
+        stall_timeout: std::time::Duration,
+    ) {
+        loop {
+            let deadline = *progress.borrow_and_update() + stall_timeout;
+            tokio::select! {
+                changed = progress.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    if progress.borrow().elapsed() >= stall_timeout {
+                        return;
+                    }
                 }
             }
         }
@@ -687,8 +735,10 @@ impl TelegramBot {
         // restart the complete runtime and pool instead of leaving a half-healthy bot online.
         let bot_clone = self.bot.clone();
         let pool_clone = self.pool.clone();
+        let (queue_progress_tx, queue_progress_rx) =
+            tokio::sync::watch::channel(tokio::time::Instant::now());
         let mut queue_worker = tokio::spawn(async move {
-            Self::run_message_queue_processor(bot_clone, pool_clone).await;
+            Self::run_message_queue_processor(bot_clone, pool_clone, queue_progress_tx).await;
         });
 
         // create context for all handlers (shares the engine + channel locks with recovery)
@@ -760,6 +810,9 @@ impl TelegramBot {
             )
             .enable_ctrlc_handler()
             .build();
+        let queue_stall =
+            Self::wait_for_queue_stall(queue_progress_rx, Self::MESSAGE_QUEUE_STALL_TIMEOUT);
+        tokio::pin!(queue_stall);
 
         tokio::select! {
             _ = dispatcher.dispatch() => {
@@ -769,6 +822,14 @@ impl TelegramBot {
             }
             worker_result = &mut queue_worker => {
                 Err(format!("message queue processor exited unexpectedly: {worker_result:?}").into())
+            }
+            _ = &mut queue_stall => {
+                queue_worker.abort();
+                let _ = queue_worker.await;
+                Err(format!(
+                    "message queue processor made no progress for {}s",
+                    Self::MESSAGE_QUEUE_STALL_TIMEOUT.as_secs()
+                ).into())
             }
         }
     }
