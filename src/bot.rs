@@ -239,7 +239,10 @@ impl TelegramBot {
             )
             .await
         {
-            Ok(row) => row,
+            Ok(row) => {
+                info!("Message queue selection query completed");
+                row
+            }
             Err(e) => {
                 error!("Message queue selection failed: {}", e);
                 return QueueTickOutcome::DatabaseError;
@@ -266,6 +269,7 @@ impl TelegramBot {
             window_end: row.get(9),
             lease_token,
         };
+        info!("Decoded queue row {}; submitting lease update", queued.id);
         if let Err(e) = transaction
             .execute(
                 "UPDATE message_queue
@@ -279,6 +283,7 @@ impl TelegramBot {
             error!("Message queue claim update failed: {}", e);
             return QueueTickOutcome::DatabaseError;
         }
+        info!("Queue row {} lease update completed", queued.id);
         if let Some(campaign_id) = queued.campaign_id {
             let cadence_seconds: i32 = row.get(10);
             if let Err(e) = transaction
