@@ -56,7 +56,7 @@ pub fn get_gemini_rate_limiter() -> &'static GeminiRateLimiter {
 pub const MAX_RETRIES: u32 = 3;
 pub const BASE_DELAY_MS: u64 = 1000;
 pub const GEMINI_TIMEOUT_SECS: u64 = 300;
-pub const ANALYSIS_MODEL: &str = "gemini-3.7-flash";
+pub const ANALYSIS_MODEL: &str = "gemini-3.8-flash";
 pub const GEMINI_FLASH_LITE_MODEL: &str = "gemini-2.5-flash-lite";
 
 #[derive(Debug)]
