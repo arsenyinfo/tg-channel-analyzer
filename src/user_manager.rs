@@ -160,9 +160,19 @@ impl UserManager {
         language_code: Option<&str>,
     ) -> Result<(User, Option<ReferralRewardInfo>), Box<dyn Error + Send + Sync>> {
         let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+        // Serialize first-time registration before checking existence, so concurrent
+        // requests return the same user and process its referral exactly once. The
+        // prefix separates these lock keys from campaign keys and fixed worker locks.
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended('user-registration:' || $1::BIGINT::TEXT, 0))",
+                &[&telegram_user_id],
+            )
+            .await?;
 
         // try to get existing user first
-        if let Some(row) = client
+        if let Some(row) = transaction
             .query_opt(
                 "SELECT id, telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language 
                  FROM users WHERE telegram_user_id = $1",
@@ -170,6 +180,8 @@ impl UserManager {
             )
             .await?
         {
+            // Language updates remain best-effort outside the registration transaction.
+            transaction.commit().await?;
             let mut user = User {
                 id: row.get(0),
                 telegram_user_id: row.get(1),
@@ -209,8 +221,6 @@ impl UserManager {
         // create new user and process any referral atomically in one transaction,
         // so a referral-processing failure rolls back the user insert rather than
         // leaving referred_by_user_id set with no referrer increment
-        let transaction = client.transaction().await?;
-
         let row = transaction
             .query_one(
                 "INSERT INTO users (telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language)
