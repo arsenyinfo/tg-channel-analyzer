@@ -226,7 +226,9 @@ pub fn extract_tag(text: &str, tag: &str) -> Option<String> {
     let re = Regex::new(&pattern).ok()?;
     re.captures(text)
         .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().trim().to_string())
+        .map(|m| m.as_str().trim())
+        .filter(|content| !content.is_empty())
+        .map(str::to_string)
 }
 
 pub async fn query_llm_with_context(
@@ -408,8 +410,24 @@ fn completion_error_class(error: &CompletionError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::usage_columns;
+    use super::{extract_tag, usage_columns};
     use rig_core::providers::gemini::completion::gemini_api_types::UsageMetadata;
+
+    #[test]
+    fn analysis_tags_require_nonempty_content() {
+        for tag in ["professional", "personal", "roast"] {
+            assert_eq!(extract_tag("unstructured response", tag), None);
+            assert_eq!(extract_tag(&format!("<{tag}></{tag}>"), tag), None);
+            assert_eq!(extract_tag(&format!("<{tag}> \n\t </{tag}>"), tag), None);
+            assert_eq!(
+                extract_tag(
+                    &format!("<{tag}> \nFirst line\nSecond line\t </{tag}>"),
+                    tag
+                ),
+                Some("First line\nSecond line".to_string())
+            );
+        }
+    }
 
     #[test]
     fn preserves_all_gemini_usage_counters() {
