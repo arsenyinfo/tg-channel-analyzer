@@ -167,6 +167,23 @@ async fn infer_language_batch(
     }
 }
 
+async fn update_inferred_languages(
+    client: &tokio_postgres::Client,
+    updates: &[(i32, String)],
+) -> Result<u64, tokio_postgres::Error> {
+    let update_query = r#"
+        UPDATE users
+        SET language = $2, updated_at = NOW()
+        WHERE id = $1 AND language IS NULL
+    "#;
+
+    let mut updated = 0;
+    for (user_id, language) in updates {
+        updated += client.execute(update_query, &[user_id, language]).await?;
+    }
+    Ok(updated)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // initialize rustls crypto provider
@@ -223,18 +240,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // update database
         if !updates.is_empty() {
             let client = pool.get().await?;
-            let update_query = r#"
-                UPDATE users
-                SET language = $2, updated_at = NOW()
-                WHERE id = $1
-            "#;
-
-            for (user_id, language) in &updates {
-                client.execute(update_query, &[user_id, language]).await?;
-            }
-
-            total_updated += updates.len();
-            info!("Updated {} users in this batch", updates.len());
+            let updated = update_inferred_languages(&client, &updates).await?;
+            total_updated += updated;
+            info!("Updated {} users in this batch", updated);
         }
 
         // small delay to avoid rate limiting
@@ -276,7 +284,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[cfg(test)]
 mod tests {
-    use super::LANGUAGE_INFERENCE_PROMPT;
+    use super::{update_inferred_languages, LANGUAGE_INFERENCE_PROMPT};
+
+    #[tokio::test]
+    async fn backfill_preserves_languages_observed_after_the_snapshot() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must select a local postgres database");
+        let config: tokio_postgres::Config = database_url.parse().unwrap();
+        assert!(matches!(
+            config.get_hosts(),
+            [tokio_postgres::config::Host::Tcp(host)]
+                if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
+        ));
+        assert_eq!(config.get_dbname(), Some("postgres"));
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        let connection_task = tokio::spawn(connection);
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE users (
+                    id INTEGER PRIMARY KEY,
+                    language TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                 );
+                 INSERT INTO users (id) VALUES (1), (2);",
+            )
+            .await
+            .unwrap();
+
+        let snapshot = client
+            .query(
+                "SELECT id FROM users WHERE language IS NULL ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.len(), 2);
+        let inferred: Vec<(i32, String)> = snapshot
+            .iter()
+            .map(|row| (row.get("id"), "en".to_string()))
+            .collect();
+        client
+            .execute("UPDATE users SET language = 'ru' WHERE id = 1", &[])
+            .await
+            .unwrap();
+
+        let updated = update_inferred_languages(&client, &inferred).await.unwrap();
+        let rows = client
+            .query("SELECT language FROM users ORDER BY id", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, String>("language"), "ru");
+        assert_eq!(rows[1].get::<_, String>("language"), "en");
+        assert_eq!(updated, 1);
+        assert_eq!(
+            update_inferred_languages(&client, &inferred).await.unwrap(),
+            0
+        );
+        drop(client);
+        connection_task.await.unwrap().unwrap();
+    }
 
     #[test]
     fn prompt_uses_single_braces_for_the_json_example() {
