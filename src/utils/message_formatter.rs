@@ -131,82 +131,68 @@ impl MessageFormatter {
         pieces
     }
 
-    /// splits a message into chunks that fit within Telegram's 4096 UTF-16 code unit limit
+    /// Splits generated HTML by rendered UTF-16 length, keeping entities intact and
+    /// closing/reopening active formatting so each chunk is independently valid.
     pub fn split_message_into_chunks(text: &str, max_length: usize) -> Vec<String> {
         if Self::count_utf16_code_units(text) <= max_length {
             return vec![text.to_string()];
         }
 
+        // Words stay together when they fit; long words split only at character boundaries.
+        // Input is the escaped HTML produced by markdown_to_html_safe.
+        let tokens =
+            Regex::new(r"(?s)<[^>]*>|&(?:#[xX][0-9a-fA-F]+|#[0-9]+|[A-Za-z]+);|[^<&\s]+|\s|[<&]")
+                .unwrap();
         let mut chunks = Vec::new();
-        let mut current_chunk = String::new();
+        let mut current = String::new();
+        let mut visible_length = 0;
+        let mut open_tags: Vec<(&str, &str)> = Vec::new();
 
-        // split by lines to avoid breaking in the middle of formatting
-        for line in text.lines() {
-            let line_with_newline = format!("{}\n", line);
-
-            // if adding this line would exceed the limit, finalize current chunk
-            if Self::count_utf16_code_units(&current_chunk)
-                + Self::count_utf16_code_units(&line_with_newline)
-                > max_length
-            {
-                if !current_chunk.is_empty() {
-                    chunks.push(current_chunk.trim_end().to_string());
-                    current_chunk.clear();
-                }
-
-                // if single line is too long, split it at word boundaries
-                if Self::count_utf16_code_units(&line_with_newline) > max_length {
-                    let words: Vec<&str> = line.split_whitespace().collect();
-                    let mut word_chunk = String::new();
-
-                    for word in words {
-                        // a single word longer than the limit must be hard-split, otherwise
-                        // it would produce an over-limit chunk that Telegram rejects
-                        if Self::count_utf16_code_units(word) > max_length {
-                            if !word_chunk.is_empty() {
-                                chunks.push(word_chunk.trim_end().to_string());
-                                word_chunk.clear();
-                            }
-                            let pieces = Self::hard_split_word(word, max_length);
-                            let last = pieces.len() - 1;
-                            for (i, piece) in pieces.into_iter().enumerate() {
-                                if i == last {
-                                    word_chunk.push_str(&piece);
-                                    word_chunk.push(' ');
-                                } else {
-                                    chunks.push(piece);
-                                }
-                            }
-                            continue;
-                        }
-
-                        let word_with_space = format!("{} ", word);
-                        if Self::count_utf16_code_units(&word_chunk)
-                            + Self::count_utf16_code_units(&word_with_space)
-                            > max_length
-                            && !word_chunk.is_empty()
-                        {
-                            chunks.push(word_chunk.trim_end().to_string());
-                            word_chunk.clear();
-                        }
-                        word_chunk.push_str(&word_with_space);
-                    }
-
-                    if !word_chunk.is_empty() {
-                        current_chunk = word_chunk.trim_end().to_string();
-                    }
+        for matched in tokens.find_iter(text) {
+            let token = matched.as_str();
+            if token.starts_with("<!--") {
+                continue;
+            }
+            if let Some(tag) = token.strip_prefix('<') {
+                if token.starts_with("</") {
+                    open_tags.pop();
                 } else {
-                    current_chunk.push_str(&line_with_newline);
+                    let name = tag
+                        .split(|c: char| c.is_whitespace() || c == '>')
+                        .next()
+                        .unwrap();
+                    open_tags.push((name, token));
                 }
+                current.push_str(token);
+                continue;
+            }
+
+            let is_entity = token.starts_with('&') && token.ends_with(';');
+            let pieces = if !is_entity && Self::count_utf16_code_units(token) > max_length {
+                Self::hard_split_word(token, max_length)
             } else {
-                current_chunk.push_str(&line_with_newline);
+                vec![token.to_string()]
+            };
+            for piece in pieces {
+                let length =
+                    Self::count_utf16_code_units(&html_escape::decode_html_entities(&piece));
+                if visible_length > 0 && visible_length + length > max_length {
+                    for (name, _) in open_tags.iter().rev() {
+                        current.push_str(&format!("</{name}>"));
+                    }
+                    chunks.push(std::mem::take(&mut current));
+                    for (_, opening) in &open_tags {
+                        current.push_str(opening);
+                    }
+                    visible_length = 0;
+                }
+                current.push_str(&piece);
+                visible_length += length;
             }
         }
-
-        if !current_chunk.is_empty() {
-            chunks.push(current_chunk.trim_end().to_string());
+        if !current.is_empty() {
+            chunks.push(current);
         }
-
         chunks
     }
 }
@@ -249,5 +235,67 @@ mod tests {
         assert!(!html.contains("link.example"));
         assert!(html.contains("https[://]example.com"));
         assert!(html.contains("www[.]example.com"));
+    }
+    fn rendered(html: &str) -> String {
+        // Parse fragments independently, so assertions compare delivered text rather than markup.
+        scraper::Html::parse_fragment(html)
+            .root_element()
+            .text()
+            .collect()
+    }
+
+    fn assert_chunks(html: &str, limit: usize) {
+        let chunks = MessageFormatter::split_message_into_chunks(html, limit);
+        let tag = regex::Regex::new(r"</?([a-z]+)[^>]*>").unwrap();
+        for chunk in &chunks {
+            let mut stack = Vec::new();
+            for caps in tag.captures_iter(chunk) {
+                let name = caps.get(1).unwrap().as_str();
+                if caps.get(0).unwrap().as_str().starts_with("</") {
+                    assert_eq!(stack.pop(), Some(name), "unbalanced HTML: {chunk}");
+                } else {
+                    stack.push(name);
+                }
+            }
+            assert!(stack.is_empty(), "unclosed formatting in {chunk}");
+            let visible = rendered(chunk);
+            assert!(MessageFormatter::count_utf16_code_units(&visible) <= limit);
+            assert!(!visible.is_empty(), "empty rendered chunk: {chunk}");
+        }
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| rendered(chunk))
+                .collect::<String>(),
+            rendered(html)
+        );
+    }
+
+    #[test]
+    fn html_chunks_keep_nested_formatting_balanced() {
+        for html in [
+            "<b>abcdefghijklmno</b>",
+            "<b>ab<i>cd efghijkl</i>mn</b>",
+            "<pre><code class=\"language-rust\">let x = 1;\nlet y = 2;</code></pre>",
+        ] {
+            for limit in [5, 10, 16] {
+                assert_chunks(html, limit);
+            }
+        }
+    }
+
+    #[test]
+    fn html_chunks_preserve_entities_unicode_and_line_breaks() {
+        for html in [
+            "1234567&amp;xy",
+            "ab&lt;cd&gt;ef&#x1F600;gh&#128512;ij",
+            "<b>😀😀😀😀</b>",
+            "abcdefghijkl\nZ",
+            "one two\nthree four",
+        ] {
+            for limit in [2, 5, 10] {
+                assert_chunks(html, limit);
+            }
+        }
     }
 }
