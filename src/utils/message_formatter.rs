@@ -28,6 +28,14 @@ impl MessageFormatter {
         let html = anchor_open.replace_all(&html, "").into_owned();
         let html = html.replace("</a>", "");
 
+        // Telegram cannot render images; retain comrak's already-escaped alternative text.
+        let image = Regex::new(r#"<img\b[^>]*\salt="([^"]*)"[^>]*>"#).unwrap();
+        let html = image.replace_all(&html, "$1").into_owned();
+
+        // Ordered lists starting above one include a start attribute.
+        let ordered_list_open = Regex::new(r"<ol\b[^>]*>").unwrap();
+        let html = ordered_list_open.replace_all(&html, "").into_owned();
+
         // defang URL schemes and www so Telegram clients do not auto-linkify bare URLs the
         // model may still emit. covers scheme:// and www. forms (the clickable phishing vectors);
         // a bare domain with no scheme/www is a documented residual.
@@ -60,7 +68,6 @@ impl MessageFormatter {
             // remove list tags and convert to plain text with bullets
             .replace("<ul>", "")
             .replace("</ul>", "\n")
-            .replace("<ol>", "")
             .replace("</ol>", "\n")
             .replace("<li>", "• ")
             .replace("</li>", "\n")
@@ -201,5 +208,46 @@ impl MessageFormatter {
         }
 
         chunks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MessageFormatter;
+
+    #[test]
+    fn ordered_lists_with_start_attributes_render_as_bullets() {
+        let html = MessageFormatter::markdown_to_html_safe("3. First\n4. **Second**");
+        assert!(!html.contains("<ol"));
+        assert!(!html.contains("</ol>"));
+        assert!(html.contains("• First"));
+        assert!(html.contains("• <b>Second</b>"));
+    }
+
+    #[test]
+    fn markdown_images_preserve_escaped_alt_text_without_image_tags() {
+        let html = MessageFormatter::markdown_to_html_safe(
+            "![<tag> & \"quoted\"](https://example.com/image.png \"title\")",
+        );
+        assert!(!html.contains("<img"));
+        assert!(!html.contains("example.com"));
+        assert!(!html.contains("<tag>"));
+        assert_eq!(
+            html_escape::decode_html_entities(&html),
+            "<tag> & \"quoted\""
+        );
+    }
+
+    #[test]
+    fn image_alt_text_keeps_existing_link_defanging() {
+        let html = MessageFormatter::markdown_to_html_safe(
+            "[![https://example.com www.example.com](https://image.example/p.png)](https://link.example)",
+        );
+        assert!(!html.contains("<img"));
+        assert!(!html.contains("<a"));
+        assert!(!html.contains("image.example"));
+        assert!(!html.contains("link.example"));
+        assert!(html.contains("https[://]example.com"));
+        assert!(html.contains("www[.]example.com"));
     }
 }
