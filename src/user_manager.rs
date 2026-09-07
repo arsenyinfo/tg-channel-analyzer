@@ -509,6 +509,34 @@ impl UserManager {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
 
+        // guard against double-completion; no-op if already completed
+        let updated = transaction
+            .execute(
+                "UPDATE user_analyses
+                 SET status = 'completed', credits_used = 1,
+                     result_source = $3, llm_cache_key = $4
+                 WHERE id = $1 AND user_id = $2 AND status = 'pending'",
+                &[&analysis_id, &user_id, &result_source, &llm_cache_key],
+            )
+            .await?;
+
+        if updated == 0 {
+            // No pending analysis was claimed, so this call must not consume credit.
+            transaction.rollback().await?;
+            info!(
+                "Analysis {} already completed, skipping charge for user {}",
+                analysis_id, user_id
+            );
+            let row = client
+                .query_opt(
+                    "SELECT analysis_credits FROM users WHERE id = $1",
+                    &[&user_id],
+                )
+                .await?
+                .ok_or(UserManagerError::UserNotFound(user_id))?;
+            return Ok(row.get(0));
+        }
+
         // consume credit only if user has sufficient credits
         let row = transaction
             .query_opt(
@@ -537,34 +565,6 @@ impl UserManager {
                 };
             }
         };
-
-        // guard against double-completion; no-op if already completed
-        let updated = transaction
-            .execute(
-                "UPDATE user_analyses
-                 SET status = 'completed', credits_used = 1,
-                     result_source = $3, llm_cache_key = $4
-                 WHERE id = $1 AND user_id = $2 AND status = 'pending'",
-                &[&analysis_id, &user_id, &result_source, &llm_cache_key],
-            )
-            .await?;
-
-        if updated == 0 {
-            // analysis already completed (race condition); roll back the credit deduction
-            transaction.rollback().await?;
-            info!(
-                "Analysis {} already completed, skipping charge for user {}",
-                analysis_id, user_id
-            );
-            let row = client
-                .query_opt(
-                    "SELECT analysis_credits FROM users WHERE id = $1",
-                    &[&user_id],
-                )
-                .await?
-                .ok_or(UserManagerError::UserNotFound(user_id))?;
-            return Ok(row.get(0));
-        }
 
         transaction.commit().await?;
 
