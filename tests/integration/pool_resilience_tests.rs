@@ -45,23 +45,20 @@ async fn failed_first_use_can_be_detached_and_replaced() {
         .expect("Failed to create test database");
     let verified_pool = pool(&db);
 
-    let client = verified_pool.get().await.expect("Failed to get client");
-    let terminated_pid = backend_pid(&client).await;
-    drop(client);
+    // Keep the connection checked out while the backend is terminated. Releasing it
+    // first lets normal pool recycling replace it before we can exercise first-use failure.
+    let stale = verified_pool.get().await.expect("Failed to get client");
+    let terminated_pid = backend_pid(&stale).await;
 
     let admin = db.pool.get().await.expect("Failed to get admin client");
     let terminated: bool = admin
-        .query_one("SELECT pg_terminate_backend($1)", &[&terminated_pid])
+        .query_one("SELECT pg_terminate_backend($1, 5000)", &[&terminated_pid])
         .await
         .expect("Failed to terminate pooled backend")
         .get(0);
     assert!(terminated);
     drop(admin);
 
-    let stale = tokio::time::timeout(Duration::from_secs(5), verified_pool.get())
-        .await
-        .expect("Timed out reacquiring terminated connection")
-        .expect("Failed to reacquire terminated connection");
     assert!(
         stale.query_one("SELECT 1", &[]).await.is_err(),
         "first use of a hard-closed Fast-recycled connection should fail"
