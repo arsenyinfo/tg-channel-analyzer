@@ -135,13 +135,16 @@ impl PaymentHandler {
             )
             .await;
 
+        let mut notification_result = Ok(());
         let process_referral = match result {
             Ok(Some(new_balance)) => {
                 let success_msg = lang.payment_success(user.id, credits, new_balance);
 
-                bot.send_message(msg.chat.id, success_msg)
+                notification_result = bot
+                    .send_message(msg.chat.id, success_msg)
                     .parse_mode(ParseMode::Html)
-                    .await?;
+                    .await
+                    .map(|_| ());
 
                 info!(
                     "Successfully processed payment: {} credits for user {}",
@@ -179,7 +182,7 @@ impl PaymentHandler {
             }
         }
 
-        Ok(())
+        notification_result
     }
 
     async fn process_referral_rewards(
