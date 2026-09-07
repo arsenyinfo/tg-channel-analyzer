@@ -138,8 +138,16 @@ impl TelegramWebScraper {
 
         let normalized_url = self.normalize_channel_url(channel_url)?;
 
+        self.scrape_normalized_url(&normalized_url, max_pages).await
+    }
+
+    async fn scrape_normalized_url(
+        &mut self,
+        normalized_url: &str,
+        max_pages: usize,
+    ) -> Result<Vec<MessageDict>, WebScrapingError> {
         // initialize cookies first
-        self.initialize_cookies(&normalized_url).await?;
+        self.initialize_cookies(normalized_url).await?;
 
         let mut all_messages = Vec::new();
         let mut before_id: Option<i64>;
@@ -147,7 +155,7 @@ impl TelegramWebScraper {
         // get initial page
         info!("Fetching initial page: {}", normalized_url);
         let response = self
-            .http_request_with_retry(self.client.get(&normalized_url))
+            .http_request_with_retry(self.client.get(normalized_url))
             .await?;
 
         let html_content = response.text().await?;
@@ -165,16 +173,16 @@ impl TelegramWebScraper {
 
         // fetch additional pages with pagination
         for page in 1..max_pages {
-            if before_id.is_none() {
+            let Some(previous_id) = before_id else {
                 break;
-            }
+            };
 
             // add delay between requests to be polite
             tokio::time::sleep(Duration::from_millis(500)).await;
 
             info!("Fetching page {} with before_id: {:?}", page, before_id);
 
-            let pagination_url = format!("{}?before={}", normalized_url, before_id.unwrap());
+            let pagination_url = format!("{}?before={}", normalized_url, previous_id);
             let mut headers = reqwest::header::HeaderMap::new();
             headers.insert(
                 "Accept",
@@ -226,8 +234,11 @@ impl TelegramWebScraper {
 
             let (mut page_messages, last_id) = self.extract_messages_from_html(&html_content)?;
 
-            if page_messages.is_empty() {
-                info!("No more messages found at page {}", page);
+            // Forwarded posts still advance the raw cursor even when none of this page's
+            // messages are retained. Stop only when there is no progress toward older posts,
+            // before appending a repeated page's messages.
+            if !last_id.is_some_and(|id| id < previous_id) {
+                info!("No older messages found at page {}", page);
                 break;
             }
 
@@ -423,5 +434,113 @@ impl TelegramWebScraper {
         };
 
         Ok((messages, last_message_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn post(id: i64, text: &str, forwarded: bool) -> String {
+        let forwarded = if forwarded {
+            "<div class=\"tgme_widget_message_forwarded_from\">Source</div>"
+        } else {
+            ""
+        };
+        format!(
+            "<div class=\"tgme_widget_message_wrap\"><div data-post=\"channel/{id}\">{forwarded}<div class=\"tgme_widget_message_text\">{text}</div></div></div>"
+        )
+    }
+
+    async fn scrape_pages(pages: Vec<(&str, String)>, max_pages: usize) -> Vec<MessageDict> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/s/channel/", listener.local_addr().unwrap());
+        let pages: Vec<_> = pages
+            .into_iter()
+            .map(|(request, body)| (request.to_string(), body))
+            .collect();
+        let server = tokio::spawn(async move {
+            for (expected_request, body) in pages {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 1024];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "request ended before its headers");
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    String::from_utf8_lossy(&request).lines().next().unwrap(),
+                    expected_request
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut scraper = TelegramWebScraper {
+            client: Client::builder().no_proxy().build().unwrap(),
+            cookies_initialized: true,
+        };
+        let (messages, served) = timeout(Duration::from_secs(10), async {
+            tokio::join!(scraper.scrape_normalized_url(&url, max_pages), server)
+        })
+        .await
+        .expect("scraping fixture timed out");
+        served.unwrap();
+        messages.unwrap()
+    }
+
+    #[tokio::test]
+    async fn pagination_continues_past_forwarded_only_pages() {
+        let messages = scrape_pages(
+            vec![
+                ("GET /s/channel/ HTTP/1.1", post(30, "Newest", false)),
+                (
+                    "POST /s/channel/?before=30 HTTP/1.1",
+                    serde_json::to_string(&post(20, "Forwarded", true)).unwrap(),
+                ),
+                (
+                    "POST /s/channel/?before=20 HTTP/1.1",
+                    serde_json::to_string(&post(10, "Oldest", false)).unwrap(),
+                ),
+            ],
+            3,
+        )
+        .await;
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("Newest"), Some("Oldest")]
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_stops_without_an_older_cursor() {
+        for page in [
+            String::new(),
+            post(30, "Repeated", false),
+            post(31, "Newer", false),
+        ] {
+            let messages = scrape_pages(
+                vec![
+                    ("GET /s/channel/ HTTP/1.1", post(30, "Newest", false)),
+                    ("POST /s/channel/?before=30 HTTP/1.1", page),
+                ],
+                3,
+            )
+            .await;
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].message.as_deref(), Some("Newest"));
+        }
     }
 }
