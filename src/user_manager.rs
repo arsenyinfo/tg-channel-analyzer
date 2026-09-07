@@ -556,7 +556,6 @@ impl UserManager {
                 "Analysis {} already completed, skipping charge for user {}",
                 analysis_id, user_id
             );
-            let client = self.pool.get().await?;
             let row = client
                 .query_opt(
                     "SELECT analysis_credits FROM users WHERE id = $1",
