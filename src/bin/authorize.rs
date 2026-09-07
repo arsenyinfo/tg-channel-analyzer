@@ -44,6 +44,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(&sessions_dir)?;
     }
 
+    // ensure session file exists to prevent save_to_file failures on some systems
+    if !session_path.exists() {
+        fs::write(&session_path, [])?;
+    }
+
     // try to load existing session first
     let session = match Session::load_file(session_path.to_str().unwrap()) {
         Ok(session) => {

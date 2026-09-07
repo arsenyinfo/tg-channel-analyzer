@@ -6,6 +6,10 @@ pub async fn query_and_parse_analysis(
     prompt: &str,
     context: &LlmRunContext,
 ) -> Result<AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
+    // Ensure GEMINI_API_KEY is set to prevent gemini-rs panic on client creation
+    std::env::var("GEMINI_API_KEY")
+        .map_err(|_| "GEMINI_API_KEY environment variable is required")?;
+
     // retries the API call for one model; parses each response once (extract_tag is
     // deterministic, so re-parsing the same response can never help)
     async fn try_model(
