@@ -7,6 +7,106 @@ use super::{
 };
 
 #[tokio::test]
+async fn concurrent_registration_returns_one_user_and_awards_one_referral() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let db = TestDatabase::create_fresh().await.unwrap();
+    let manager = Arc::new(UserManager::new(db.pool.clone()));
+    let (referrer, _) = manager
+        .get_or_create_user(81_001, None, None, None, None, Some("en"))
+        .await
+        .unwrap();
+
+    let mut blocking_client = db.pool.get().await.unwrap();
+    let transaction = blocking_client.transaction().await.unwrap();
+    transaction
+        .batch_execute("LOCK TABLE users IN SHARE MODE")
+        .await
+        .unwrap();
+
+    let register = || {
+        let manager = manager.clone();
+        let referrer_id = referrer.id;
+        tokio::spawn(async move {
+            manager
+                .get_or_create_user(
+                    81_002,
+                    Some("referee"),
+                    Some("Referee"),
+                    None,
+                    Some(referrer_id),
+                    Some("en"),
+                )
+                .await
+        })
+    };
+    let first = register();
+    let second = register();
+    let observer = db.pool.get().await.unwrap();
+    // Both callers must be blocked before releasing the INSERT barrier. Without
+    // serialization, this ensures both lookups have already missed the new user.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let blocked: i64 = observer
+                .query_one(
+                    "SELECT COUNT(*) FROM pg_stat_activity
+                     WHERE datname = current_database() AND wait_event_type = 'Lock'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if blocked == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both registration calls must reach the lock barrier");
+    transaction.commit().await.unwrap();
+    drop(blocking_client);
+
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("registration calls must finish after releasing the barrier");
+    let (first_user, first_reward) = first.unwrap().expect("first registration failed");
+    let (second_user, second_reward) = second.unwrap().expect("second registration failed");
+    assert_eq!(first_user.id, second_user.id);
+    assert_eq!(first_user.referred_by_user_id, Some(referrer.id));
+    assert_eq!(second_user.referred_by_user_id, Some(referrer.id));
+    assert_eq!(first_user.analysis_credits, 1);
+    assert_eq!(second_user.analysis_credits, 1);
+    assert_eq!(
+        usize::from(first_reward.is_some()) + usize::from(second_reward.is_some()),
+        1
+    );
+    let user_count: i64 = observer
+        .query_one(
+            "SELECT COUNT(*) FROM users WHERE telegram_user_id = 81002",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(user_count, 1);
+    drop(observer);
+    TestAssertions::assert_user_referral_count(&db, referrer.id, 1)
+        .await
+        .unwrap();
+    TestAssertions::assert_user_credit_count(&db, referrer.id, 2)
+        .await
+        .unwrap();
+    TestAssertions::assert_referral_reward_count(&db, referrer.id, "unpaid_milestone", 1)
+        .await
+        .unwrap();
+    db.cleanup().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_basic_referral_chain() {
     let db = TestDatabase::create_fresh()
         .await
