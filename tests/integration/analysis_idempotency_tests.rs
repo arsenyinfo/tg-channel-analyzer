@@ -72,6 +72,13 @@ async fn duplicate_callback_query_creates_only_one_analysis() {
         .await
         .expect("Failed to complete claimed analysis");
     assert_eq!(remaining_credits, 0);
+    assert_eq!(
+        user_manager
+            .atomic_complete_analysis(analysis_id, user.id, "generated", Some("test-cache-key"))
+            .await
+            .expect("Completing an already charged analysis must succeed at zero balance"),
+        0
+    );
 
     let late_duplicate = user_manager
         .create_pending_analysis(
@@ -96,6 +103,28 @@ async fn duplicate_callback_query_creates_only_one_analysis() {
         .await
         .expect("Later analysis claim failed")
         .expect("A new analysis must be allowed after the prior one completes");
+    assert!(matches!(
+        user_manager
+            .atomic_complete_analysis(later_request, user.id, "generated", None)
+            .await,
+        Err(tg_main::user_manager::UserManagerError::InsufficientCredits(_))
+    ));
+    let pending_status: String = db
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT status FROM user_analyses WHERE id = $1",
+            &[&later_request],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        pending_status, "pending",
+        "failed charge must roll back the status transition"
+    );
     user_manager
         .mark_analysis_failed(later_request)
         .await

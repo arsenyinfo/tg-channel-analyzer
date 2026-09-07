@@ -160,9 +160,19 @@ impl UserManager {
         language_code: Option<&str>,
     ) -> Result<(User, Option<ReferralRewardInfo>), Box<dyn Error + Send + Sync>> {
         let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+        // Serialize first-time registration before checking existence, so concurrent
+        // requests return the same user and process its referral exactly once. The
+        // prefix separates these lock keys from campaign keys and fixed worker locks.
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended('user-registration:' || $1::BIGINT::TEXT, 0))",
+                &[&telegram_user_id],
+            )
+            .await?;
 
         // try to get existing user first
-        if let Some(row) = client
+        if let Some(row) = transaction
             .query_opt(
                 "SELECT id, telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language 
                  FROM users WHERE telegram_user_id = $1",
@@ -170,6 +180,8 @@ impl UserManager {
             )
             .await?
         {
+            // Language updates remain best-effort outside the registration transaction.
+            transaction.commit().await?;
             let mut user = User {
                 id: row.get(0),
                 telegram_user_id: row.get(1),
@@ -209,8 +221,6 @@ impl UserManager {
         // create new user and process any referral atomically in one transaction,
         // so a referral-processing failure rolls back the user insert rather than
         // leaving referred_by_user_id set with no referrer increment
-        let transaction = client.transaction().await?;
-
         let row = transaction
             .query_one(
                 "INSERT INTO users (telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language)
@@ -509,6 +519,34 @@ impl UserManager {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
 
+        // guard against double-completion; no-op if already completed
+        let updated = transaction
+            .execute(
+                "UPDATE user_analyses
+                 SET status = 'completed', credits_used = 1,
+                     result_source = $3, llm_cache_key = $4
+                 WHERE id = $1 AND user_id = $2 AND status = 'pending'",
+                &[&analysis_id, &user_id, &result_source, &llm_cache_key],
+            )
+            .await?;
+
+        if updated == 0 {
+            // No pending analysis was claimed, so this call must not consume credit.
+            transaction.rollback().await?;
+            info!(
+                "Analysis {} already completed, skipping charge for user {}",
+                analysis_id, user_id
+            );
+            let row = client
+                .query_opt(
+                    "SELECT analysis_credits FROM users WHERE id = $1",
+                    &[&user_id],
+                )
+                .await?
+                .ok_or(UserManagerError::UserNotFound(user_id))?;
+            return Ok(row.get(0));
+        }
+
         // consume credit only if user has sufficient credits
         let row = transaction
             .query_opt(
@@ -537,35 +575,6 @@ impl UserManager {
                 };
             }
         };
-
-        // guard against double-completion; no-op if already completed
-        let updated = transaction
-            .execute(
-                "UPDATE user_analyses
-                 SET status = 'completed', credits_used = 1,
-                     result_source = $3, llm_cache_key = $4
-                 WHERE id = $1 AND user_id = $2 AND status = 'pending'",
-                &[&analysis_id, &user_id, &result_source, &llm_cache_key],
-            )
-            .await?;
-
-        if updated == 0 {
-            // analysis already completed (race condition); roll back the credit deduction
-            transaction.rollback().await?;
-            info!(
-                "Analysis {} already completed, skipping charge for user {}",
-                analysis_id, user_id
-            );
-            let client = self.pool.get().await?;
-            let row = client
-                .query_opt(
-                    "SELECT analysis_credits FROM users WHERE id = $1",
-                    &[&user_id],
-                )
-                .await?
-                .ok_or(UserManagerError::UserNotFound(user_id))?;
-            return Ok(row.get(0));
-        }
 
         transaction.commit().await?;
 
