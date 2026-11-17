@@ -227,7 +227,16 @@ pub struct AnalysisResult {
     pub professional: Option<String>,
     pub personal: Option<String>,
     pub roast: Option<String>,
+    #[serde(default)]
+    pub quotes: AnalysisQuotes,
     pub messages_count: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AnalysisQuotes {
+    pub professional: Option<String>,
+    pub personal: Option<String>,
+    pub roast: Option<String>,
 }
 
 #[cfg(test)]
@@ -256,6 +265,19 @@ mod tests {
             current,
             CacheManager::get_llm_cache_key(&messages, "analysis", "v2", "gemini-3.7-flash",)
         );
+    }
+
+    #[test]
+    fn cached_analyses_without_quotes_are_still_readable() {
+        let result: AnalysisResult = serde_json::from_value(serde_json::json!({
+            "professional": "existing analysis",
+            "personal": null,
+            "roast": null,
+            "messages_count": 42
+        }))
+        .unwrap();
+        assert_eq!(result.professional.as_deref(), Some("existing analysis"));
+        assert!(result.quotes.professional.is_none());
     }
 
     #[test]

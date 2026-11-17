@@ -1,8 +1,53 @@
-use crate::cache::AnalysisResult;
+use crate::cache::{AnalysisQuotes, AnalysisResult};
 use crate::llm::{extract_tag, query_llm_with_context, LlmRunContext, ANALYSIS_MODEL};
 use log::{error, info, warn};
 
 const FALLBACK_MODEL: &str = "gemini-3.8-flash";
+
+fn section_quote(response: &str, section: &str, body: Option<&str>) -> Option<String> {
+    let body = body?;
+    extract_tag(response, &format!("{section}_quote")).filter(|quote| {
+        quote.chars().count() <= 180 && !quote.contains(['\n', '\r']) && body.contains(quote)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::section_quote;
+
+    #[test]
+    fn quotes_must_be_short_verbatim_excerpts_from_the_matching_section() {
+        let response = "<professional_quote>Сначала проверить гипотезу.</professional_quote>\n\
+                        <personal_quote>Он любит экспериментировать.</personal_quote>";
+        assert_eq!(
+            section_quote(
+                response,
+                "professional",
+                Some("Сначала проверить гипотезу. Затем измерить результат.")
+            )
+            .as_deref(),
+            Some("Сначала проверить гипотезу.")
+        );
+        assert_eq!(
+            section_quote(response, "personal", Some("Он много читает.")),
+            None
+        );
+        assert_eq!(
+            section_quote(response, "roast", Some("Текст роаста.")),
+            None
+        );
+
+        let overlong = "я".repeat(181);
+        assert_eq!(
+            section_quote(
+                &format!("<roast_quote>{overlong}</roast_quote>"),
+                "roast",
+                Some(&overlong)
+            ),
+            None
+        );
+    }
+}
 
 pub async fn query_and_parse_analysis(
     prompt: &str,
@@ -53,6 +98,19 @@ pub async fn query_and_parse_analysis(
                             response_attempt + 1
                         );
                         return Ok(AnalysisResult {
+                            quotes: AnalysisQuotes {
+                                professional: section_quote(
+                                    &response.content,
+                                    "professional",
+                                    professional.as_deref(),
+                                ),
+                                personal: section_quote(
+                                    &response.content,
+                                    "personal",
+                                    personal.as_deref(),
+                                ),
+                                roast: section_quote(&response.content, "roast", roast.as_deref()),
+                            },
                             professional,
                             personal,
                             roast,

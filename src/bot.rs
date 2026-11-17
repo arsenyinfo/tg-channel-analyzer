@@ -7,7 +7,10 @@ use std::sync::{
     Arc,
 };
 use teloxide::prelude::*;
-use teloxide::types::{CallbackQuery, ChatId, ParseMode, PreCheckoutQuery, SuccessfulPayment};
+use teloxide::types::{
+    CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, PreCheckoutQuery,
+    SuccessfulPayment,
+};
 use teloxide::utils::command::BotCommands;
 use teloxide::{ApiError, RequestError};
 use tokio::sync::Mutex;
@@ -1212,27 +1215,31 @@ impl TelegramBot {
         user_id: i32,
         lang: Lang,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let analysis_content = match analysis_type {
-            "professional" => &result.professional,
-            "personal" => &result.personal,
-            "roast" => &result.roast,
-            _ => &None,
+        let (analysis_content, quote) = match analysis_type {
+            "professional" => (result.professional, result.quotes.professional),
+            "personal" => (result.personal, result.quotes.personal),
+            "roast" => (result.roast, result.quotes.roast),
+            _ => (None, None),
         };
 
         match analysis_content {
             Some(content) if !content.is_empty() => {
                 // convert LLM markdown content to HTML first
-                let html_content = MessageFormatter::markdown_to_html_safe(content);
+                let html_content = MessageFormatter::markdown_to_html_safe(&content);
 
                 // prepare header template that will be added to each part
                 let header = lang
                     .analysis_result_header(&MessageFormatter::escape_html(channel_name), user_id);
                 let analysis_header = lang.analysis_type_header(analysis_type);
+                let quote_header = quote.as_deref().map_or_else(String::new, |quote| {
+                    format!("<b>{}</b>\n\n", MessageFormatter::escape_html(quote))
+                });
 
                 // calculate available space for content after headers (using UTF-16 code units as Telegram does)
                 const MAX_MESSAGE_LENGTH: usize = 3584;
                 let headers_length = MessageFormatter::count_utf16_code_units(&header)
-                    + MessageFormatter::count_utf16_code_units(&analysis_header);
+                    + MessageFormatter::count_utf16_code_units(&analysis_header)
+                    + MessageFormatter::count_utf16_code_units(&quote_header);
                 let available_content_length =
                     MAX_MESSAGE_LENGTH.saturating_sub(headers_length + 100); // buffer for part indicators
 
@@ -1243,21 +1250,31 @@ impl TelegramBot {
                 );
 
                 for (i, chunk) in content_chunks.iter().enumerate() {
-                    let full_message = if content_chunks.len() > 1 {
-                        format!(
-                            "{}{}{}{}",
-                            header,
-                            analysis_header,
-                            chunk,
-                            lang.analysis_part_indicator(i + 1, content_chunks.len())
-                        )
-                    } else {
-                        format!("{}{}{}", header, analysis_header, chunk)
-                    };
+                    let lead = if i == 0 { quote_header.as_str() } else { "" };
+                    let mut full_message = format!("{header}{analysis_header}{lead}{chunk}");
+                    if content_chunks.len() > 1 {
+                        full_message
+                            .push_str(&lang.analysis_part_indicator(i + 1, content_chunks.len()));
+                    }
 
-                    bot.send_message(user_chat_id, full_message)
-                        .parse_mode(ParseMode::Html)
-                        .await?;
+                    let mut request = bot
+                        .send_message(user_chat_id, full_message)
+                        .parse_mode(ParseMode::Html);
+                    if i == 0 {
+                        if let Some(quote) = quote.as_deref() {
+                            let referral_url =
+                                format!("https://t.me/ScratchAuthorEgoBot?start={user_id}");
+                            let mut share_url = reqwest::Url::parse("https://t.me/share/url")?;
+                            share_url
+                                .query_pairs_mut()
+                                .append_pair("url", &referral_url)
+                                .append_pair("text", &format!("{channel_name}\n{quote}"));
+                            request = request.reply_markup(InlineKeyboardMarkup::new([[
+                                InlineKeyboardButton::url(lang.share_analysis_button(), share_url),
+                            ]]));
+                        }
+                    }
+                    request.await?;
                 }
 
                 info!(

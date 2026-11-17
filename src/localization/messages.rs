@@ -726,6 +726,13 @@ impl Lang {
         }
     }
 
+    pub fn share_analysis_button(&self) -> &'static str {
+        match self {
+            Lang::En => "Share",
+            Lang::Ru => "Поделиться",
+        }
+    }
+
     pub fn analysis_part_indicator(&self, part: usize, total: usize) -> String {
         match self {
             Lang::En => format!("\n\n<i>📄 Part {} of {}</i>", part, total),
