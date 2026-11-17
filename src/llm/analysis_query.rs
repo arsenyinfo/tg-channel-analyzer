@@ -2,6 +2,8 @@ use crate::cache::AnalysisResult;
 use crate::llm::{extract_tag, query_llm_with_context, LlmRunContext, ANALYSIS_MODEL};
 use log::{error, info, warn};
 
+const FALLBACK_MODEL: &str = "gemini-3.8-flash";
+
 pub async fn query_and_parse_analysis(
     prompt: &str,
     context: &LlmRunContext,
@@ -103,9 +105,8 @@ pub async fn query_and_parse_analysis(
         }
     }
 
-    // try gemini-2.5-flash as fallback (much cheaper than pro)
-    info!("Falling back to gemini-2.5-flash");
-    match try_model(prompt, "gemini-2.5-flash", "fallback", 2, context).await {
+    info!("Falling back to {FALLBACK_MODEL}");
+    match try_model(prompt, FALLBACK_MODEL, "fallback", 2, context).await {
         Ok(result) => Ok(result),
         Err(e) => {
             error!("Gemini Flash fallback also failed: {}", e);

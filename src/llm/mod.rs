@@ -7,7 +7,7 @@ use regex::Regex;
 use reqwest::Client;
 use rig_core::client::CompletionClient;
 use rig_core::completion::{AssistantContent, CompletionError, CompletionModel};
-use rig_core::providers::gemini;
+use rig_core::providers::{gemini, openai};
 use serde_json::json;
 use std::io::Cursor;
 use std::sync::{Arc, OnceLock};
@@ -56,7 +56,7 @@ pub fn get_gemini_rate_limiter() -> &'static GeminiRateLimiter {
 pub const MAX_RETRIES: u32 = 3;
 pub const BASE_DELAY_MS: u64 = 1000;
 pub const GEMINI_TIMEOUT_SECS: u64 = 300;
-pub const ANALYSIS_MODEL: &str = "gemini-3.8-flash";
+pub const ANALYSIS_MODEL: &str = "gpt-6.1-terra";
 pub const GEMINI_FLASH_LITE_MODEL: &str = "gemini-2.5-flash-lite";
 
 #[derive(Debug)]
@@ -90,6 +90,7 @@ impl LlmRunContext {
     async fn start_attempt(
         &self,
         attempt_key: &str,
+        provider: &str,
         model: &str,
         model_stage: &str,
         response_round: u32,
@@ -102,13 +103,14 @@ impl LlmRunContext {
                     (attempt_key, generation_key, user_analysis_id, operation, provider,
                      model, model_stage, response_round, transport_round, status,
                      billing_certainty)
-                 VALUES ($1, $2, $3, $4, 'gemini', $5, $6, $7, $8, 'started', 'unknown')
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'started', 'unknown')
                  ON CONFLICT (attempt_key) DO NOTHING",
                 &[
                     &attempt_key,
                     &self.generation_key,
                     &self.user_analysis_id,
                     &self.operation,
+                    &provider,
                     &model,
                     &model_stage,
                     &i32::try_from(response_round).unwrap_or(i32::MAX),
@@ -126,16 +128,14 @@ impl LlmRunContext {
         certainty: &str,
         http_status: Option<i32>,
         error_class: Option<&str>,
-        response: Option<&RigGeminiResponse>,
+        response: Option<ResponseUsage<'_>>,
     ) {
         let Ok(client) = self.pool.get().await else {
             error!("Could not acquire DB connection to finish LLM usage attempt");
             return;
         };
-        let usage = response.and_then(|item| item.raw_response.usage_metadata.as_ref());
-        let usage_json = usage.and_then(|item| serde_json::to_value(item).ok());
-        let provider_response_id = response.map(|item| item.raw_response.response_id.as_str());
-        let model_version = response.and_then(|item| item.raw_response.model_version.as_deref());
+        let provider_response_id = response.as_ref().map(|item| item.response_id);
+        let model_version = response.as_ref().and_then(|item| item.model_version);
         let (
             prompt_tokens,
             cached_tokens,
@@ -143,7 +143,11 @@ impl LlmRunContext {
             thought_tokens,
             tool_tokens,
             total_tokens,
-        ) = usage_columns(usage);
+        ) = response
+            .as_ref()
+            .map(|item| item.tokens)
+            .unwrap_or_default();
+        let usage_json = response.and_then(|item| item.raw);
         if let Err(error) = client
             .execute(
                 "UPDATE llm_attempts SET status = $2, billing_certainty = $3,
@@ -194,9 +198,53 @@ impl LlmRunContext {
     }
 }
 
-type RigGeminiResponse = rig_core::completion::CompletionResponse<
-    rig_core::providers::gemini::completion::gemini_api_types::GenerateContentResponse,
->;
+struct ResponseUsage<'a> {
+    response_id: &'a str,
+    model_version: Option<&'a str>,
+    tokens: UsageColumns,
+    raw: Option<serde_json::Value>,
+}
+
+fn gemini_usage(
+    response: &gemini::completion::gemini_api_types::GenerateContentResponse,
+) -> ResponseUsage<'_> {
+    let usage = response.usage_metadata.as_ref();
+    ResponseUsage {
+        response_id: &response.response_id,
+        model_version: response.model_version.as_deref(),
+        tokens: usage_columns(usage),
+        raw: usage.and_then(|usage| serde_json::to_value(usage).ok()),
+    }
+}
+
+fn openai_usage(response: &openai::responses_api::CompletionResponse) -> ResponseUsage<'_> {
+    let usage = response.usage.as_ref();
+    let tokens = usage.map(|usage| {
+        let count = |value| i64::try_from(value).ok();
+        let cached = usage
+            .input_tokens_details
+            .as_ref()
+            .map(|details| details.cached_tokens);
+        let reasoning = usage
+            .output_tokens_details
+            .as_ref()
+            .map(|details| details.reasoning_tokens);
+        (
+            count(usage.input_tokens),
+            cached.and_then(count),
+            count(usage.output_tokens.saturating_sub(reasoning.unwrap_or(0))),
+            reasoning.and_then(count),
+            None,
+            count(usage.total_tokens),
+        )
+    });
+    ResponseUsage {
+        response_id: &response.id,
+        model_version: Some(&response.model),
+        tokens: tokens.unwrap_or_default(),
+        raw: usage.and_then(|usage| serde_json::to_value(usage).ok()),
+    }
+}
 
 type UsageColumns = (
     Option<i64>,
@@ -240,24 +288,71 @@ pub async fn query_llm_with_context(
 ) -> Result<LLMResponse, Box<dyn std::error::Error + Send + Sync>> {
     info!("Querying LLM with model: {}", model);
 
+    if model == ANALYSIS_MODEL {
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .map_err(|_| "OPENAI_API_KEY environment variable not set")?;
+        let client = openai::Client::new(&api_key)?;
+        return query_completion(
+            &client.completion_model(model),
+            prompt,
+            model,
+            "openai",
+            context,
+            model_stage,
+            response_round,
+            openai_usage,
+        )
+        .await;
+    }
+
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|_| "GEMINI_API_KEY environment variable not set")?;
     let client = gemini::Client::new(&api_key)?;
-    let completion_model = client.completion_model(model);
+    query_completion(
+        &client.completion_model(model),
+        prompt,
+        model,
+        "gemini",
+        context,
+        model_stage,
+        response_round,
+        gemini_usage,
+    )
+    .await
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn query_completion<M: CompletionModel>(
+    completion_model: &M,
+    prompt: &str,
+    model: &str,
+    provider: &str,
+    context: Option<&LlmRunContext>,
+    model_stage: &str,
+    response_round: u32,
+    response_usage: fn(&M::Response) -> ResponseUsage<'_>,
+) -> Result<LLMResponse, Box<dyn std::error::Error + Send + Sync>> {
     for attempt in 0..=MAX_RETRIES {
-        get_gemini_rate_limiter().wait_for_api_call().await;
+        let mut request = completion_model.completion_request(prompt);
+        if provider == "gemini" {
+            get_gemini_rate_limiter().wait_for_api_call().await;
+        } else {
+            request = request.additional_params(json!({"store": false}));
+        }
         let attempt_key = format!("{:032x}", rand::random::<u128>());
         if let Some(context) = context {
             context
-                .start_attempt(&attempt_key, model, model_stage, response_round, attempt)
+                .start_attempt(
+                    &attempt_key,
+                    provider,
+                    model,
+                    model_stage,
+                    response_round,
+                    attempt,
+                )
                 .await?;
         }
-        let response = match timeout(
-            Duration::from_secs(GEMINI_TIMEOUT_SECS),
-            completion_model.completion_request(prompt).send(),
-        )
-        .await
+        let response = match timeout(Duration::from_secs(GEMINI_TIMEOUT_SECS), request.send()).await
         {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
@@ -299,12 +394,12 @@ pub async fn query_llm_with_context(
                         .await;
                 }
                 if !retryable {
-                    error!("Gemini API request failed permanently: {}", e);
+                    error!("{provider} API request failed permanently: {}", e);
                     return Err(e.into());
                 }
                 if attempt == MAX_RETRIES {
                     error!(
-                        "Failed to get response from Gemini API after {} attempts: {:?}",
+                        "Failed to get response from {provider} API after {} attempts: {:?}",
                         MAX_RETRIES + 1,
                         e
                     );
@@ -313,7 +408,7 @@ pub async fn query_llm_with_context(
 
                 let delay = calculate_delay(attempt);
                 warn!(
-                    "Gemini API call failed (attempt {}/{}): {:?}. Retrying in {}ms",
+                    "{provider} API call failed (attempt {}/{}): {:?}. Retrying in {}ms",
                     attempt + 1,
                     MAX_RETRIES + 1,
                     e,
@@ -337,16 +432,16 @@ pub async fn query_llm_with_context(
                 }
                 if attempt == MAX_RETRIES {
                     error!(
-                        "Gemini API call timed out after {} attempts ({}s timeout)",
+                        "{provider} API call timed out after {} attempts ({}s timeout)",
                         MAX_RETRIES + 1,
                         GEMINI_TIMEOUT_SECS
                     );
-                    return Err("Gemini API call timed out".into());
+                    return Err(format!("{provider} API call timed out").into());
                 }
 
                 let delay = calculate_delay(attempt);
                 warn!(
-                    "Gemini API call timed out (attempt {}/{}): {}s timeout. Retrying in {}ms",
+                    "{provider} API call timed out (attempt {}/{}): {}s timeout. Retrying in {}ms",
                     attempt + 1,
                     MAX_RETRIES + 1,
                     GEMINI_TIMEOUT_SECS,
@@ -373,12 +468,12 @@ pub async fn query_llm_with_context(
                     "known",
                     Some(200),
                     None,
-                    Some(&response),
+                    Some(response_usage(&response.raw_response)),
                 )
                 .await;
         }
         if content.is_empty() {
-            return Err("Gemini response did not contain visible text".into());
+            return Err(format!("{provider} response did not contain visible text").into());
         }
 
         info!(
