@@ -5,6 +5,9 @@ use image::{GenericImageView, ImageFormat};
 use log::{error, info, warn};
 use regex::Regex;
 use reqwest::Client;
+use rig_core::client::CompletionClient;
+use rig_core::completion::{AssistantContent, CompletionError, CompletionModel};
+use rig_core::providers::{gemini, openai};
 use serde_json::json;
 use std::io::Cursor;
 use std::sync::{Arc, OnceLock};
@@ -53,10 +56,217 @@ pub fn get_gemini_rate_limiter() -> &'static GeminiRateLimiter {
 pub const MAX_RETRIES: u32 = 3;
 pub const BASE_DELAY_MS: u64 = 1000;
 pub const GEMINI_TIMEOUT_SECS: u64 = 300;
+pub const ANALYSIS_MODEL: &str = "gpt-6.1-terra";
+pub const GEMINI_FLASH_LITE_MODEL: &str = "gemini-2.5-flash-lite";
 
 #[derive(Debug)]
 pub struct LLMResponse {
     pub content: String,
+    pub attempt_key: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct LlmRunContext {
+    pool: Arc<deadpool_postgres::Pool>,
+    pub generation_key: String,
+    pub operation: &'static str,
+    pub user_analysis_id: Option<i32>,
+}
+
+impl LlmRunContext {
+    pub fn new(
+        pool: Arc<deadpool_postgres::Pool>,
+        operation: &'static str,
+        user_analysis_id: Option<i32>,
+    ) -> Self {
+        Self {
+            pool,
+            generation_key: format!("{:032x}", rand::random::<u128>()),
+            operation,
+            user_analysis_id,
+        }
+    }
+
+    async fn start_attempt(
+        &self,
+        attempt_key: &str,
+        provider: &str,
+        model: &str,
+        model_stage: &str,
+        response_round: u32,
+        transport_round: u32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO llm_attempts
+                    (attempt_key, generation_key, user_analysis_id, operation, provider,
+                     model, model_stage, response_round, transport_round, status,
+                     billing_certainty)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'started', 'unknown')
+                 ON CONFLICT (attempt_key) DO NOTHING",
+                &[
+                    &attempt_key,
+                    &self.generation_key,
+                    &self.user_analysis_id,
+                    &self.operation,
+                    &provider,
+                    &model,
+                    &model_stage,
+                    &i32::try_from(response_round).unwrap_or(i32::MAX),
+                    &i32::try_from(transport_round).unwrap_or(i32::MAX),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn finish_attempt(
+        &self,
+        attempt_key: &str,
+        status: &str,
+        certainty: &str,
+        http_status: Option<i32>,
+        error_class: Option<&str>,
+        response: Option<ResponseUsage<'_>>,
+    ) {
+        let Ok(client) = self.pool.get().await else {
+            error!("Could not acquire DB connection to finish LLM usage attempt");
+            return;
+        };
+        let provider_response_id = response.as_ref().map(|item| item.response_id);
+        let model_version = response.as_ref().and_then(|item| item.model_version);
+        let (
+            prompt_tokens,
+            cached_tokens,
+            candidate_tokens,
+            thought_tokens,
+            tool_tokens,
+            total_tokens,
+        ) = response
+            .as_ref()
+            .map(|item| item.tokens)
+            .unwrap_or_default();
+        let usage_json = response.and_then(|item| item.raw);
+        if let Err(error) = client
+            .execute(
+                "UPDATE llm_attempts SET status = $2, billing_certainty = $3,
+                    http_status = $4, error_class = $5, provider_response_id = $6,
+                    model_version = $7, prompt_tokens = $8, cached_content_tokens = $9,
+                    candidate_tokens = $10, thought_tokens = $11, tool_prompt_tokens = $12,
+                    total_tokens = $13, usage_metadata = $14, finished_at = NOW()
+                 WHERE attempt_key = $1",
+                &[
+                    &attempt_key,
+                    &status,
+                    &certainty,
+                    &http_status,
+                    &error_class,
+                    &provider_response_id,
+                    &model_version,
+                    &prompt_tokens,
+                    &cached_tokens,
+                    &candidate_tokens,
+                    &thought_tokens,
+                    &tool_tokens,
+                    &total_tokens,
+                    &usage_json,
+                ],
+            )
+            .await
+        {
+            error!("Could not persist LLM attempt result: {error}");
+        }
+    }
+
+    pub async fn mark_consumer_outcome(&self, attempt_key: Option<&str>, outcome: &str) {
+        let Some(attempt_key) = attempt_key else {
+            return;
+        };
+        let Ok(client) = self.pool.get().await else {
+            return;
+        };
+        if let Err(error) = client
+            .execute(
+                "UPDATE llm_attempts SET consumer_outcome = $2 WHERE attempt_key = $1",
+                &[&attempt_key, &outcome],
+            )
+            .await
+        {
+            error!("Could not persist LLM consumer outcome: {error}");
+        }
+    }
+}
+
+struct ResponseUsage<'a> {
+    response_id: &'a str,
+    model_version: Option<&'a str>,
+    tokens: UsageColumns,
+    raw: Option<serde_json::Value>,
+}
+
+fn gemini_usage(
+    response: &gemini::completion::gemini_api_types::GenerateContentResponse,
+) -> ResponseUsage<'_> {
+    let usage = response.usage_metadata.as_ref();
+    ResponseUsage {
+        response_id: &response.response_id,
+        model_version: response.model_version.as_deref(),
+        tokens: usage_columns(usage),
+        raw: usage.and_then(|usage| serde_json::to_value(usage).ok()),
+    }
+}
+
+fn openai_usage(response: &openai::responses_api::CompletionResponse) -> ResponseUsage<'_> {
+    let usage = response.usage.as_ref();
+    let tokens = usage.map(|usage| {
+        let count = |value| i64::try_from(value).ok();
+        let cached = usage
+            .input_tokens_details
+            .as_ref()
+            .map(|details| details.cached_tokens);
+        let reasoning = usage
+            .output_tokens_details
+            .as_ref()
+            .map(|details| details.reasoning_tokens);
+        (
+            count(usage.input_tokens),
+            cached.and_then(count),
+            count(usage.output_tokens.saturating_sub(reasoning.unwrap_or(0))),
+            reasoning.and_then(count),
+            None,
+            count(usage.total_tokens),
+        )
+    });
+    ResponseUsage {
+        response_id: &response.id,
+        model_version: Some(&response.model),
+        tokens: tokens.unwrap_or_default(),
+        raw: usage.and_then(|usage| serde_json::to_value(usage).ok()),
+    }
+}
+
+type UsageColumns = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn usage_columns(
+    usage: Option<&rig_core::providers::gemini::completion::gemini_api_types::UsageMetadata>,
+) -> UsageColumns {
+    let value = |value: Option<i32>| value.map(i64::from);
+    (
+        usage.map(|item| i64::from(item.prompt_token_count)),
+        value(usage.and_then(|item| item.cached_content_token_count)),
+        value(usage.and_then(|item| item.candidates_token_count)),
+        value(usage.and_then(|item| item.thoughts_token_count)),
+        value(usage.and_then(|item| item.tool_use_prompt_token_count)),
+        usage.map(|item| i64::from(item.total_token_count)),
+    )
 }
 
 pub fn extract_tag(text: &str, tag: &str) -> Option<String> {
@@ -64,30 +274,132 @@ pub fn extract_tag(text: &str, tag: &str) -> Option<String> {
     let re = Regex::new(&pattern).ok()?;
     re.captures(text)
         .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().trim().to_string())
+        .map(|m| m.as_str().trim())
+        .filter(|content| !content.is_empty())
+        .map(str::to_string)
 }
 
-pub async fn query_llm(
+pub async fn query_llm_with_context(
     prompt: &str,
     model: &str,
+    context: Option<&LlmRunContext>,
+    model_stage: &str,
+    response_round: u32,
 ) -> Result<LLMResponse, Box<dyn std::error::Error + Send + Sync>> {
     info!("Querying LLM with model: {}", model);
 
-    // apply rate limiting before each attempt
-    get_gemini_rate_limiter().wait_for_api_call().await;
-
-    for attempt in 0..=MAX_RETRIES {
-        let response = match timeout(
-            Duration::from_secs(GEMINI_TIMEOUT_SECS),
-            gemini_rs::chat(model).send_message(prompt),
+    if model == ANALYSIS_MODEL {
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .map_err(|_| "OPENAI_API_KEY environment variable not set")?;
+        let client = openai::Client::new(&api_key)?;
+        return query_completion(
+            &client.completion_model(model),
+            prompt,
+            model,
+            "openai",
+            context,
+            model_stage,
+            response_round,
+            openai_usage,
         )
-        .await
+        .await;
+    }
+
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .map_err(|_| "GEMINI_API_KEY environment variable not set")?;
+    let client = gemini::Client::new(&api_key)?;
+    query_completion(
+        &client.completion_model(model),
+        prompt,
+        model,
+        "gemini",
+        context,
+        model_stage,
+        response_round,
+        gemini_usage,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn query_completion<M: CompletionModel>(
+    completion_model: &M,
+    prompt: &str,
+    model: &str,
+    provider: &str,
+    context: Option<&LlmRunContext>,
+    model_stage: &str,
+    response_round: u32,
+    response_usage: fn(&M::Response) -> ResponseUsage<'_>,
+) -> Result<LLMResponse, Box<dyn std::error::Error + Send + Sync>> {
+    for attempt in 0..=MAX_RETRIES {
+        let mut request = completion_model.completion_request(prompt);
+        if provider == "gemini" {
+            get_gemini_rate_limiter().wait_for_api_call().await;
+        } else {
+            request = request.additional_params(json!({"store": false}));
+        }
+        let attempt_key = format!("{:032x}", rand::random::<u128>());
+        if let Some(context) = context {
+            context
+                .start_attempt(
+                    &attempt_key,
+                    provider,
+                    model,
+                    model_stage,
+                    response_round,
+                    attempt,
+                )
+                .await?;
+        }
+        let response = match timeout(Duration::from_secs(GEMINI_TIMEOUT_SECS), request.send()).await
         {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
+                let status = e
+                    .provider_response_status()
+                    .map(|status| i32::from(status.as_u16()));
+                let retryable = match status {
+                    Some(429) => true,
+                    Some(value) => value >= 500,
+                    None => matches!(
+                        e,
+                        CompletionError::HttpError(_) | CompletionError::ProviderError(_)
+                    ),
+                };
+                let attempt_status = if status.is_some() {
+                    "http_error"
+                } else if matches!(
+                    e,
+                    CompletionError::JsonError(_) | CompletionError::ResponseError(_)
+                ) {
+                    "response_invalid"
+                } else {
+                    "transport_error"
+                };
+                if let Some(context) = context {
+                    context
+                        .finish_attempt(
+                            &attempt_key,
+                            attempt_status,
+                            if status.is_some() {
+                                "not_billed"
+                            } else {
+                                "unknown"
+                            },
+                            status,
+                            Some(completion_error_class(&e)),
+                            None,
+                        )
+                        .await;
+                }
+                if !retryable {
+                    error!("{provider} API request failed permanently: {}", e);
+                    return Err(e.into());
+                }
                 if attempt == MAX_RETRIES {
                     error!(
-                        "Failed to get response from Gemini API after {} attempts: {:?}",
+                        "Failed to get response from {provider} API after {} attempts: {:?}",
                         MAX_RETRIES + 1,
                         e
                     );
@@ -96,7 +408,7 @@ pub async fn query_llm(
 
                 let delay = calculate_delay(attempt);
                 warn!(
-                    "Gemini API call failed (attempt {}/{}): {:?}. Retrying in {}ms",
+                    "{provider} API call failed (attempt {}/{}): {:?}. Retrying in {}ms",
                     attempt + 1,
                     MAX_RETRIES + 1,
                     e,
@@ -106,18 +418,30 @@ pub async fn query_llm(
                 continue;
             }
             Err(_timeout) => {
+                if let Some(context) = context {
+                    context
+                        .finish_attempt(
+                            &attempt_key,
+                            "timeout_unknown",
+                            "unknown",
+                            None,
+                            Some("timeout"),
+                            None,
+                        )
+                        .await;
+                }
                 if attempt == MAX_RETRIES {
                     error!(
-                        "Gemini API call timed out after {} attempts ({}s timeout)",
+                        "{provider} API call timed out after {} attempts ({}s timeout)",
                         MAX_RETRIES + 1,
                         GEMINI_TIMEOUT_SECS
                     );
-                    return Err("Gemini API call timed out".into());
+                    return Err(format!("{provider} API call timed out").into());
                 }
 
                 let delay = calculate_delay(attempt);
                 warn!(
-                    "Gemini API call timed out (attempt {}/{}): {}s timeout. Retrying in {}ms",
+                    "{provider} API call timed out (attempt {}/{}): {}s timeout. Retrying in {}ms",
                     attempt + 1,
                     MAX_RETRIES + 1,
                     GEMINI_TIMEOUT_SECS,
@@ -128,26 +452,28 @@ pub async fn query_llm(
             }
         };
 
-        let content = response.to_string();
-
+        let content: String = response
+            .choice
+            .iter()
+            .filter_map(|part| match part {
+                AssistantContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if let Some(context) = context {
+            context
+                .finish_attempt(
+                    &attempt_key,
+                    "succeeded",
+                    "known",
+                    Some(200),
+                    None,
+                    Some(response_usage(&response.raw_response)),
+                )
+                .await;
+        }
         if content.is_empty() {
-            if attempt == MAX_RETRIES {
-                error!(
-                    "Received empty response from Gemini API after {} attempts",
-                    MAX_RETRIES + 1
-                );
-                return Err("Empty response from Gemini API".into());
-            }
-
-            let delay = calculate_delay(attempt);
-            warn!(
-                "Received empty response from Gemini API (attempt {}/{}). Retrying in {}ms",
-                attempt + 1,
-                MAX_RETRIES + 1,
-                delay.as_millis()
-            );
-            sleep(delay).await;
-            continue;
+            return Err(format!("{provider} response did not contain visible text").into());
         }
 
         info!(
@@ -155,10 +481,67 @@ pub async fn query_llm(
             content.len(),
             attempt + 1
         );
-        return Ok(LLMResponse { content });
+        return Ok(LLMResponse {
+            content,
+            attempt_key: context.map(|_| attempt_key),
+        });
     }
 
     unreachable!()
+}
+
+fn completion_error_class(error: &CompletionError) -> &'static str {
+    match error {
+        CompletionError::HttpError(_) => "http",
+        CompletionError::JsonError(_) => "json",
+        CompletionError::UrlError(_) => "url",
+        CompletionError::RequestError(_) => "request",
+        CompletionError::ResponseError(_) => "response",
+        CompletionError::ProviderError(_) => "provider",
+        CompletionError::ProviderResponse(_) => "provider_response",
+        _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_tag, usage_columns};
+    use rig_core::providers::gemini::completion::gemini_api_types::UsageMetadata;
+
+    #[test]
+    fn analysis_tags_require_nonempty_content() {
+        for tag in ["professional", "personal", "roast"] {
+            assert_eq!(extract_tag("unstructured response", tag), None);
+            assert_eq!(extract_tag(&format!("<{tag}></{tag}>"), tag), None);
+            assert_eq!(extract_tag(&format!("<{tag}> \n\t </{tag}>"), tag), None);
+            assert_eq!(
+                extract_tag(
+                    &format!("<{tag}> \nFirst line\nSecond line\t </{tag}>"),
+                    tag
+                ),
+                Some("First line\nSecond line".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_all_gemini_usage_counters() {
+        let usage: UsageMetadata = serde_json::from_value(serde_json::json!({
+            "promptTokenCount": 100,
+            "cachedContentTokenCount": 40,
+            "candidatesTokenCount": 20,
+            "thoughtsTokenCount": 30,
+            "toolUsePromptTokenCount": 5,
+            "totalTokenCount": 150,
+            "trafficType": "ON_DEMAND"
+        }))
+        .expect("Gemini usage fixture must deserialize through Rig");
+
+        assert_eq!(
+            usage_columns(Some(&usage)),
+            (Some(100), Some(40), Some(20), Some(30), Some(5), Some(150))
+        );
+    }
 }
 
 pub fn calculate_delay(attempt: u32) -> Duration {
@@ -347,8 +730,8 @@ async fn describe_single_image(
 
     // make API call to Gemini
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite-preview-06-17:generateContent?key={}",
-        api_key
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        GEMINI_FLASH_LITE_MODEL, api_key
     );
 
     let response = client

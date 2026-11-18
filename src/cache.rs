@@ -1,11 +1,11 @@
 use deadpool_postgres::{Config, Pool, PoolConfig, Runtime, Timeouts};
 use log::{error, info, warn};
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::analysis::MessageDict;
@@ -24,8 +24,23 @@ impl CacheManager {
         let database_url =
             env::var("DATABASE_URL").map_err(|_| "DATABASE_URL environment variable not set")?;
 
+        let config = Self::database_config(database_url);
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls = MakeRustlsConnect::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+        Ok(config.create_pool(Some(Runtime::Tokio1), tls)?)
+    }
+
+    fn database_config(database_url: String) -> Config {
         let mut config = Config::new();
         config.url = Some(database_url);
+        // Keep deadpool's Fast recycling mode. Its simple-query based probe modes can leave the
+        // next extended query hanging behind some PostgreSQL proxies. Queue operations have their
+        // own watchdog and permanently detach a connection after any timeout or database error.
         // bound the pool and fail fast on exhaustion instead of blocking forever (the default
         // has no acquire timeout, so a leak/slow DB would silently wedge the bot)
         config.pool = Some(PoolConfig {
@@ -37,14 +52,7 @@ impl CacheManager {
             },
             ..Default::default()
         });
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls = MakeRustlsConnect::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        );
-        Ok(config.create_pool(Some(Runtime::Tokio1), tls)?)
+        config
     }
 
     // channel message cache (7-day TTL)
@@ -136,9 +144,18 @@ impl CacheManager {
         format!("{:x}", hasher.finish())
     }
 
-    pub fn get_llm_cache_key(&self, messages: &[MessageDict], prompt_type: &str) -> String {
-        let cache_input = (messages, prompt_type);
+    fn get_llm_cache_key(
+        messages: &[MessageDict],
+        prompt_type: &str,
+        cache_version: &str,
+        model: &str,
+    ) -> String {
+        let cache_input = (messages, prompt_type, cache_version, model);
         Self::hash_content(&cache_input)
+    }
+
+    pub fn get_analysis_cache_key(&self, messages: &[MessageDict]) -> String {
+        Self::get_llm_cache_key(messages, "analysis", "v3", crate::llm::ANALYSIS_MODEL)
     }
 
     pub async fn load_llm_result(&self, cache_key: &str) -> Option<AnalysisResult> {
@@ -210,5 +227,67 @@ pub struct AnalysisResult {
     pub professional: Option<String>,
     pub personal: Option<String>,
     pub roast: Option<String>,
+    #[serde(default)]
+    pub quotes: AnalysisQuotes,
     pub messages_count: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AnalysisQuotes {
+    pub professional: Option<String>,
+    pub personal: Option<String>,
+    pub roast: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn messages() -> Vec<MessageDict> {
+        vec![MessageDict {
+            date: Some("2026-08-13".to_string()),
+            message: Some("hello".to_string()),
+            images: None,
+        }]
+    }
+
+    #[test]
+    fn llm_cache_key_includes_model_and_cache_version() {
+        let messages = messages();
+        let current =
+            CacheManager::get_llm_cache_key(&messages, "analysis", "v3", "gemini-3.7-flash");
+
+        assert_ne!(
+            current,
+            CacheManager::get_llm_cache_key(&messages, "analysis", "v3", "gemini-3-flash-preview",)
+        );
+        assert_ne!(
+            current,
+            CacheManager::get_llm_cache_key(&messages, "analysis", "v2", "gemini-3.7-flash",)
+        );
+    }
+
+    #[test]
+    fn cached_analyses_without_quotes_are_still_readable() {
+        let result: AnalysisResult = serde_json::from_value(serde_json::json!({
+            "professional": "existing analysis",
+            "personal": null,
+            "roast": null,
+            "messages_count": 42
+        }))
+        .unwrap();
+        assert_eq!(result.professional.as_deref(), Some("existing analysis"));
+        assert!(result.quotes.professional.is_none());
+    }
+
+    #[test]
+    fn database_pool_has_bounded_acquisition() {
+        let config =
+            CacheManager::database_config("postgresql://example.invalid/example".to_string());
+
+        let pool = config.get_pool_config();
+        assert_eq!(pool.timeouts.wait, Some(Duration::from_secs(30)));
+        assert_eq!(pool.timeouts.create, Some(Duration::from_secs(30)));
+        assert_eq!(pool.timeouts.recycle, Some(Duration::from_secs(30)));
+    }
 }

@@ -2,6 +2,8 @@ pub mod analysis;
 pub mod backend_config;
 pub mod bot;
 pub mod cache;
+pub mod campaign;
+pub mod campaign_schedule;
 pub mod handlers;
 pub mod llm;
 pub mod localization;

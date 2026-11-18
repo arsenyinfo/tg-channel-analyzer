@@ -81,6 +81,40 @@ pub struct UserManager {
 }
 
 impl UserManager {
+    pub fn pool(&self) -> Arc<Pool> {
+        self.pool.clone()
+    }
+
+    pub async fn suppress_campaigns(
+        &self,
+        telegram_user_id: i64,
+        reason: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+        transaction
+            .execute(
+                "INSERT INTO campaign_suppressions (telegram_user_id, reason)
+                 VALUES ($1, $2)
+                 ON CONFLICT (telegram_user_id) DO UPDATE
+                 SET reason = EXCLUDED.reason, created_at = NOW()",
+                &[&telegram_user_id, &reason],
+            )
+            .await?;
+        transaction
+            .execute(
+                "UPDATE message_queue
+                 SET status = 'failed', last_error_code = 'user_opt_out',
+                     error_message = 'User opted out before delivery'
+                 WHERE telegram_user_id = $1 AND campaign_id IS NOT NULL
+                   AND status = 'pending'",
+                &[&telegram_user_id],
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub fn new(pool: Arc<Pool>) -> Self {
         Self { pool }
     }
@@ -126,9 +160,19 @@ impl UserManager {
         language_code: Option<&str>,
     ) -> Result<(User, Option<ReferralRewardInfo>), Box<dyn Error + Send + Sync>> {
         let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
+        // Serialize first-time registration before checking existence, so concurrent
+        // requests return the same user and process its referral exactly once. The
+        // prefix separates these lock keys from campaign keys and fixed worker locks.
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended('user-registration:' || $1::BIGINT::TEXT, 0))",
+                &[&telegram_user_id],
+            )
+            .await?;
 
         // try to get existing user first
-        if let Some(row) = client
+        if let Some(row) = transaction
             .query_opt(
                 "SELECT id, telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language 
                  FROM users WHERE telegram_user_id = $1",
@@ -136,6 +180,8 @@ impl UserManager {
             )
             .await?
         {
+            // Language updates remain best-effort outside the registration transaction.
+            transaction.commit().await?;
             let mut user = User {
                 id: row.get(0),
                 telegram_user_id: row.get(1),
@@ -175,8 +221,6 @@ impl UserManager {
         // create new user and process any referral atomically in one transaction,
         // so a referral-processing failure rolls back the user insert rather than
         // leaving referred_by_user_id set with no referrer increment
-        let transaction = client.transaction().await?;
-
         let row = transaction
             .query_one(
                 "INSERT INTO users (telegram_user_id, username, first_name, last_name, analysis_credits, total_analyses_performed, referred_by_user_id, referrals_count, paid_referrals_count, language)
@@ -241,7 +285,8 @@ impl UserManager {
         let telegram_user_id: i64 = row.get(1);
 
         let milestone_rewards =
-            Self::award_milestone_rewards(transaction, referrer_user_id, new_referral_count).await?;
+            Self::award_milestone_rewards(transaction, referrer_user_id, new_referral_count)
+                .await?;
 
         let is_celebration = Self::is_celebration_milestone(new_referral_count);
         info!(
@@ -378,29 +423,88 @@ impl UserManager {
         Ok(())
     }
 
-    /// creates a pending analysis record without consuming credit
+    /// Claims a Telegram callback and creates its pending analysis without consuming credit.
+    /// Returns `None` when the callback was already claimed by another delivery.
     pub async fn create_pending_analysis(
         &self,
         user_id: i32,
         channel_name: &str,
         analysis_type: &str,
         language: Option<&str>,
-    ) -> Result<i32, UserManagerError> {
-        let client = self.pool.get().await?;
+        telegram_callback_query_id: &str,
+    ) -> Result<Option<i32>, UserManagerError> {
+        let mut client = self.pool.get().await?;
+        let transaction = client.transaction().await?;
 
-        // create pending analysis record
-        let analysis_id = client
+        // A Telegram callback ID only deduplicates redelivery of the same tap. A user can tap
+        // several buttons while the first analysis is waiting behind the engine lock, producing
+        // distinct callback IDs and duplicate work. Serialize claims per user/channel and allow
+        // only one pending analysis for that channel at a time.
+        transaction
             .query_one(
-                "INSERT INTO user_analyses (user_id, channel_name, credits_used, analysis_type, status, language) VALUES ($1, $2, 0, $3, 'pending', $4) RETURNING id",
-                &[&user_id, &channel_name, &analysis_type, &language],
+                "SELECT pg_advisory_xact_lock($1, hashtext(LOWER($2)))",
+                &[&user_id, &channel_name],
+            )
+            .await?;
+
+        let already_pending = transaction
+            .query_opt(
+                "SELECT id FROM user_analyses
+                 WHERE user_id = $1 AND LOWER(channel_name) = LOWER($2)
+                   AND status = 'pending'
+                 LIMIT 1",
+                &[&user_id, &channel_name],
             )
             .await?
-            .get::<_, i32>(0);
+            .is_some();
+        if already_pending {
+            transaction.commit().await?;
+            info!(
+                "Analysis already pending for user {} and channel {}; skipping duplicate tap",
+                user_id, channel_name
+            );
+            return Ok(None);
+        }
 
-        info!(
-            "Created pending analysis {} for user {} (channel: {}, lang: {:?})",
-            analysis_id, user_id, channel_name, language
-        );
+        let analysis_id = transaction
+            .query_opt(
+                "INSERT INTO user_analyses
+                    (user_id, channel_name, credits_used, analysis_type, status, language,
+                     telegram_callback_query_id, experiment_campaign_id)
+                 VALUES ($1, $2, 0, $3, 'pending', $4, $5, (
+                     SELECT cr.campaign_id
+                     FROM campaign_recipients cr
+                     LEFT JOIN message_queue mq
+                       ON mq.campaign_id = cr.campaign_id AND mq.user_id = cr.user_id
+                     WHERE cr.user_id = $1
+                       AND cr.enrolled_at >= NOW() - INTERVAL '30 days'
+                       AND (cr.variant IN ('holdout', 'message_credit') OR mq.sent_at IS NOT NULL)
+                     ORDER BY COALESCE(mq.sent_at, cr.enrolled_at) DESC
+                     LIMIT 1
+                 ))
+                 ON CONFLICT (telegram_callback_query_id) DO NOTHING
+                 RETURNING id",
+                &[
+                    &user_id,
+                    &channel_name,
+                    &analysis_type,
+                    &language,
+                    &telegram_callback_query_id,
+                ],
+            )
+            .await?
+            .map(|row| row.get::<_, i32>(0));
+
+        transaction.commit().await?;
+
+        if let Some(analysis_id) = analysis_id {
+            info!(
+                "Created pending analysis {} for user {} (channel: {}, lang: {:?})",
+                analysis_id, user_id, channel_name, language
+            );
+        } else {
+            info!("Callback query was already claimed; skipping duplicate analysis");
+        }
         Ok(analysis_id)
     }
 
@@ -409,9 +513,39 @@ impl UserManager {
         &self,
         analysis_id: i32,
         user_id: i32,
+        result_source: &str,
+        llm_cache_key: Option<&str>,
     ) -> Result<i32, UserManagerError> {
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
+
+        // guard against double-completion; no-op if already completed
+        let updated = transaction
+            .execute(
+                "UPDATE user_analyses
+                 SET status = 'completed', credits_used = 1,
+                     result_source = $3, llm_cache_key = $4
+                 WHERE id = $1 AND user_id = $2 AND status = 'pending'",
+                &[&analysis_id, &user_id, &result_source, &llm_cache_key],
+            )
+            .await?;
+
+        if updated == 0 {
+            // No pending analysis was claimed, so this call must not consume credit.
+            transaction.rollback().await?;
+            info!(
+                "Analysis {} already completed, skipping charge for user {}",
+                analysis_id, user_id
+            );
+            let row = client
+                .query_opt(
+                    "SELECT analysis_credits FROM users WHERE id = $1",
+                    &[&user_id],
+                )
+                .await?
+                .ok_or(UserManagerError::UserNotFound(user_id))?;
+            return Ok(row.get(0));
+        }
 
         // consume credit only if user has sufficient credits
         let row = transaction
@@ -441,32 +575,6 @@ impl UserManager {
                 };
             }
         };
-
-        // guard against double-completion; no-op if already completed
-        let updated = transaction
-            .execute(
-                "UPDATE user_analyses SET status = 'completed', credits_used = 1 WHERE id = $1 AND status = 'pending'",
-                &[&analysis_id],
-            )
-            .await?;
-
-        if updated == 0 {
-            // analysis already completed (race condition); roll back the credit deduction
-            transaction.rollback().await?;
-            info!(
-                "Analysis {} already completed, skipping charge for user {}",
-                analysis_id, user_id
-            );
-            let client = self.pool.get().await?;
-            let row = client
-                .query_opt(
-                    "SELECT analysis_credits FROM users WHERE id = $1",
-                    &[&user_id],
-                )
-                .await?
-                .ok_or(UserManagerError::UserNotFound(user_id))?;
-            return Ok(row.get(0));
-        }
 
         transaction.commit().await?;
 

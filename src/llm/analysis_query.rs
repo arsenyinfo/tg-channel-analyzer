@@ -1,9 +1,19 @@
-use crate::cache::AnalysisResult;
-use crate::llm::{extract_tag, query_llm};
+use crate::cache::{AnalysisQuotes, AnalysisResult};
+use crate::llm::{extract_tag, query_llm_with_context, LlmRunContext, ANALYSIS_MODEL};
 use log::{error, info, warn};
+
+const FALLBACK_MODEL: &str = "gemini-3.8-flash";
+
+fn section_quote(response: &str, section: &str, body: Option<&str>) -> Option<String> {
+    let body = body?;
+    extract_tag(response, &format!("{section}_quote")).filter(|quote| {
+        quote.chars().count() <= 180 && !quote.contains(['\n', '\r']) && body.contains(quote)
+    })
+}
 
 pub async fn query_and_parse_analysis(
     prompt: &str,
+    context: &LlmRunContext,
 ) -> Result<AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
     // Ensure GEMINI_API_KEY is set to prevent gemini-rs panic on client creation
     std::env::var("GEMINI_API_KEY")
@@ -14,10 +24,20 @@ pub async fn query_and_parse_analysis(
     async fn try_model(
         prompt: &str,
         model: &str,
-        api_retries: u32,
+        model_stage: &str,
+        response_attempts: u32,
+        context: &LlmRunContext,
     ) -> Result<AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
-        for api_attempt in 0..api_retries {
-            match query_llm(prompt, model).await {
+        for response_attempt in 0..response_attempts {
+            match query_llm_with_context(
+                prompt,
+                model,
+                Some(context),
+                model_stage,
+                response_attempt,
+            )
+            .await
+            {
                 Ok(response) => {
                     let professional = extract_tag(&response.content, "professional");
                     let personal = extract_tag(&response.content, "personal");
@@ -35,12 +55,28 @@ pub async fn query_and_parse_analysis(
                     }
 
                     if missing.is_empty() {
+                        context
+                            .mark_consumer_outcome(response.attempt_key.as_deref(), "accepted")
+                            .await;
                         info!(
-                            "Complete analysis received from {} (api_attempt: {})",
+                            "Complete analysis received from {} (response_attempt: {})",
                             model,
-                            api_attempt + 1
+                            response_attempt + 1
                         );
                         return Ok(AnalysisResult {
+                            quotes: AnalysisQuotes {
+                                professional: section_quote(
+                                    &response.content,
+                                    "professional",
+                                    professional.as_deref(),
+                                ),
+                                personal: section_quote(
+                                    &response.content,
+                                    "personal",
+                                    personal.as_deref(),
+                                ),
+                                roast: section_quote(&response.content, "roast", roast.as_deref()),
+                            },
                             professional,
                             personal,
                             roast,
@@ -49,51 +85,94 @@ pub async fn query_and_parse_analysis(
                     }
 
                     warn!(
-                        "Missing analysis sections [{}] from {} (api_attempt: {})",
+                        "Missing analysis sections [{}] from {} (response_attempt: {})",
                         missing.join(", "),
                         model,
-                        api_attempt + 1
+                        response_attempt + 1
                     );
-                    if api_attempt == api_retries - 1 {
+                    context
+                        .mark_consumer_outcome(response.attempt_key.as_deref(), "incomplete")
+                        .await;
+                    if response_attempt == response_attempts - 1 {
                         return Err(format!(
-                            "Failed to get complete analysis from {} after {} API attempts (missing: {})",
+                            "Failed to get complete analysis from {} after {} response attempts (missing: {})",
                             model,
-                            api_retries,
+                            response_attempts,
                             missing.join(", ")
                         )
                         .into());
                     }
                 }
                 Err(e) => {
-                    error!("{} API attempt {} failed: {}", model, api_attempt + 1, e);
-                    if api_attempt == api_retries - 1 {
-                        return Err(e);
-                    }
+                    // query_llm already owns transport retries; only repeat here when a
+                    // successful response is missing required analysis sections.
+                    error!("{} API request failed: {}", model, e);
+                    return Err(e);
                 }
             }
         }
         Err(format!(
-            "Unexpected failure in {} after {} API attempts",
-            model, api_retries
+            "Unexpected failure in {} after {} response attempts",
+            model, response_attempts
         )
         .into())
     }
 
-    // try gemini-3-flash-preview with retries
-    match try_model(prompt, "gemini-3-flash-preview", 2).await {
+    // try the primary analysis model with retries
+    match try_model(prompt, ANALYSIS_MODEL, "primary", 2, context).await {
         Ok(result) => return Ok(result),
         Err(e) => {
-            warn!("Gemini 3 Flash failed with error: {}, trying fallback", e);
+            warn!(
+                "{} failed with error: {}, trying fallback",
+                ANALYSIS_MODEL, e
+            );
         }
     }
 
-    // try gemini-2.5-flash as fallback (much cheaper than pro)
-    info!("Falling back to gemini-2.5-flash");
-    match try_model(prompt, "gemini-2.5-flash", 2).await {
+    info!("Falling back to {FALLBACK_MODEL}");
+    match try_model(prompt, FALLBACK_MODEL, "fallback", 2, context).await {
         Ok(result) => Ok(result),
         Err(e) => {
             error!("Gemini Flash fallback also failed: {}", e);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::section_quote;
+
+    #[test]
+    fn quotes_must_be_short_verbatim_excerpts_from_the_matching_section() {
+        let response = "<professional_quote>Сначала проверить гипотезу.</professional_quote>\n\
+                        <personal_quote>Он любит экспериментировать.</personal_quote>";
+        assert_eq!(
+            section_quote(
+                response,
+                "professional",
+                Some("Сначала проверить гипотезу. Затем измерить результат.")
+            )
+            .as_deref(),
+            Some("Сначала проверить гипотезу.")
+        );
+        assert_eq!(
+            section_quote(response, "personal", Some("Он много читает.")),
+            None
+        );
+        assert_eq!(
+            section_quote(response, "roast", Some("Текст роаста.")),
+            None
+        );
+
+        let overlong = "я".repeat(181);
+        assert_eq!(
+            section_quote(
+                &format!("<roast_quote>{overlong}</roast_quote>"),
+                "roast",
+                Some(&overlong)
+            ),
+            None
+        );
     }
 }

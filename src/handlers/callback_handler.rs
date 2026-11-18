@@ -35,7 +35,10 @@ impl CallbackHandler {
         InlineKeyboardMarkup::new(vec![vec![single_button], vec![bulk_button]])
     }
 
-    pub fn create_analysis_selection_keyboard(channel_name: &str, lang: Lang) -> InlineKeyboardMarkup {
+    pub fn create_analysis_selection_keyboard(
+        channel_name: &str,
+        lang: Lang,
+    ) -> InlineKeyboardMarkup {
         let professional_button = InlineKeyboardButton::callback(
             lang.btn_professional_analysis(),
             format!("analysis_professional_{}", channel_name),
@@ -141,9 +144,18 @@ impl CallbackHandler {
             // reject anything but the known analysis types; callback data is user-controlled,
             // and an unknown/empty type would otherwise fail the DB CHECK or panic downstream
             if !matches!(analysis_type, "professional" | "personal" | "roast") {
-                error!("Invalid analysis type in callback data: {:?}", analysis_type);
+                error!(
+                    "Invalid analysis type in callback data: {:?}",
+                    analysis_type
+                );
                 ctx.bot.answer_callback_query(&query.id).await?;
                 return Ok(());
+            }
+
+            // Stop Telegram's loading spinner immediately. The database and analysis engine may
+            // be busy, but acknowledging the tap must not wait behind either of them.
+            if let Err(e) = ctx.bot.answer_callback_query(&query.id).await {
+                error!("Failed to acknowledge analysis callback: {}", e);
             }
 
             let telegram_user_id = query.from.id.0 as i64;
@@ -178,7 +190,6 @@ impl CallbackHandler {
                     .reply_markup(Self::create_payment_keyboard(lang))
                     .await?;
 
-                ctx.bot.answer_callback_query(&query.id).await?;
                 return Ok(());
             }
 
@@ -190,10 +201,14 @@ impl CallbackHandler {
                     channel_name,
                     analysis_type,
                     query.from.language_code.as_deref(),
+                    &query.id,
                 )
                 .await
             {
-                Ok(id) => id,
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    return Ok(());
+                }
                 Err(e) => {
                     let error_msg = match e {
                         UserManagerError::UserNotFound(_) => lang.error_user_not_found(),
@@ -203,10 +218,19 @@ impl CallbackHandler {
                         .bot
                         .send_message(Self::get_chat_id(message), error_msg)
                         .await;
-                    ctx.bot.answer_callback_query(&query.id).await?;
                     return Ok(());
                 }
             };
+
+            // This prompt asks for one choice. Remove its keyboard once a choice is claimed so
+            // the same message cannot be used to enqueue more analyses accidentally.
+            if let Err(e) = ctx
+                .bot
+                .edit_message_reply_markup(Self::get_chat_id(message), message.id())
+                .await
+            {
+                error!("Failed to remove used analysis keyboard: {}", e);
+            }
 
             // start analysis in background
             Self::start_analysis_in_background(
@@ -219,9 +243,10 @@ impl CallbackHandler {
                 lang,
             )
             .await;
+        } else {
+            ctx.bot.answer_callback_query(&query.id).await?;
         }
 
-        ctx.bot.answer_callback_query(&query.id).await?;
         Ok(())
     }
 

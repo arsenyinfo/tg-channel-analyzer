@@ -47,7 +47,18 @@ pub struct AnalysisEngine {
 }
 
 impl AnalysisEngine {
+    // Used by auxiliary binaries through the library crate; the main binary includes this
+    // module separately and uses new_with_sessions after startup validation.
+    #[allow(dead_code)]
     pub fn new(pool: Arc<Pool>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let session_files = SessionManager::discover_sessions()?;
+        Self::new_with_sessions(pool, session_files)
+    }
+
+    pub fn new_with_sessions(
+        pool: Arc<Pool>,
+        session_files: Vec<String>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let api_id = env::var("TG_API_ID")
             .map_err(|_| "TG_API_ID environment variable is required")?
             .parse::<i32>()
@@ -58,11 +69,10 @@ impl AnalysisEngine {
 
         let cache = CacheManager::new(pool);
 
-        let session_files = SessionManager::discover_sessions()?;
         if session_files.is_empty() {
-            return Err("No session files found in sessions/ directory".into());
+            return Err("No valid Telegram sessions provided".into());
         }
-        info!("Found {} session files", session_files.len());
+        info!("Configured {} validated session files", session_files.len());
 
         let web_scraper = TelegramWebScraper::new()
             .map_err(|e| format!("Failed to initialize web scraper: {}", e))?;
@@ -183,11 +193,9 @@ impl AnalysisEngine {
         &mut self,
         channel_username: &str,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let clean_username = if channel_username.starts_with('@') {
-            &channel_username[1..]
-        } else {
-            channel_username
-        };
+        let clean_username = channel_username
+            .strip_prefix('@')
+            .unwrap_or(channel_username);
 
         info!("Validating channel: {}", clean_username);
 
@@ -333,7 +341,7 @@ impl AnalysisEngine {
             }
         };
 
-        let cache_key = self.cache.get_llm_cache_key(&messages, "analysis");
+        let cache_key = self.cache.get_analysis_cache_key(&messages);
         Ok(AnalysisData {
             messages,
             cache_key,
@@ -360,9 +368,7 @@ impl AnalysisEngine {
                 wait_time.as_secs(),
                 backend.name()
             );
-            self.backend_rate_limiter
-                .wait_for_backend(backend)
-                .await;
+            self.backend_rate_limiter.wait_for_backend(backend).await;
         }
     }
 
@@ -470,11 +476,9 @@ impl AnalysisEngine {
         &mut self,
         channel_username: &str,
     ) -> Result<Vec<MessageDict>, Box<dyn std::error::Error + Send + Sync>> {
-        let clean_username = if channel_username.starts_with('@') {
-            &channel_username[1..]
-        } else {
-            channel_username
-        };
+        let clean_username = channel_username
+            .strip_prefix('@')
+            .unwrap_or(channel_username);
 
         // check for cached channel first, fallback to resolution if needed
         let cached_channel = self.resolved_channels.get(clean_username).cloned();
@@ -604,4 +608,3 @@ impl AnalysisEngine {
         Ok(messages)
     }
 }
-

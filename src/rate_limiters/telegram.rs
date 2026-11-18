@@ -10,6 +10,12 @@ pub struct TelegramRateLimiter {
     message_iteration_last_call: Arc<Mutex<Option<Instant>>>,
 }
 
+impl Default for TelegramRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TelegramRateLimiter {
     pub fn new() -> Self {
         Self {

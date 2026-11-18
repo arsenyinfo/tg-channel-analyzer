@@ -2,6 +2,7 @@ mod analysis;
 mod backend_config;
 mod bot;
 mod cache;
+mod campaign_schedule;
 mod handlers;
 mod llm;
 mod localization;
@@ -19,13 +20,13 @@ use cache::CacheManager;
 use clap::Parser;
 use localization::Lang;
 use log::{error, info, warn};
-use teloxide::requests::Requester;
 use migrations::MigrationManager;
-use session_manager::SessionManager;
+use session_manager::{SessionManager, ValidationResult};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
+use teloxide::requests::Requester;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use user_manager::UserManager;
@@ -79,6 +80,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("{}", success_msg);
     }
 
+    let valid_sessions = match validation_result {
+        ValidationResult::Success { valid_sessions, .. } => valid_sessions,
+        _ => unreachable!("unsuccessful session validation returned above"),
+    };
+
     // wait for Telegram API connectivity before proceeding
     wait_for_telegram_api(&bot_token).await?;
 
@@ -102,7 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // shared analysis engine + channel locks, used by both recovery and the live dispatcher,
     // so per-channel serialization and the global rate limiters apply across both paths
-    let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new(pool.clone())?));
+    let analysis_engine = Arc::new(Mutex::new(AnalysisEngine::new_with_sessions(
+        pool.clone(),
+        valid_sessions,
+    )?));
     let channel_locks: ChannelLocks = Arc::new(Mutex::new(HashMap::new()));
 
     // recover pending analyses from previous session
@@ -115,20 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
 
-    let bot = TelegramBot::new(
-        &bot_token,
-        user_manager,
-        pool,
-        analysis_engine,
-        channel_locks,
-    )
-    .await?;
+    let bot = TelegramBot::new(&bot_token, user_manager, analysis_engine, channel_locks).await?;
 
     // spawn dispatcher in a task so a panic doesn't crash the runtime
-    let dispatcher_result = tokio::spawn(async move {
-        bot.run().await;
-    })
-    .await;
+    let dispatcher_result = tokio::spawn(async move { bot.run().await }).await;
 
     // dispatcher exited — abort any still-running recovery tasks
     info!("Dispatcher exited, aborting remaining recovery tasks");
@@ -137,7 +136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     match dispatcher_result {
-        Ok(()) => Ok(()),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            error!("Bot runtime failed: {}", e);
+            Err(e)
+        }
         Err(e) => {
             error!("Bot dispatcher failed: {}", e);
             Err(format!("Bot dispatcher failed: {}", e).into())
@@ -268,9 +271,6 @@ async fn recover_pending_analyses(
         handles.push(handle);
     }
 
-    info!(
-        "Queued {} recovery tasks (max 3 concurrent)",
-        handles.len()
-    );
+    info!("Queued {} recovery tasks (max 3 concurrent)", handles.len());
     Ok(handles)
 }

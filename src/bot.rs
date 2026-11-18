@@ -1,10 +1,18 @@
+use chrono::{DateTime, Duration, NaiveTime, Utc};
 use log::{error, info};
 use regex::Regex;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use teloxide::prelude::*;
-use teloxide::types::{CallbackQuery, ChatId, ParseMode, PreCheckoutQuery, SuccessfulPayment};
+use teloxide::types::{
+    CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, PreCheckoutQuery,
+    SuccessfulPayment,
+};
 use teloxide::utils::command::BotCommands;
+use teloxide::{ApiError, RequestError};
 use tokio::sync::Mutex;
 
 use crate::analysis::AnalysisEngine;
@@ -19,6 +27,20 @@ use crate::user_manager::{UserManager, UserManagerError};
 use crate::utils::MessageFormatter;
 use deadpool_postgres::Pool;
 
+struct QueuedMessage {
+    id: i32,
+    telegram_user_id: i64,
+    message: String,
+    parse_mode: String,
+    campaign_id: Option<i64>,
+    attempt_count: i32,
+    max_attempts: i32,
+    timezone: Option<String>,
+    window_start: Option<NaiveTime>,
+    window_end: Option<NaiveTime>,
+    lease_token: String,
+}
+
 // per-channel locks to prevent concurrent LLM calls for the same channel
 pub type ChannelLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
@@ -27,9 +49,11 @@ pub type ChannelLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 pub enum Command {
     #[command(description = "start the bot")]
     Start,
-    #[command(description = "buy 1 analysis for 50 stars")]
+    #[command(description = "stop campaign notifications")]
+    Stop,
+    #[command(description = "buy 1 analysis for 100 stars")]
     Buy1,
-    #[command(description = "buy 10 analyses for 200 stars")]
+    #[command(description = "buy 10 analyses for 500 stars")]
     Buy10,
 }
 
@@ -37,7 +61,6 @@ pub struct TelegramBot {
     bot: Arc<Bot>,
     analysis_engine: Arc<Mutex<AnalysisEngine>>,
     user_manager: Arc<UserManager>,
-    pool: Arc<Pool>,
     payment_handler: PaymentHandler,
     channel_locks: ChannelLocks,
 }
@@ -52,6 +75,11 @@ pub struct BotContext {
 }
 
 impl TelegramBot {
+    const MESSAGE_QUEUE_LOCK_ID: i64 = 7_623_417_991;
+    const MESSAGE_QUEUE_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+    const MESSAGE_QUEUE_WATCHDOG_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+    const MESSAGE_QUEUE_BACKOFF_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(30);
+
     fn validate_and_normalize_channel(text: &str) -> Option<String> {
         // regex for valid telegram channel username (5-32 chars, alphanumeric and underscore)
         let channel_regex = Regex::new(r"^@([a-zA-Z0-9_]{5,32})$").unwrap();
@@ -72,13 +100,82 @@ impl TelegramBot {
         None
     }
 
-    async fn run_message_queue_processor(bot: Arc<Bot>, pool: Arc<Pool>) {
+    fn spawn_message_queue_watchdog(heartbeat: Arc<AtomicU64>) {
+        std::thread::Builder::new()
+            .name("queue-watchdog".to_string())
+            .spawn(move || {
+                let mut observed = heartbeat.load(Ordering::Relaxed);
+                let mut last_progress = std::time::Instant::now();
+                loop {
+                    std::thread::sleep(Self::MESSAGE_QUEUE_WATCHDOG_POLL);
+                    let current = heartbeat.load(Ordering::Relaxed);
+                    if current != observed {
+                        observed = current;
+                        last_progress = std::time::Instant::now();
+                    } else if last_progress.elapsed() >= Self::MESSAGE_QUEUE_STALL_TIMEOUT {
+                        eprintln!(
+                            "Message queue made no progress for {}s; terminating for systemd restart",
+                            Self::MESSAGE_QUEUE_STALL_TIMEOUT.as_secs()
+                        );
+                        std::process::exit(70);
+                    }
+                }
+            })
+            .expect("failed to start message queue watchdog");
+    }
+
+    fn spawn_message_queue_worker(bot: Arc<Bot>, heartbeat: Arc<AtomicU64>) {
+        std::thread::Builder::new()
+            .name("message-queue".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("failed to build message queue runtime");
+                runtime.block_on(async move {
+                    let pool = match CacheManager::create_pool().await {
+                        Ok(pool) => Arc::new(pool),
+                        Err(error) => {
+                            eprintln!("Failed to create message queue pool: {error}");
+                            std::process::exit(71);
+                        }
+                    };
+                    Self::run_message_queue_processor(bot, pool, heartbeat).await;
+                });
+                eprintln!("Message queue worker exited unexpectedly");
+                std::process::exit(71);
+            })
+            .expect("failed to start message queue worker");
+    }
+
+    async fn sleep_with_queue_heartbeats(delay: std::time::Duration, heartbeat: &AtomicU64) {
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            heartbeat.fetch_add(1, Ordering::Relaxed);
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep_until(std::cmp::min(
+                deadline,
+                now + Self::MESSAGE_QUEUE_BACKOFF_HEARTBEAT,
+            ))
+            .await;
+        }
+    }
+
+    async fn run_message_queue_processor(
+        bot: Arc<Bot>,
+        pool: Arc<Pool>,
+        heartbeat: Arc<AtomicU64>,
+    ) {
         info!("Starting message queue processor");
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
-
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-
+            heartbeat.fetch_add(1, Ordering::Relaxed);
             let mut client = match pool.get().await {
                 Ok(client) => client,
                 Err(e) => {
@@ -86,91 +183,491 @@ impl TelegramBot {
                         "Failed to get database connection for queue processor: {}",
                         e
                     );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                     continue;
                 }
             };
-
-            // hold a transaction across the claim, send, and status update so the row lock
-            // spans the whole critical section (FOR UPDATE SKIP LOCKED in autocommit would
-            // release the lock immediately, allowing a second processor to double-send)
             let transaction = match client.transaction().await {
-                Ok(tx) => tx,
+                Ok(transaction) => transaction,
                 Err(e) => {
-                    error!("Failed to open queue transaction: {}", e);
+                    error!("Failed to start queue claim transaction: {}", e);
                     continue;
                 }
             };
+            // The transaction-scoped advisory lock serializes claims across replicas and is
+            // always released by PostgreSQL on commit/rollback/connection loss.
+            let owns_lock: bool = match transaction
+                .query_one(
+                    "SELECT pg_try_advisory_xact_lock($1)",
+                    &[&Self::MESSAGE_QUEUE_LOCK_ID],
+                )
+                .await
+            {
+                Ok(row) => row.get(0),
+                Err(e) => {
+                    error!("Failed to coordinate queue claim: {}", e);
+                    continue;
+                }
+            };
+            if !owns_lock {
+                continue;
+            }
 
+            if let Err(e) = transaction
+                .execute(
+                    "UPDATE message_queue
+                     SET status = 'delivery_unknown', lease_token = NULL, leased_until = NULL,
+                         last_error_code = 'lease_expired',
+                         error_message = 'Delivery outcome unknown after worker interruption'
+                     WHERE status = 'processing'
+                       AND (leased_until IS NULL OR leased_until < NOW())",
+                    &[],
+                )
+                .await
+            {
+                error!("Failed to reconcile expired queue leases: {}", e);
+                continue;
+            }
+
+            let lease_token = format!("{:032x}", rand::random::<u128>());
             let row = match transaction
                 .query_opt(
-                    "SELECT id, telegram_user_id, message, parse_mode
-                 FROM message_queue
-                 WHERE status = 'pending'
-                 ORDER BY created_at
-                 LIMIT 1
-                 FOR UPDATE SKIP LOCKED",
+                    r#"
+                    SELECT mq.id, mq.telegram_user_id, mq.message, mq.parse_mode,
+                           mq.campaign_id, mq.attempt_count, mq.max_attempts,
+                           c.timezone, c.send_window_start, c.send_window_end,
+                           c.cadence_seconds
+                    FROM message_queue mq
+                    LEFT JOIN campaigns c ON c.id = mq.campaign_id
+                    WHERE mq.status = 'pending'
+                      AND mq.attempt_count < mq.max_attempts
+                      AND mq.scheduled_at <= NOW()
+                      AND mq.next_attempt_at <= NOW()
+                      AND NOT EXISTS (
+                          SELECT 1 FROM campaign_suppressions cs
+                          WHERE cs.telegram_user_id = mq.telegram_user_id
+                      )
+                      AND (
+                          mq.campaign_id IS NULL
+                          OR (
+                              c.status = 'active'
+                              AND c.next_send_at <= NOW()
+                              AND (CURRENT_TIMESTAMP AT TIME ZONE c.timezone)::time
+                                  >= c.send_window_start
+                              AND (CURRENT_TIMESTAMP AT TIME ZONE c.timezone)::time
+                                  < c.send_window_end
+                          )
+                      )
+                    ORDER BY mq.next_attempt_at, mq.scheduled_at, mq.id
+                    LIMIT 1
+                    FOR UPDATE OF mq SKIP LOCKED
+                    "#,
                     &[],
                 )
                 .await
             {
                 Ok(row) => row,
                 Err(e) => {
-                    error!("Failed to query message queue: {}", e);
+                    error!("Message queue selection failed: {}", e);
+                    continue;
+                }
+            };
+            let Some(row) = row else {
+                if let Err(e) = transaction.commit().await {
+                    error!("Failed to commit empty queue claim: {}", e);
+                }
+                continue;
+            };
+
+            let queued = QueuedMessage {
+                id: row.get(0),
+                telegram_user_id: row.get(1),
+                message: row.get(2),
+                parse_mode: row.get(3),
+                campaign_id: row.get(4),
+                attempt_count: row.get::<_, i32>(5) + 1,
+                max_attempts: row.get(6),
+                timezone: row.get(7),
+                window_start: row.get(8),
+                window_end: row.get(9),
+                lease_token,
+            };
+            if let Err(e) = transaction
+                .execute(
+                    "UPDATE message_queue
+                     SET status = 'processing', attempt_count = attempt_count + 1,
+                         lease_token = $2, leased_until = NOW() + INTERVAL '5 minutes'
+                     WHERE id = $1",
+                    &[&queued.id, &queued.lease_token],
+                )
+                .await
+            {
+                error!("Message queue claim update failed: {}", e);
+                continue;
+            }
+            if let Some(campaign_id) = queued.campaign_id {
+                let cadence_seconds: i32 = row.get(10);
+                if let Err(e) = transaction
+                    .execute(
+                        "UPDATE campaigns
+                         SET next_send_at = NOW() + ($2::INTEGER * INTERVAL '1 second'),
+                             updated_at = NOW()
+                         WHERE id = $1",
+                        &[&campaign_id, &cadence_seconds],
+                    )
+                    .await
+                {
+                    error!("Failed to advance campaign pacing: {}", e);
+                    continue;
+                }
+            }
+            if let Err(e) = transaction.commit().await {
+                error!("Failed to commit message queue claim: {}", e);
+                continue;
+            }
+
+            if queued.campaign_id.is_some() {
+                match client
+                    .query_opt(
+                        "SELECT 1 FROM campaign_suppressions WHERE telegram_user_id = $1",
+                        &[&queued.telegram_user_id],
+                    )
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        let _ = Self::finish_queue_row(
+                            &client,
+                            &queued,
+                            "failed",
+                            "user_opt_out",
+                            "Recipient opted out before delivery",
+                        )
+                        .await;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!(
+                            "Could not verify suppression for queue row {}; leaving lease for safe reconciliation: {}",
+                            queued.id, e
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            let parse_mode = match queued.parse_mode.as_str() {
+                "HTML" => ParseMode::Html,
+                "MarkdownV2" => ParseMode::MarkdownV2,
+                _ => {
+                    error!("Queue row {} has invalid parse mode", queued.id);
+                    let _ = Self::finish_queue_row(
+                        &client,
+                        &queued,
+                        "failed",
+                        "invalid_parse_mode",
+                        "Invalid parse mode",
+                    )
+                    .await;
                     continue;
                 }
             };
 
-            let Some(row) = row else {
-                let _ = transaction.rollback().await;
-                continue;
-            };
-
-            let id: i32 = row.get(0);
-            let user_id: i64 = row.get(1);
-            let message: String = row.get(2);
-            let parse_mode: String = row.get(3);
-
-            // send message
-            let send_result = if parse_mode.to_uppercase() == "HTML" {
-                bot.send_message(ChatId(user_id), &message)
-                    .parse_mode(ParseMode::Html)
+            match bot
+                .send_message(ChatId(queued.telegram_user_id), &queued.message)
+                .parse_mode(parse_mode)
+                .await
+            {
+                Ok(_) => match client
+                    .execute(
+                        "UPDATE message_queue
+                         SET status = 'sent', sent_at = NOW(), lease_token = NULL,
+                             leased_until = NULL, error_message = NULL, last_error_code = NULL
+                         WHERE id = $1 AND status = 'processing' AND lease_token = $2",
+                        &[&queued.id, &queued.lease_token],
+                    )
                     .await
-            } else {
-                bot.send_message(ChatId(user_id), &message)
-                    .parse_mode(ParseMode::MarkdownV2)
-                    .await
-            };
-
-            let update_result = match &send_result {
-                Ok(_) => {
-                    transaction
-                        .execute(
-                            "UPDATE message_queue SET status = 'sent', sent_at = NOW() WHERE id = $1",
-                            &[&id],
-                        )
-                        .await
-                }
+                {
+                    Ok(1) => {}
+                    Ok(_) => error!(
+                        "Queue row {} lost its lease after Telegram accepted it",
+                        queued.id
+                    ),
+                    Err(e) => error!(
+                        "Telegram accepted queue row {}, but recording success failed: {}",
+                        queued.id, e
+                    ),
+                },
                 Err(e) => {
-                    let error_msg = e.to_string();
-                    transaction
-                        .execute(
-                            "UPDATE message_queue SET status = 'failed', error_message = $2 WHERE id = $1",
-                            &[&id, &error_msg],
+                    if let Err(update_error) = Self::handle_queue_error(&client, &queued, &e).await
+                    {
+                        error!(
+                            "Failed to record delivery error for queue row {}: {}",
+                            queued.id, update_error
+                        );
+                    }
+                    if matches!(e, RequestError::Api(ApiError::InvalidToken)) {
+                        error!("Telegram rejected the bot token; queue worker backing off");
+                        drop(client);
+                        Self::sleep_with_queue_heartbeats(
+                            tokio::time::Duration::from_secs(3600),
+                            &heartbeat,
                         )
-                        .await
-                }
-            };
-
-            match update_result {
-                Ok(_) => {
-                    if let Err(e) = transaction.commit().await {
-                        error!("Failed to commit queue status update for {}: {}", id, e);
+                        .await;
                     }
                 }
-                Err(e) => {
-                    error!("Failed to update message status for {}: {}", id, e);
-                    let _ = transaction.rollback().await;
+            }
+        }
+    }
+
+    async fn finish_queue_row(
+        client: &deadpool_postgres::Object,
+        queued: &QueuedMessage,
+        status: &str,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let updated = client
+            .execute(
+                "UPDATE message_queue
+                 SET status = $3, lease_token = NULL, leased_until = NULL,
+                     last_error_code = $4, error_message = $5
+                 WHERE id = $1 AND status = 'processing' AND lease_token = $2",
+                &[
+                    &queued.id,
+                    &queued.lease_token,
+                    &status,
+                    &error_code,
+                    &error_message,
+                ],
+            )
+            .await?;
+        if updated != 1 {
+            return Err(format!("queue row {} lease was lost", queued.id).into());
+        }
+        Ok(())
+    }
+
+    fn retry_delay(attempt_count: i32) -> Duration {
+        let exponent = u32::try_from((attempt_count - 1).clamp(0, 4)).unwrap_or(0);
+        Duration::seconds((30_i64 * 4_i64.pow(exponent)).min(3600))
+    }
+
+    fn normalize_queue_retry(
+        queued: &QueuedMessage,
+        candidate: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, Box<dyn std::error::Error + Send + Sync>> {
+        match (
+            queued.timezone.as_deref(),
+            queued.window_start,
+            queued.window_end,
+        ) {
+            (Some(timezone), Some(start), Some(end)) => {
+                crate::campaign_schedule::normalize_retry_time(candidate, timezone, start, end)
+            }
+            _ => Ok(candidate),
+        }
+    }
+
+    async fn retry_queue_row(
+        client: &deadpool_postgres::Object,
+        queued: &QueuedMessage,
+        candidate: DateTime<Utc>,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if queued.attempt_count >= queued.max_attempts {
+            return Self::finish_queue_row(
+                client,
+                queued,
+                "failed",
+                "attempts_exhausted",
+                "Maximum delivery attempts exhausted",
+            )
+            .await;
+        }
+        let retry_at = Self::normalize_queue_retry(queued, candidate)?;
+        let updated = client
+            .execute(
+                "UPDATE message_queue
+                 SET status = 'pending', next_attempt_at = $3, lease_token = NULL,
+                     leased_until = NULL, last_error_code = $4, error_message = $5
+                 WHERE id = $1 AND status = 'processing' AND lease_token = $2",
+                &[
+                    &queued.id,
+                    &queued.lease_token,
+                    &retry_at,
+                    &error_code,
+                    &error_message,
+                ],
+            )
+            .await?;
+        if updated != 1 {
+            return Err(format!("queue row {} lease was lost", queued.id).into());
+        }
+        Ok(())
+    }
+
+    async fn handle_queue_error(
+        client: &deadpool_postgres::Object,
+        queued: &QueuedMessage,
+        error: &RequestError,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match error {
+            RequestError::RetryAfter(delay) => {
+                let candidate = Utc::now() + delay.chrono_duration() + Duration::seconds(1);
+                Self::retry_queue_row(
+                    client,
+                    queued,
+                    candidate,
+                    "telegram_retry_after",
+                    "Telegram requested a delayed retry",
+                )
+                .await
+            }
+            RequestError::MigrateToChatId(new_chat_id) => {
+                let updated = client
+                    .execute(
+                        "UPDATE message_queue
+                         SET telegram_user_id = $3
+                         WHERE id = $1 AND status = 'processing' AND lease_token = $2",
+                        &[&queued.id, &queued.lease_token, &new_chat_id.0],
+                    )
+                    .await?;
+                if updated != 1 {
+                    return Err(format!("queue row {} lease was lost", queued.id).into());
                 }
+                Self::retry_queue_row(
+                    client,
+                    queued,
+                    Utc::now(),
+                    "migrate_to_chat",
+                    "Telegram migrated the chat identifier",
+                )
+                .await
+            }
+            RequestError::Network(source) if source.is_connect() => {
+                let candidate = Utc::now() + Self::retry_delay(queued.attempt_count);
+                Self::retry_queue_row(
+                    client,
+                    queued,
+                    candidate,
+                    "network_connect",
+                    "Could not connect to Telegram",
+                )
+                .await
+            }
+            RequestError::Network(_) | RequestError::InvalidJson { .. } => {
+                Self::finish_queue_row(
+                    client,
+                    queued,
+                    "delivery_unknown",
+                    "ambiguous_delivery",
+                    "Telegram delivery may have succeeded; automatic retry suppressed",
+                )
+                .await
+            }
+            RequestError::Io(_) => {
+                let candidate = Utc::now() + Self::retry_delay(queued.attempt_count);
+                Self::retry_queue_row(
+                    client,
+                    queued,
+                    candidate,
+                    "local_io",
+                    "Local I/O failure before delivery",
+                )
+                .await
+            }
+            RequestError::Api(
+                ApiError::BotBlocked
+                | ApiError::UserDeactivated
+                | ApiError::CantInitiateConversation
+                | ApiError::ChatNotFound
+                | ApiError::CantTalkWithBots
+                | ApiError::BotKicked
+                | ApiError::BotKickedFromSupergroup
+                | ApiError::BotKickedFromChannel,
+            ) => {
+                client
+                    .execute(
+                        "INSERT INTO campaign_suppressions (telegram_user_id, reason)
+                         VALUES ($1, 'telegram_permanent_failure')
+                         ON CONFLICT (telegram_user_id) DO NOTHING",
+                        &[&queued.telegram_user_id],
+                    )
+                    .await?;
+                client
+                    .execute(
+                        "UPDATE message_queue
+                         SET status = 'failed', last_error_code = 'recipient_unreachable',
+                             error_message = 'Recipient suppressed after permanent Telegram failure'
+                         WHERE telegram_user_id = $1 AND campaign_id IS NOT NULL
+                           AND status = 'pending'",
+                        &[&queued.telegram_user_id],
+                    )
+                    .await?;
+                Self::finish_queue_row(
+                    client,
+                    queued,
+                    "failed",
+                    "recipient_unreachable",
+                    "Telegram recipient is permanently unreachable",
+                )
+                .await
+            }
+            RequestError::Api(
+                ApiError::MessageIsTooLong
+                | ApiError::MessageTextIsEmpty
+                | ApiError::CantParseEntities(_)
+                | ApiError::CantParseUrl
+                | ApiError::WrongHttpUrl
+                | ApiError::RequestEntityTooLarge,
+            ) => {
+                if let Some(campaign_id) = queued.campaign_id {
+                    client
+                        .execute(
+                            "UPDATE campaigns SET status = 'paused', updated_at = NOW()
+                             WHERE id = $1",
+                            &[&campaign_id],
+                        )
+                        .await?;
+                }
+                Self::finish_queue_row(
+                    client,
+                    queued,
+                    "failed",
+                    "invalid_content",
+                    "Campaign paused because Telegram rejected the message content",
+                )
+                .await
+            }
+            RequestError::Api(ApiError::InvalidToken) => {
+                client
+                    .execute(
+                        "UPDATE campaigns SET status = 'paused', updated_at = NOW()
+                         WHERE status = 'active'",
+                        &[],
+                    )
+                    .await?;
+                Self::retry_queue_row(
+                    client,
+                    queued,
+                    Utc::now() + Duration::hours(1),
+                    "invalid_bot_token",
+                    "All campaigns paused because Telegram rejected the bot token",
+                )
+                .await
+            }
+            RequestError::Api(_) => {
+                let candidate = Utc::now() + Self::retry_delay(queued.attempt_count);
+                Self::retry_queue_row(
+                    client,
+                    queued,
+                    candidate,
+                    "telegram_api",
+                    "Telegram rejected the request; scheduled for bounded retry",
+                )
+                .await
             }
         }
     }
@@ -178,7 +675,6 @@ impl TelegramBot {
     pub async fn new(
         bot_token: &str,
         user_manager: Arc<UserManager>,
-        pool: Arc<Pool>,
         analysis_engine: Arc<Mutex<AnalysisEngine>>,
         channel_locks: ChannelLocks,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -189,21 +685,23 @@ impl TelegramBot {
             bot,
             analysis_engine,
             user_manager,
-            pool,
             payment_handler,
             channel_locks,
         })
     }
 
-    pub async fn run(&self) {
+    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Starting Telegram bot...");
 
-        // spawn message queue processor
-        let bot_clone = self.bot.clone();
-        let pool_clone = self.pool.clone();
-        tokio::spawn(async move {
-            Self::run_message_queue_processor(bot_clone, pool_clone).await;
-        });
+        // The watchdog uses an OS thread so it can terminate a process even if the Tokio task
+        // running the database driver loses a wake-up while a queue query is in flight.
+        let queue_heartbeat = Arc::new(AtomicU64::new(0));
+        Self::spawn_message_queue_watchdog(queue_heartbeat.clone());
+
+        // Isolate the queue's pool and database driver on their own runtime. The production bot
+        // runtime has intermittently lost the wake-up for a completed FOR UPDATE response, while
+        // the same query consistently completes in a standalone runtime.
+        Self::spawn_message_queue_worker(self.bot.clone(), queue_heartbeat);
 
         // create context for all handlers (shares the engine + channel locks with recovery)
         let ctx = BotContext {
@@ -276,6 +774,8 @@ impl TelegramBot {
             .build()
             .dispatch()
             .await;
+
+        Ok(())
     }
 
     async fn handle_message(ctx: BotContext, msg: Message) -> ResponseResult<()> {
@@ -384,7 +884,7 @@ impl TelegramBot {
             _ => return None,
         };
 
-        let cache_key = cache.get_llm_cache_key(&messages, "analysis");
+        let cache_key = cache.get_analysis_cache_key(&messages);
 
         let cached_result = match cache.load_llm_result(&cache_key).await {
             Some(result) => result,
@@ -416,6 +916,9 @@ impl TelegramBot {
         }
     }
 
+    // This is the task boundary used by both callbacks and startup recovery; keeping the
+    // dependencies explicit makes ownership across the spawned task clear.
+    #[allow(clippy::too_many_arguments)]
     pub async fn perform_single_analysis(
         bot: Arc<Bot>,
         user_chat_id: ChatId,
@@ -433,16 +936,23 @@ impl TelegramBot {
             analysis_type, channel_name
         );
 
+        // Give immediate feedback before touching the global analysis-engine mutex. Preparing
+        // another channel may hold that mutex across network I/O, and previously this message
+        // was delayed long enough for users to tap several analysis buttons.
+        bot.send_message(user_chat_id, lang.analysis_in_progress(&analysis_type))
+            .await?;
+
         let cache = {
             let engine = analysis_engine.lock().await;
             engine.cache.clone()
         };
 
-        if let Some((cached_result, _cached_messages)) =
+        if let Some((cached_result, cached_messages)) =
             Self::check_fast_path_cache(&cache, &channel_name, &analysis_type).await
         {
+            let cache_key = cache.get_analysis_cache_key(&cached_messages);
             let remaining_credits = user_manager
-                .atomic_complete_analysis(analysis_id, user_id)
+                .atomic_complete_analysis(analysis_id, user_id, "cache", Some(&cache_key))
                 .await?;
 
             Self::deliver_or_refund(
@@ -461,9 +971,6 @@ impl TelegramBot {
 
             return Ok(());
         }
-
-        bot.send_message(user_chat_id, lang.analysis_in_progress(&analysis_type))
-            .await?;
 
         let wait_needed = {
             let engine = analysis_engine.lock().await;
@@ -519,38 +1026,41 @@ impl TelegramBot {
 
         let cached_result = {
             let engine = analysis_engine.lock().await;
-            engine
-                .cache
-                .load_llm_result(&analysis_data.cache_key)
-                .await
+            engine.cache.load_llm_result(&analysis_data.cache_key).await
         };
 
-        let result = if let Some(cached_result) = cached_result {
+        let (result, result_source) = if let Some(cached_result) = cached_result {
             info!("Using cached LLM result for channel {}", channel_name);
-            cached_result
+            (cached_result, "cache")
         } else {
-            let prompt = match crate::prompts::analysis::generate_analysis_prompt(
-                &analysis_data.messages,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    error!(
-                        "Failed to generate analysis prompt for channel {}: {}",
-                        channel_name, e
-                    );
-                    bot.send_message(user_chat_id, lang.error_prompt_generation())
-                        .parse_mode(ParseMode::Html)
-                        .await?;
-                    return Err(e);
-                }
-            };
+            let prompt =
+                match crate::prompts::analysis::generate_analysis_prompt(&analysis_data.messages) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!(
+                            "Failed to generate analysis prompt for channel {}: {}",
+                            channel_name, e
+                        );
+                        bot.send_message(user_chat_id, lang.error_prompt_generation())
+                            .parse_mode(ParseMode::Html)
+                            .await?;
+                        return Err(e);
+                    }
+                };
 
             info!(
                 "Querying LLM for {} analysis of channel {}...",
                 analysis_type, channel_name
             );
+            let llm_context = crate::llm::LlmRunContext::new(
+                user_manager.pool(),
+                "channel_analysis",
+                Some(analysis_id),
+            );
             let mut result =
-                match crate::llm::analysis_query::query_and_parse_analysis(&prompt).await {
+                match crate::llm::analysis_query::query_and_parse_analysis(&prompt, &llm_context)
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => {
                         error!(
@@ -578,12 +1088,17 @@ impl TelegramBot {
                 }
             }
 
-            result
+            (result, "generated")
         };
 
         // consume credit + mark completed atomically; delivery (and refund-on-failure) follows
         let remaining_credits = match user_manager
-            .atomic_complete_analysis(analysis_id, user_id)
+            .atomic_complete_analysis(
+                analysis_id,
+                user_id,
+                result_source,
+                Some(&analysis_data.cache_key),
+            )
             .await
         {
             Ok(credits) => credits,
@@ -700,27 +1215,31 @@ impl TelegramBot {
         user_id: i32,
         lang: Lang,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let analysis_content = match analysis_type {
-            "professional" => &result.professional,
-            "personal" => &result.personal,
-            "roast" => &result.roast,
-            _ => &None,
+        let (analysis_content, quote) = match analysis_type {
+            "professional" => (result.professional, result.quotes.professional),
+            "personal" => (result.personal, result.quotes.personal),
+            "roast" => (result.roast, result.quotes.roast),
+            _ => (None, None),
         };
 
         match analysis_content {
             Some(content) if !content.is_empty() => {
                 // convert LLM markdown content to HTML first
-                let html_content = MessageFormatter::markdown_to_html_safe(content);
+                let html_content = MessageFormatter::markdown_to_html_safe(&content);
 
                 // prepare header template that will be added to each part
-                let header =
-                    lang.analysis_result_header(&MessageFormatter::escape_html(channel_name), user_id);
+                let header = lang
+                    .analysis_result_header(&MessageFormatter::escape_html(channel_name), user_id);
                 let analysis_header = lang.analysis_type_header(analysis_type);
+                let quote_header = quote.as_deref().map_or_else(String::new, |quote| {
+                    format!("<b>{}</b>\n\n", MessageFormatter::escape_html(quote))
+                });
 
                 // calculate available space for content after headers (using UTF-16 code units as Telegram does)
                 const MAX_MESSAGE_LENGTH: usize = 3584;
                 let headers_length = MessageFormatter::count_utf16_code_units(&header)
-                    + MessageFormatter::count_utf16_code_units(&analysis_header);
+                    + MessageFormatter::count_utf16_code_units(&analysis_header)
+                    + MessageFormatter::count_utf16_code_units(&quote_header);
                 let available_content_length =
                     MAX_MESSAGE_LENGTH.saturating_sub(headers_length + 100); // buffer for part indicators
 
@@ -731,21 +1250,31 @@ impl TelegramBot {
                 );
 
                 for (i, chunk) in content_chunks.iter().enumerate() {
-                    let full_message = if content_chunks.len() > 1 {
-                        format!(
-                            "{}{}{}{}",
-                            header,
-                            analysis_header,
-                            chunk,
-                            lang.analysis_part_indicator(i + 1, content_chunks.len())
-                        )
-                    } else {
-                        format!("{}{}{}", header, analysis_header, chunk)
-                    };
+                    let lead = if i == 0 { quote_header.as_str() } else { "" };
+                    let mut full_message = format!("{header}{analysis_header}{lead}{chunk}");
+                    if content_chunks.len() > 1 {
+                        full_message
+                            .push_str(&lang.analysis_part_indicator(i + 1, content_chunks.len()));
+                    }
 
-                    bot.send_message(user_chat_id, full_message)
-                        .parse_mode(ParseMode::Html)
-                        .await?;
+                    let mut request = bot
+                        .send_message(user_chat_id, full_message)
+                        .parse_mode(ParseMode::Html);
+                    if i == 0 {
+                        if let Some(quote) = quote.as_deref() {
+                            let referral_url =
+                                format!("https://t.me/ScratchAuthorEgoBot?start={user_id}");
+                            let mut share_url = reqwest::Url::parse("https://t.me/share/url")?;
+                            share_url
+                                .query_pairs_mut()
+                                .append_pair("url", &referral_url)
+                                .append_pair("text", &format!("{channel_name}\n{quote}"));
+                            request = request.reply_markup(InlineKeyboardMarkup::new([[
+                                InlineKeyboardButton::url(lang.share_analysis_button(), share_url),
+                            ]]));
+                        }
+                    }
+                    request.await?;
                 }
 
                 info!(
@@ -760,11 +1289,8 @@ impl TelegramBot {
                     "No {} analysis content available for channel: {} (user: {})",
                     analysis_type, channel_name, user_chat_id
                 );
-                bot.send_message(
-                    user_chat_id,
-                    lang.error_no_analysis_content(analysis_type),
-                )
-                .await?;
+                bot.send_message(user_chat_id, lang.error_no_analysis_content(analysis_type))
+                    .await?;
             }
         }
 

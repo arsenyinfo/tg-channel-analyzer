@@ -1,10 +1,12 @@
-use deadpool_postgres::{Config, Runtime};
+use deadpool_postgres::Pool;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::env;
+use std::sync::Arc;
+use tg_main::cache::CacheManager;
+use tg_main::llm::{query_llm_with_context, LlmRunContext, GEMINI_FLASH_LITE_MODEL};
+use tg_main::migrations::MigrationManager;
 use tokio_postgres::Row;
-use tokio_postgres_rustls::MakeRustlsConnect;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LanguageInference {
@@ -19,6 +21,24 @@ struct UserWithoutLanguage {
     first_name: Option<String>,
     last_name: Option<String>,
 }
+
+const LANGUAGE_INFERENCE_PROMPT: &str = r#"You are a language detection expert. For each user below, analyze their name and username to determine their most likely language.
+
+You must choose ONLY from these 4 options:
+- "en" for English speakers
+- "ru" for Russian speakers
+- "es" for Spanish speakers
+- null if you cannot determine with reasonable confidence
+
+Consider:
+1. Character sets (Latin vs Cyrillic)
+2. Common name patterns (e.g., -ov/-ev endings for Russian, Hispanic surnames for Spanish)
+3. Username conventions
+
+Respond with ONLY a JSON array where each element is {"user_id": <id>, "language": "<code>"}.
+
+Users to analyze:
+"#;
 
 impl From<Row> for UserWithoutLanguage {
     fn from(row: Row) -> Self {
@@ -55,43 +75,33 @@ fn prepare_user_data_for_inference(user: &UserWithoutLanguage) -> String {
 
 async fn infer_language_batch(
     users: &[UserWithoutLanguage],
-) -> Result<Vec<(i32, Option<String>)>, Box<dyn std::error::Error>> {
+    pool: Arc<Pool>,
+) -> Result<Vec<(i32, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
     if users.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut prompt = format!(
-        r#"You are a language detection expert. For each user below, analyze their name and username to determine their most likely language.
-
-You must choose ONLY from these 4 options:
-- "en" for English speakers
-- "ru" for Russian speakers
-- "es" for Spanish speakers
-- null if you cannot determine with reasonable confidence
-
-Consider:
-1. Character sets (Latin vs Cyrillic)
-2. Common name patterns (e.g., -ov/-ev endings for Russian, Hispanic surnames for Spanish)
-3. Username conventions
-
-Respond with ONLY a JSON array where each element is {{"user_id": <id>, "language": "<code>"}}.
-
-Users to analyze:
-"#
-    );
+    let mut prompt = LANGUAGE_INFERENCE_PROMPT.to_string();
 
     for user in users {
         let user_info = prepare_user_data_for_inference(user);
         prompt.push_str(&format!("\nUser ID {}:\n{}\n", user.id, user_info));
     }
 
-    // use Gemini Flash 1.5 for efficiency
-    match gemini_rs::chat("gemini-2.5-flash-lite-preview-06-17")
-        .send_message(&prompt)
-        .await
+    // use the stable Flash-Lite model for efficiency
+    let context = LlmRunContext::new(pool, "language_inference", None);
+    match query_llm_with_context(
+        &prompt,
+        GEMINI_FLASH_LITE_MODEL,
+        Some(&context),
+        "direct",
+        0,
+    )
+    .await
     {
         Ok(response) => {
-            let text = response.to_string();
+            let attempt_key = response.attempt_key.clone();
+            let text = response.content;
 
             // parse JSON response
             let cleaned_text = if text.contains("```json") {
@@ -110,6 +120,9 @@ Users to analyze:
 
             match serde_json::from_str::<Vec<LanguageInference>>(cleaned_text.trim()) {
                 Ok(results) => {
+                    context
+                        .mark_consumer_outcome(attempt_key.as_deref(), "accepted")
+                        .await;
                     let mut language_map = HashMap::new();
                     let valid_languages = ["en", "ru", "es"];
 
@@ -138,6 +151,9 @@ Users to analyze:
                         .collect())
                 }
                 Err(e) => {
+                    context
+                        .mark_consumer_outcome(attempt_key.as_deref(), "incomplete")
+                        .await;
                     error!("Failed to parse JSON response: {}", e);
                     error!("Response text: {}", cleaned_text);
                     Ok(users.iter().map(|user| (user.id, None)).collect())
@@ -151,8 +167,25 @@ Users to analyze:
     }
 }
 
+async fn update_inferred_languages(
+    client: &tokio_postgres::Client,
+    updates: &[(i32, String)],
+) -> Result<u64, tokio_postgres::Error> {
+    let update_query = r#"
+        UPDATE users
+        SET language = $2, updated_at = NOW()
+        WHERE id = $1 AND language IS NULL
+    "#;
+
+    let mut updated = 0;
+    for (user_id, language) in updates {
+        updated += client.execute(update_query, &[user_id, language]).await?;
+    }
+    Ok(updated)
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // initialize rustls crypto provider
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -162,22 +195,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // load environment variables
     dotenvy::dotenv().ok();
 
-    // get database URL
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-
-    // create database pool with TLS
-    let mut config = Config::new();
-    config.url = Some(database_url);
-
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls = MakeRustlsConnect::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    );
-
-    let pool = config.create_pool(Some(Runtime::Tokio1), tls)?;
+    let pool = Arc::new(CacheManager::create_pool().await?);
+    MigrationManager::run_migrations(&pool).await?;
 
     // get users without language
     let query = r#"
@@ -206,11 +225,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(
             "Processing batch {}/{}",
             batch_idx + 1,
-            (users.len() + BATCH_SIZE - 1) / BATCH_SIZE
+            users.len().div_ceil(BATCH_SIZE)
         );
 
         // infer languages
-        let results = infer_language_batch(chunk).await?;
+        let results = infer_language_batch(chunk, pool.clone()).await?;
 
         // prepare updates
         let updates: Vec<(i32, String)> = results
@@ -221,22 +240,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // update database
         if !updates.is_empty() {
             let client = pool.get().await?;
-            let update_query = r#"
-                UPDATE users
-                SET language = $2, updated_at = NOW()
-                WHERE id = $1
-            "#;
-
-            for (user_id, language) in &updates {
-                client.execute(update_query, &[user_id, language]).await?;
-            }
-
-            total_updated += updates.len();
-            info!("Updated {} users in this batch", updates.len());
+            let updated = update_inferred_languages(&client, &updates).await?;
+            total_updated += updated;
+            info!("Updated {} users in this batch", updated);
         }
 
         // small delay to avoid rate limiting
-        if batch_idx + 1 < (users.len() + BATCH_SIZE - 1) / BATCH_SIZE {
+        if batch_idx + 1 < users.len().div_ceil(BATCH_SIZE) {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
     }
@@ -270,4 +280,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{update_inferred_languages, LANGUAGE_INFERENCE_PROMPT};
+
+    #[tokio::test]
+    async fn backfill_preserves_languages_observed_after_the_snapshot() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must select a local postgres database");
+        let config: tokio_postgres::Config = database_url.parse().unwrap();
+        assert!(matches!(
+            config.get_hosts(),
+            [tokio_postgres::config::Host::Tcp(host)]
+                if matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
+        ));
+        assert_eq!(config.get_dbname(), Some("postgres"));
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        let connection_task = tokio::spawn(connection);
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE users (
+                    id INTEGER PRIMARY KEY,
+                    language TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                 );
+                 INSERT INTO users (id) VALUES (1), (2);",
+            )
+            .await
+            .unwrap();
+
+        let snapshot = client
+            .query(
+                "SELECT id FROM users WHERE language IS NULL ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.len(), 2);
+        let inferred: Vec<(i32, String)> = snapshot
+            .iter()
+            .map(|row| (row.get("id"), "en".to_string()))
+            .collect();
+        client
+            .execute("UPDATE users SET language = 'ru' WHERE id = 1", &[])
+            .await
+            .unwrap();
+
+        let updated = update_inferred_languages(&client, &inferred).await.unwrap();
+        let rows = client
+            .query("SELECT language FROM users ORDER BY id", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, String>("language"), "ru");
+        assert_eq!(rows[1].get::<_, String>("language"), "en");
+        assert_eq!(updated, 1);
+        assert_eq!(
+            update_inferred_languages(&client, &inferred).await.unwrap(),
+            0
+        );
+        drop(client);
+        connection_task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn prompt_uses_single_braces_for_the_json_example() {
+        assert!(LANGUAGE_INFERENCE_PROMPT.contains(r#"{"user_id": <id>, "language": "<code>"}"#));
+        assert!(!LANGUAGE_INFERENCE_PROMPT.contains("{{"));
+        assert!(!LANGUAGE_INFERENCE_PROMPT.contains("}}"));
+    }
 }

@@ -19,6 +19,12 @@ pub struct MockTelegramBot {
     pub user_interactions: Arc<Mutex<HashMap<i64, Vec<String>>>>,
 }
 
+impl Default for MockTelegramBot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockTelegramBot {
     pub fn new() -> Self {
         Self {
@@ -42,7 +48,7 @@ impl MockTelegramBot {
             .lock()
             .unwrap()
             .entry(chat_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(text);
     }
 

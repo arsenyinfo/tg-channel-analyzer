@@ -18,6 +18,14 @@ pub struct PaymentHandler {
 }
 
 impl PaymentHandler {
+    fn package_for_payload(payload: &str) -> Option<(i32, u32)> {
+        match payload {
+            "credits_1" => Some((SINGLE_PACKAGE_AMOUNT, SINGLE_PACKAGE_PRICE)),
+            "credits_10" => Some((BULK_PACKAGE_AMOUNT, BULK_PACKAGE_PRICE)),
+            _ => None,
+        }
+    }
+
     pub fn new(user_manager: Arc<UserManager>) -> Self {
         Self { user_manager }
     }
@@ -55,8 +63,18 @@ impl PaymentHandler {
         bot: Arc<Bot>,
         query: PreCheckoutQuery,
     ) -> ResponseResult<()> {
-        // approve all pre-checkout queries for digital goods
-        bot.answer_pre_checkout_query(query.id, true).await?;
+        let valid = query.currency == "XTR"
+            && Self::package_for_payload(&query.invoice_payload)
+                .is_some_and(|(_, stars)| query.total_amount == stars);
+        let request = bot.answer_pre_checkout_query(query.id, valid);
+        if !valid {
+            error!("Rejected pre-checkout query with invalid package or amount");
+            request
+                .error_message("This invoice is no longer valid. Please request a new one.")
+                .await?;
+            return Ok(());
+        }
+        request.await?;
         info!(
             "Approved pre-checkout query for {} stars",
             query.total_amount
@@ -89,15 +107,19 @@ impl PaymentHandler {
             }
         };
 
-        // parse credits from payload
-        let credits = if payment.invoice_payload == "credits_1" {
-            1
-        } else if payment.invoice_payload == "credits_10" {
-            10
-        } else {
-            error!("Unknown payment payload: {}", payment.invoice_payload);
+        let Some((credits, expected_stars)) = Self::package_for_payload(&payment.invoice_payload)
+        else {
+            error!("Successful payment carried an unknown invoice payload");
+            bot.send_message(msg.chat.id, lang.error_payment_processing())
+                .await?;
             return Ok(());
         };
+        if payment.currency != "XTR" || payment.total_amount != expected_stars {
+            error!("Successful payment did not match its configured package");
+            bot.send_message(msg.chat.id, lang.error_payment_processing())
+                .await?;
+            return Ok(());
+        }
 
         // idempotently record the payment and credit the user, keyed on the Telegram charge id
         // so a redelivered SuccessfulPayment (e.g. after a restart) cannot double-credit
@@ -113,13 +135,16 @@ impl PaymentHandler {
             )
             .await;
 
+        let mut notification_result = Ok(());
         let process_referral = match result {
             Ok(Some(new_balance)) => {
                 let success_msg = lang.payment_success(user.id, credits, new_balance);
 
-                bot.send_message(msg.chat.id, success_msg)
+                notification_result = bot
+                    .send_message(msg.chat.id, success_msg)
                     .parse_mode(ParseMode::Html)
-                    .await?;
+                    .await
+                    .map(|_| ());
 
                 info!(
                     "Successfully processed payment: {} credits for user {}",
@@ -157,7 +182,7 @@ impl PaymentHandler {
             }
         }
 
-        Ok(())
+        notification_result
     }
 
     async fn process_referral_rewards(
@@ -172,31 +197,30 @@ impl PaymentHandler {
                     let referrer_user_id = reward_info.referrer_user_id.unwrap_or(0);
 
                     // send notification to referrer
-                    let reward_msg = if reward_info.paid_rewards > 0
-                        && reward_info.milestone_rewards > 0
-                    {
-                        lang.referral_paid_and_milestone(
-                            reward_info.total_credits_awarded,
-                            reward_info.referral_count,
-                            reward_info.paid_rewards,
-                            reward_info.milestone_rewards,
-                            referrer_user_id,
-                        )
-                    } else if reward_info.paid_rewards > 0 {
-                        lang.referral_paid_only(
-                            reward_info.paid_rewards,
-                            reward_info.referral_count,
-                            referrer_user_id,
-                        )
-                    } else if reward_info.milestone_rewards > 0 {
-                        lang.referral_milestone_only(
-                            reward_info.milestone_rewards,
-                            reward_info.referral_count,
-                            referrer_user_id,
-                        )
-                    } else {
-                        String::new()
-                    };
+                    let reward_msg =
+                        if reward_info.paid_rewards > 0 && reward_info.milestone_rewards > 0 {
+                            lang.referral_paid_and_milestone(
+                                reward_info.total_credits_awarded,
+                                reward_info.referral_count,
+                                reward_info.paid_rewards,
+                                reward_info.milestone_rewards,
+                                referrer_user_id,
+                            )
+                        } else if reward_info.paid_rewards > 0 {
+                            lang.referral_paid_only(
+                                reward_info.paid_rewards,
+                                reward_info.referral_count,
+                                referrer_user_id,
+                            )
+                        } else if reward_info.milestone_rewards > 0 {
+                            lang.referral_milestone_only(
+                                reward_info.milestone_rewards,
+                                reward_info.referral_count,
+                                referrer_user_id,
+                            )
+                        } else {
+                            String::new()
+                        };
 
                     if !reward_msg.is_empty() {
                         let _ = bot
@@ -217,5 +241,23 @@ impl PaymentHandler {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invoice_payloads_map_to_configured_packages() {
+        assert_eq!(
+            PaymentHandler::package_for_payload("credits_1"),
+            Some((SINGLE_PACKAGE_AMOUNT, SINGLE_PACKAGE_PRICE))
+        );
+        assert_eq!(
+            PaymentHandler::package_for_payload("credits_10"),
+            Some((BULK_PACKAGE_AMOUNT, BULK_PACKAGE_PRICE))
+        );
+        assert_eq!(PaymentHandler::package_for_payload("credits_999"), None);
     }
 }

@@ -38,6 +38,12 @@ pub struct BackendRateLimiter {
     web_scraping_rate_limit: Duration,
 }
 
+impl Default for BackendRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BackendRateLimiter {
     pub fn new() -> Self {
         Self {
