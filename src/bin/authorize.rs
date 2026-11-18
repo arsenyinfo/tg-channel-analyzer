@@ -3,10 +3,25 @@ use grammers_session::Session;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 
 /// extracts phone number digits only, removing all formatting
 fn sanitize_phone_number(phone: &str) -> String {
     phone.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+fn save_session(session: &Session, path: &Path) -> io::Result<()> {
+    let directory = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // NamedTempFile uses owner-only permissions on Unix. Keep it on the same
+    // filesystem so the final rename atomically replaces the old session.
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(&session.save())?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -45,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // try to load existing session first
-    let session = match Session::load_file(session_path.to_str().unwrap()) {
+    let session = match Session::load_file(&session_path) {
         Ok(session) => {
             println!("Loaded existing session from {}", session_path.display());
             session
@@ -96,11 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Already authorized!");
     }
 
-    // save the session
-    match client
-        .session()
-        .save_to_file(session_path.to_str().unwrap())
-    {
+    match save_session(client.session(), &session_path) {
         Ok(_) => println!(
             "Session saved successfully to {} for phone number {}",
             session_path.display(),
@@ -108,11 +119,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         Err(e) => {
             eprintln!("Failed to save session: {}", e);
-            eprintln!("This might be a permissions issue or the grammers library version issue.");
-            eprintln!("Try running the program with sudo or check if the session file can be created manually.");
             return Err(e.into());
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saves_a_new_session_and_replaces_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.session");
+        let session = Session::new();
+        save_session(&session, &path).unwrap();
+        assert_eq!(Session::load_file(&path).unwrap().save(), session.save());
+
+        fs::write(&path, b"old contents").unwrap();
+        save_session(&session, &path).unwrap();
+        assert_eq!(Session::load_file(&path).unwrap().save(), session.save());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        }
+    }
 }
