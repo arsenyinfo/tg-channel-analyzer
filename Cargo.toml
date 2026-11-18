@@ -67,7 +67,6 @@ lru = "0.12"
 rig-core = { version = "=0.41.0", default-features = false, features = ["rustls"] }
 sha2 = "0.10"
 
-[dev-dependencies]
 tempfile = "3.0"
 
 # Remove the Rust future-incompatibility in proc-macro-error2 2.0.1 until
