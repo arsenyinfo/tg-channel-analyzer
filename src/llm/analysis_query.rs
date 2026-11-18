@@ -11,44 +11,6 @@ fn section_quote(response: &str, section: &str, body: Option<&str>) -> Option<St
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::section_quote;
-
-    #[test]
-    fn quotes_must_be_short_verbatim_excerpts_from_the_matching_section() {
-        let response = "<professional_quote>Сначала проверить гипотезу.</professional_quote>\n\
-                        <personal_quote>Он любит экспериментировать.</personal_quote>";
-        assert_eq!(
-            section_quote(
-                response,
-                "professional",
-                Some("Сначала проверить гипотезу. Затем измерить результат.")
-            )
-            .as_deref(),
-            Some("Сначала проверить гипотезу.")
-        );
-        assert_eq!(
-            section_quote(response, "personal", Some("Он много читает.")),
-            None
-        );
-        assert_eq!(
-            section_quote(response, "roast", Some("Текст роаста.")),
-            None
-        );
-
-        let overlong = "я".repeat(181);
-        assert_eq!(
-            section_quote(
-                &format!("<roast_quote>{overlong}</roast_quote>"),
-                "roast",
-                Some(&overlong)
-            ),
-            None
-        );
-    }
-}
-
 pub async fn query_and_parse_analysis(
     prompt: &str,
     context: &LlmRunContext,
@@ -170,5 +132,43 @@ pub async fn query_and_parse_analysis(
             error!("Gemini Flash fallback also failed: {}", e);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::section_quote;
+
+    #[test]
+    fn quotes_must_be_short_verbatim_excerpts_from_the_matching_section() {
+        let response = "<professional_quote>Сначала проверить гипотезу.</professional_quote>\n\
+                        <personal_quote>Он любит экспериментировать.</personal_quote>";
+        assert_eq!(
+            section_quote(
+                response,
+                "professional",
+                Some("Сначала проверить гипотезу. Затем измерить результат.")
+            )
+            .as_deref(),
+            Some("Сначала проверить гипотезу.")
+        );
+        assert_eq!(
+            section_quote(response, "personal", Some("Он много читает.")),
+            None
+        );
+        assert_eq!(
+            section_quote(response, "roast", Some("Текст роаста.")),
+            None
+        );
+
+        let overlong = "я".repeat(181);
+        assert_eq!(
+            section_quote(
+                &format!("<roast_quote>{overlong}</roast_quote>"),
+                "roast",
+                Some(&overlong)
+            ),
+            None
+        );
     }
 }
