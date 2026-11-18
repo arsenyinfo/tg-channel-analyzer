@@ -1,8 +1,37 @@
 use crate::cache::{AnalysisQuotes, AnalysisResult};
-use crate::llm::{extract_tag, query_llm_with_context, LlmRunContext, ANALYSIS_MODEL};
+use crate::llm::{
+    configured_api_key, extract_tag, query_llm_with_context, LlmRunContext, ANALYSIS_MODEL,
+    GEMINI_KEY_ENV, OPENAI_KEY_ENV,
+};
 use log::{error, info, warn};
 
 const FALLBACK_MODEL: &str = "gemini-3.8-flash";
+
+const MISSING_ANALYSIS_KEYS: &str =
+    "Set at least one non-empty API key: OPENAI_API_KEY or GEMINI_API_KEY";
+
+fn model_order(
+    openai: bool,
+    gemini: bool,
+) -> Result<(&'static str, Option<&'static str>), &'static str> {
+    match (openai, gemini) {
+        (true, true) => Ok((ANALYSIS_MODEL, Some(FALLBACK_MODEL))),
+        (true, false) => Ok((ANALYSIS_MODEL, None)),
+        (false, true) => Ok((FALLBACK_MODEL, None)),
+        (false, false) => Err(MISSING_ANALYSIS_KEYS),
+    }
+}
+
+fn configured_models() -> Result<(&'static str, Option<&'static str>), &'static str> {
+    model_order(
+        configured_api_key(OPENAI_KEY_ENV).is_some(),
+        configured_api_key(GEMINI_KEY_ENV).is_some(),
+    )
+}
+
+pub fn validate_analysis_keys() -> Result<(), &'static str> {
+    configured_models().map(|_| ())
+}
 
 fn section_quote(response: &str, section: &str, body: Option<&str>) -> Option<String> {
     let body = body?;
@@ -114,30 +143,35 @@ pub async fn query_and_parse_analysis(
         .into())
     }
 
-    // try the primary analysis model with retries
-    match try_model(prompt, ANALYSIS_MODEL, "primary", 2, context).await {
-        Ok(result) => return Ok(result),
-        Err(e) => {
-            warn!(
-                "{} failed with error: {}, trying fallback",
-                ANALYSIS_MODEL, e
-            );
-        }
-    }
-
-    info!("Falling back to {FALLBACK_MODEL}");
-    match try_model(prompt, FALLBACK_MODEL, "fallback", 2, context).await {
+    let (primary, fallback) = configured_models()?;
+    match try_model(prompt, primary, "primary", 2, context).await {
         Ok(result) => Ok(result),
         Err(e) => {
-            error!("Gemini Flash fallback also failed: {}", e);
-            Err(e)
+            let Some(fallback) = fallback else {
+                return Err(e);
+            };
+            warn!("{primary} failed: {e}. Falling back to {fallback}");
+            try_model(prompt, fallback, "fallback", 2, context).await
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::section_quote;
+    use super::{
+        model_order, section_quote, ANALYSIS_MODEL, FALLBACK_MODEL, MISSING_ANALYSIS_KEYS,
+    };
+
+    #[test]
+    fn chooses_only_models_with_configured_keys() {
+        assert_eq!(
+            model_order(true, true),
+            Ok((ANALYSIS_MODEL, Some(FALLBACK_MODEL)))
+        );
+        assert_eq!(model_order(true, false), Ok((ANALYSIS_MODEL, None)));
+        assert_eq!(model_order(false, true), Ok((FALLBACK_MODEL, None)));
+        assert_eq!(model_order(false, false), Err(MISSING_ANALYSIS_KEYS));
+    }
 
     #[test]
     fn quotes_must_be_short_verbatim_excerpts_from_the_matching_section() {

@@ -59,6 +59,15 @@ pub const GEMINI_TIMEOUT_SECS: u64 = 300;
 pub const ANALYSIS_MODEL: &str = "gpt-6.1-terra";
 pub const GEMINI_FLASH_LITE_MODEL: &str = "gemini-2.5-flash-lite";
 
+const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+const GEMINI_KEY_ENV: &str = "GEMINI_API_KEY";
+
+fn configured_api_key(name: &str) -> Option<String> {
+    let key = std::env::var(name).ok()?;
+    let key = key.trim();
+    (!key.is_empty()).then(|| key.to_owned())
+}
+
 #[derive(Debug)]
 pub struct LLMResponse {
     pub content: String,
@@ -289,8 +298,8 @@ pub async fn query_llm_with_context(
     info!("Querying LLM with model: {}", model);
 
     if model == ANALYSIS_MODEL {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| "OPENAI_API_KEY environment variable not set")?;
+        let api_key = configured_api_key(OPENAI_KEY_ENV)
+            .ok_or("OPENAI_API_KEY environment variable is missing or empty")?;
         let client = openai::Client::new(&api_key)?;
         return query_completion(
             &client.completion_model(model),
@@ -305,8 +314,8 @@ pub async fn query_llm_with_context(
         .await;
     }
 
-    let api_key = std::env::var("GEMINI_API_KEY")
-        .map_err(|_| "GEMINI_API_KEY environment variable not set")?;
+    let api_key = configured_api_key(GEMINI_KEY_ENV)
+        .ok_or("GEMINI_API_KEY environment variable is missing or empty")?;
     let client = gemini::Client::new(&api_key)?;
     query_completion(
         &client.completion_model(model),

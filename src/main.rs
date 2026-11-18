@@ -60,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let _args = Args::parse();
 
+    llm::analysis_query::validate_analysis_keys()?;
     let bot_token =
         env::var("BOT_TOKEN").map_err(|_| "BOT_TOKEN environment variable is required")?;
 

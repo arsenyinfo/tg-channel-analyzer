@@ -20,6 +20,9 @@ TG_API_HASH=your_api_hash_here
 DATABASE_URL=postgresql://username:password@localhost/channel_bot
 ```
 
+Set at least one of `OPENAI_API_KEY` (GPT-6.1 Terra) or `GEMINI_API_KEY`
+(Gemini 3.8 Flash) for channel analysis. With both keys, the bot tries Terra first.
+
 ### Database Setup
 
 1. Create a PostgreSQL database on your cloud provider (I use [Neon](https://get.neon.com/ab5))
